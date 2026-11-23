@@ -1,6 +1,8 @@
+#[cfg(kani)]
+use verity_core::{GateError, VerdictStatus};
 use verity_core::{
-    can_approve_gate, classify_kani_report, CheckKind, CheckStatus, GateError, HygieneReport,
-    HygieneViolation, KaniCheck, KaniReport, VerdictStatus,
+    can_approve_gate, classify_kani_report, CheckKind, CheckStatus, HygieneReport,
+    HygieneViolation, KaniCheck, KaniReport,
 };
 
 /// Law 4: Hygiene violations, failed/undetermined checks, or unsatisfiable

@@ -1,5 +1,7 @@
+#[cfg(kani)]
+use verity_core::RejectionReason;
 use verity_core::{
-    transition, CheckerVerdict, CommitOid, HygieneReport, HygieneViolation, RejectionReason,
+    transition, CheckerVerdict, CommitOid, HygieneReport, HygieneViolation,
     RelPath, SpecDigest, SpecHandoff, TaskEvent, TaskMode, TaskState, TransitionError,
     VerdictStatus, VerifierKind,
 };

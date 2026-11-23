@@ -1,0 +1,15 @@
+[package]
+name = "verity-desktop"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Thin Tauri v2 native desktop shell for Verity"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+verity-core = { path = "../../crates/verity-core" }
+verity-runtime = { path = "../../crates/verity-runtime" }

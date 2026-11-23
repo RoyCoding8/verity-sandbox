@@ -1,0 +1,145 @@
+/* Google Material Design 3 tonal palette and elevation tokens */
+:root {
+  --md-sys-color-primary: #1a5fb4;
+  --md-sys-color-on-primary: #ffffff;
+  --md-sys-color-primary-container: #d6e3ff;
+  --md-sys-color-on-primary-container: #001b3d;
+  --md-sys-color-secondary: #555f71;
+  --md-sys-color-secondary-container: #d9e3f8;
+  --md-sys-color-on-secondary-container: #121c2b;
+  --md-sys-color-tertiary: #0f766e;
+  --md-sys-color-tertiary-container: #ccfbf1;
+  --md-sys-color-on-tertiary-container: #042f2e;
+  --md-sys-color-error: #ba1a1a;
+  --md-sys-color-error-container: #ffdad6;
+  --md-sys-color-on-error-container: #410002;
+  --md-sys-color-surface: #f9f9ff;
+  --md-sys-color-surface-container-low: #f3f3fa;
+  --md-sys-color-surface-container: #ededf4;
+  --md-sys-color-surface-container-high: #e7e8ee;
+  --md-sys-color-on-surface: #191c20;
+  --md-sys-color-on-surface-variant: #44474e;
+  --md-sys-color-outline-variant: #c4c6d0;
+  --md-sys-shape-corner-md: 12px;
+  --md-sys-shape-corner-lg: 20px;
+  --md-sys-shape-corner-full: 9999px;
+  font-family: "Google Sans", "Inter", system-ui, -apple-system, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --md-sys-color-primary: #a9c7ff;
+    --md-sys-color-on-primary: #003063;
+    --md-sys-color-primary-container: #00468c;
+    --md-sys-color-on-primary-container: #d6e3ff;
+    --md-sys-color-secondary-container: #3d4758;
+    --md-sys-color-on-secondary-container: #d9e3f8;
+    --md-sys-color-tertiary-container: #115e59;
+    --md-sys-color-on-tertiary-container: #ccfbf1;
+    --md-sys-color-surface: #111318;
+    --md-sys-color-surface-container-low: #191c20;
+    --md-sys-color-surface-container: #1d2024;
+    --md-sys-color-surface-container-high: #282a2f;
+    --md-sys-color-on-surface: #e2e2e9;
+    --md-sys-color-on-surface-variant: #c4c6d0;
+    --md-sys-color-outline-variant: #44474e;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--md-sys-color-surface);
+  color: var(--md-sys-color-on-surface);
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 88px 1fr;
+  min-height: 100vh;
+}
+
+.nav-rail {
+  background: var(--md-sys-color-surface-container-low);
+  border-right: 1px solid var(--md-sys-color-outline-variant);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px 8px;
+  gap: 12px;
+}
+
+.nav-btn {
+  width: 68px;
+  padding: 10px 6px;
+  border: none;
+  border-radius: var(--md-sys-shape-corner-full);
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.nav-btn.active {
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.main-pane {
+  padding: 28px 36px;
+  max-width: 1120px;
+}
+
+.card {
+  background: var(--md-sys-color-surface-container);
+  border-radius: var(--md-sys-shape-corner-lg);
+  padding: 20px 24px;
+  margin-bottom: 16px;
+}
+
+.split-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 12px;
+  border-radius: var(--md-sys-shape-corner-full);
+  font-size: 12px;
+  font-weight: 600;
+  margin-right: 8px;
+}
+
+.chip-pass {
+  background: var(--md-sys-color-tertiary-container);
+  color: var(--md-sys-color-on-tertiary-container);
+}
+
+.chip-info {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.btn-filled {
+  background: var(--md-sys-color-primary);
+  color: var(--md-sys-color-on-primary);
+  border: none;
+  border-radius: var(--md-sys-shape-corner-full);
+  padding: 10px 20px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.code-block {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 13px;
+  background: var(--md-sys-color-surface-container-low);
+  padding: 14px 16px;
+  border-radius: var(--md-sys-shape-corner-md);
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
