@@ -1,0 +1,339 @@
+/* ==========================================================================
+   Material Design 3 Expressive Select & Elevated Menu
+   Variants: pill (composer), tonal (sidebar picker), field (modals/forms)
+   ========================================================================== */
+
+.md3-select-root {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+}
+
+.md3-select-root--tonal,
+.md3-select-root--field {
+  display: flex;
+  width: 100%;
+}
+
+/* Trigger base */
+.md3-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  max-width: 100%;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  line-height: 1.3;
+  cursor: pointer;
+  text-align: left;
+  border: 1px solid transparent;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    border-color var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast),
+    box-shadow var(--md-sys-motion-fast);
+}
+
+.md3-select-trigger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.md3-select-trigger-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.md3-select-leading-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: currentColor;
+  opacity: 0.82;
+}
+
+.md3-select-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md3-select-value--placeholder {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.md3-select-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--md-sys-color-on-surface-variant);
+  transition: transform var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.md3-select-root.is-open .md3-select-chevron {
+  transform: rotate(180deg);
+  color: var(--md-sys-color-on-surface);
+}
+
+/* Variant: pill (composer inline selectors) */
+.md3-select-trigger--pill {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: var(--text-xs);
+}
+
+.md3-select-trigger--pill:hover:not(:disabled),
+.md3-select-root.is-open .md3-select-trigger--pill {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+}
+
+.md3-select-trigger--pill:active:not(:disabled) {
+  background: var(--md-sys-color-surface-container-highest);
+}
+
+/* Variant: tonal (sidebar project picker) */
+.md3-select-trigger--tonal {
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius-full);
+  background: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface);
+  font-size: var(--text-sm);
+  gap: 8px;
+}
+
+.md3-select-trigger--tonal .md3-select-trigger-main {
+  gap: 8px;
+}
+
+.md3-select-trigger--tonal:hover:not(:disabled),
+.md3-select-root.is-open .md3-select-trigger--tonal {
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.md3-select-trigger--tonal:active:not(:disabled) {
+  background: var(--md-sys-color-surface-container-highest);
+}
+
+/* Variant: field (forms & modals) */
+.md3-select-trigger--field {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border-color: var(--verity-hairline);
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  gap: 8px;
+}
+
+.md3-select-trigger--field .md3-select-trigger-main {
+  gap: 8px;
+}
+
+.md3-select-trigger--field:hover:not(:disabled) {
+  border-color: var(--md-sys-color-outline);
+  background: var(--md-sys-color-surface-container);
+}
+
+.md3-select-trigger--field:focus-visible,
+.md3-select-root.is-open .md3-select-trigger--field {
+  outline: none;
+  border-color: var(--md-sys-color-primary);
+  box-shadow: 0 0 0 3px var(--md-sys-color-primary-container);
+}
+
+/* Elevated MD3 Popover Menu */
+.md3-select-menu {
+  position: absolute;
+  min-width: max(100%, 180px);
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--verity-hairline);
+  background: var(--md-sys-color-surface-container-high);
+  box-shadow: var(--verity-surface-highlight), var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 60;
+  animation: md3-select-enter var(--md-sys-motion-fast) both;
+}
+
+:root[data-theme="light"] .md3-select-menu {
+  background: #ffffff;
+  box-shadow: var(--verity-surface-highlight), var(--shadow-md);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .md3-select-menu {
+    background: #ffffff;
+    box-shadow: var(--verity-surface-highlight), var(--shadow-md);
+  }
+}
+
+.md3-select-menu--bottom {
+  top: calc(100% + 6px);
+  transform-origin: top center;
+}
+
+.md3-select-menu--top {
+  bottom: calc(100% + 6px);
+  transform-origin: bottom center;
+}
+
+.md3-select-menu--align-start {
+  left: 0;
+}
+
+.md3-select-menu--align-end {
+  right: 0;
+}
+
+@keyframes md3-select-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.md3-select-menu--top {
+  animation-name: md3-select-enter-top;
+}
+
+@keyframes md3-select-enter-top {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Menu Option Item */
+.md3-select-option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.md3-select-option:hover:not(:disabled),
+.md3-select-option.is-highlighted:not(:disabled) {
+  background: var(--md-sys-color-surface-container-highest);
+}
+
+:root[data-theme="light"] .md3-select-option:hover:not(:disabled),
+:root[data-theme="light"] .md3-select-option.is-highlighted:not(:disabled) {
+  background: var(--md-sys-color-surface-container-high);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .md3-select-option:hover:not(:disabled),
+  :root:not([data-theme="dark"]) .md3-select-option.is-highlighted:not(:disabled) {
+    background: var(--md-sys-color-surface-container-high);
+  }
+}
+
+.md3-select-option.is-selected {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.md3-select-option.is-selected:hover:not(:disabled),
+.md3-select-option.is-selected.is-highlighted:not(:disabled) {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.md3-select-option.is-disabled,
+.md3-select-option:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.md3-select-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.md3-select-option-label {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md3-select-option-desc {
+  font-size: var(--text-xs);
+  line-height: 1.35;
+  color: var(--md-sys-color-on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md3-select-option.is-selected .md3-select-option-desc {
+  color: currentColor;
+  opacity: 0.8;
+}
+
+.md3-select-option-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .md3-select-trigger,
+  .md3-select-chevron,
+  .md3-select-option {
+    transition: none;
+  }
+
+  .md3-select-menu {
+    animation: none;
+  }
+}

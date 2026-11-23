@@ -1,4 +1,6 @@
 import {
+  useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -11,6 +13,16 @@ import type {
   SlashOrSkillCommand,
   ThinkingLevel,
 } from "../api/tauri";
+import {
+  CloseIcon,
+  CpuIcon,
+  PlusIcon,
+  SendIcon,
+  SparklesIcon,
+  StopIcon,
+} from "./Icons";
+import { Md3Select, type Md3SelectOption } from "./Md3Select";
+import "./Composer.css";
 
 export interface ComposerProps {
   readonly draft: string;
@@ -22,6 +34,7 @@ export interface ComposerProps {
   readonly commands: readonly SlashOrSkillCommand[];
   readonly isStreaming: boolean;
   readonly pendingQueueCount: number;
+  readonly variant?: "hero" | "docked";
   readonly onDraftChange: (value: string) => void;
   readonly onRecallUp: () => void;
   readonly onRecallDown: () => void;
@@ -37,6 +50,7 @@ export interface ComposerProps {
 }
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_TEXTAREA_HEIGHT_PX = 180;
 
 function isAllowedMime(mime: string): mime is PendingAttachment["mime_type"] {
   return (
@@ -58,7 +72,29 @@ function isThinkingLevel(value: string): value is ThinkingLevel {
   );
 }
 
+function formatThinkingLevel(level: ThinkingLevel): string {
+  switch (level) {
+    case "off":
+      return "Off";
+    case "minimal":
+      return "Minimal";
+    case "low":
+      return "Low";
+    case "medium":
+      return "Medium";
+    case "high":
+      return "High";
+    case "xhigh":
+      return "XHigh";
+    default: {
+      const _exhaustive: never = level;
+      return _exhaustive;
+    }
+  }
+}
+
 interface CompletionMatch {
+  readonly trigger: "/" | "$";
   readonly triggerStart: number;
   readonly items: readonly SlashOrSkillCommand[];
 }
@@ -81,7 +117,7 @@ function resolveCompletions(
   );
   if (items.length === 0) return null;
   const triggerStart = draft.length - rawToken.length;
-  return { triggerStart, items };
+  return { trigger, triggerStart, items };
 }
 
 export function Composer({
@@ -94,6 +130,7 @@ export function Composer({
   commands,
   isStreaming,
   pendingQueueCount,
+  variant = "docked",
   onDraftChange,
   onRecallUp,
   onRecallDown,
@@ -109,6 +146,7 @@ export function Composer({
 }: ComposerProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const completionListRef = useRef<HTMLDivElement | null>(null);
   const [selectedCompletionIdx, setSelectedCompletionIdx] = useState(0);
   const [completionDismissed, setCompletionDismissed] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -121,6 +159,42 @@ export function Composer({
   const activeCompletionIdx = completion
     ? Math.min(selectedCompletionIdx, completion.items.length - 1)
     : 0;
+
+  const modelOptions = useMemo<readonly Md3SelectOption[]>(
+    () =>
+      models.map((m) => ({
+        value: `${m.provider}::${m.modelId}`,
+        label: m.label,
+        description: m.provider,
+      })),
+    [models]
+  );
+
+  const thinkingOptions = useMemo<readonly Md3SelectOption[]>(
+    () =>
+      thinkingLevels.map((lvl) => ({
+        value: lvl,
+        label: formatThinkingLevel(lvl),
+      })),
+    [thinkingLevels]
+  );
+
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const nextHeight = Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT_PX);
+    el.style.height = `${nextHeight}px`;
+    el.style.overflowY = el.scrollHeight > MAX_TEXTAREA_HEIGHT_PX ? "auto" : "hidden";
+  }, [draft]);
+
+  useEffect(() => {
+    if (!completion || !completionListRef.current) return;
+    const selectedEl = completionListRef.current.children[activeCompletionIdx];
+    if (selectedEl instanceof HTMLElement) {
+      selectedEl.scrollIntoView({ block: "nearest" });
+    }
+  }, [completion, activeCompletionIdx]);
 
   function applyCompletion(cmd: SlashOrSkillCommand) {
     if (!completion) return;
@@ -218,26 +292,43 @@ export function Composer({
   const selectedModelKey = `${selectedModel.provider}::${selectedModel.modelId}`;
 
   return (
-    <div className="pi-composer-shell">
+    <div
+      className={
+        variant === "hero"
+          ? "pi-composer-shell pi-composer-shell--hero"
+          : "pi-composer-shell"
+      }
+    >
       <div className="pi-composer-container">
         {completion && (
-          <div className="pi-completion-popover" role="listbox" aria-label="Command completions">
-            {completion.items.map((item, idx) => (
-              <button
-                key={item.name}
-                type="button"
-                role="option"
-                aria-selected={idx === activeCompletionIdx}
-                className={`pi-completion-item ${idx === activeCompletionIdx ? "selected" : ""}`}
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  applyCompletion(item);
-                }}
-              >
-                <span className="pi-completion-name">{item.name}</span>
-                <span className="pi-completion-desc">{item.description}</span>
-              </button>
-            ))}
+          <div
+            className="pi-completion-popover"
+            role="listbox"
+            aria-label="Command completions"
+          >
+            <div className="pi-completion-header">
+              <span>{completion.trigger === "/" ? "Commands" : "Workspace skills"}</span>
+              <span>Tab or Enter to insert · Esc to dismiss</span>
+            </div>
+            <div ref={completionListRef} className="pi-completion-list">
+              {completion.items.map((item, idx) => (
+                <button
+                  key={item.name}
+                  type="button"
+                  role="option"
+                  aria-selected={idx === activeCompletionIdx}
+                  className={`pi-completion-item${idx === activeCompletionIdx ? " selected" : ""}`}
+                  onMouseEnter={() => setSelectedCompletionIdx(idx)}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applyCompletion(item);
+                  }}
+                >
+                  <span className="pi-completion-name">{item.name}</span>
+                  <span className="pi-completion-desc">{item.description}</span>
+                </button>
+              ))}
+            </div>
           </div>
         )}
 
@@ -265,14 +356,14 @@ export function Composer({
                   src={`data:${att.mime_type};base64,${att.base64_data}`}
                   alt={att.filename}
                 />
-                <span>{att.filename}</span>
+                <span className="pi-attachment-name">{att.filename}</span>
                 <button
                   type="button"
-                  className="md3-icon-btn md3-icon-btn-sm"
+                  className="pi-attachment-remove"
                   aria-label={`Remove ${att.filename}`}
                   onClick={() => onRemoveAttachment(att.filename)}
                 >
-                  ×
+                  <CloseIcon size={12} />
                 </button>
               </span>
             ))}
@@ -285,86 +376,87 @@ export function Composer({
           </div>
         )}
 
-        <textarea
-          ref={textareaRef}
-          className="pi-composer-textarea"
-          aria-label="Message Pi"
-          placeholder={
-            isStreaming
-              ? "Type a steering note or follow-up while Pi is streaming..."
-              : "Message Pi... (/ commands, $ skills, ↑/↓ recall)"
-          }
-          value={draft}
-          rows={2}
-          onChange={(e) => {
-            setCompletionDismissed(false);
-            setSelectedCompletionIdx(0);
-            onDraftChange(e.target.value);
-          }}
-          onKeyDown={handleKeyDown}
-        />
+        <div className="pi-composer-row">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            style={{ display: "none" }}
+            onChange={handleFileChange}
+          />
+          <button
+            type="button"
+            className="pi-composer-attach-btn"
+            title="Attach image"
+            aria-label="Attach image"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <PlusIcon size={18} />
+          </button>
 
-        <div className="pi-composer-footer">
-          <div className="pi-composer-controls">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/png,image/jpeg,image/webp,image/gif"
-              style={{ display: "none" }}
-              onChange={handleFileChange}
-            />
-            <button
-              type="button"
-              className="md3-icon-btn"
-              title="Attach image"
-              aria-label="Attach image"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              📎
-            </button>
+          <textarea
+            ref={textareaRef}
+            className="pi-composer-textarea"
+            aria-label="Ask Verity"
+            placeholder={
+              isStreaming
+                ? "Send a steering note or follow-up..."
+                : "Ask Verity or type / for commands"
+            }
+            value={draft}
+            rows={1}
+            onChange={(e) => {
+              setCompletionDismissed(false);
+              setSelectedCompletionIdx(0);
+              onDraftChange(e.target.value);
+            }}
+            onKeyDown={handleKeyDown}
+          />
 
-            <select
-              className="pi-pill-select"
-              aria-label="Select model"
-              value={selectedModelKey}
-              onChange={(e) => {
-                const [provider, modelId] = e.target.value.split("::");
-                if (provider && modelId) {
-                  onSelectModel(provider, modelId);
-                }
-              }}
-            >
-              {models.map((m) => (
-                <option key={`${m.provider}::${m.modelId}`} value={`${m.provider}::${m.modelId}`}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
+          <div className="pi-composer-inline-actions">
+            {!isStreaming && (
+              <>
+                <Md3Select
+                  className="pi-composer-model-select"
+                  variant="pill"
+                  placement="top"
+                  align="end"
+                  ariaLabel="Select model"
+                  placeholder={selectedModel.label}
+                  leadingIcon={<CpuIcon size={14} />}
+                  value={selectedModelKey}
+                  options={modelOptions}
+                  onChange={(nextValue) => {
+                    const [provider, modelId] = nextValue.split("::");
+                    if (provider && modelId) {
+                      onSelectModel(provider, modelId);
+                    }
+                  }}
+                />
 
-            <select
-              className="pi-pill-select"
-              aria-label="Thinking level"
-              value={thinkingLevel}
-              onChange={(e) => {
-                if (isThinkingLevel(e.target.value)) {
-                  onSelectThinkingLevel(e.target.value);
-                }
-              }}
-            >
-              {thinkingLevels.map((lvl) => (
-                <option key={lvl} value={lvl}>
-                  Thinking: {lvl}
-                </option>
-              ))}
-            </select>
-          </div>
+                <Md3Select
+                  className="pi-composer-thinking-select"
+                  variant="pill"
+                  placement="top"
+                  align="end"
+                  ariaLabel="Thinking level"
+                  leadingIcon={<SparklesIcon size={14} />}
+                  value={thinkingLevel}
+                  options={thinkingOptions}
+                  onChange={(nextValue) => {
+                    if (isThinkingLevel(nextValue)) {
+                      onSelectThinkingLevel(nextValue);
+                    }
+                  }}
+                />
+              </>
+            )}
 
-          <div className="pi-composer-actions">
             {isStreaming ? (
               <>
                 <button
                   type="button"
-                  className="md3-btn-tonal"
+                  className="pi-composer-stream-pill"
                   disabled={!draft.trim()}
                   onClick={onSteer}
                 >
@@ -372,24 +464,32 @@ export function Composer({
                 </button>
                 <button
                   type="button"
-                  className="md3-btn-outlined"
+                  className="pi-composer-stream-pill"
                   disabled={!draft.trim()}
                   onClick={onFollowUp}
                 >
                   Follow-up
                 </button>
-                <button type="button" className="md3-btn-danger" onClick={onAbort}>
-                  Stop
+                <button
+                  type="button"
+                  className="pi-composer-stop-circle"
+                  title="Stop generation"
+                  aria-label="Stop generation"
+                  onClick={onAbort}
+                >
+                  <StopIcon size={14} />
                 </button>
               </>
             ) : (
               <button
                 type="button"
-                className="md3-btn-filled"
+                className="pi-composer-send-circle"
                 disabled={!canSubmit}
+                title="Send message"
+                aria-label="Send message"
                 onClick={onSend}
               >
-                Send
+                <SendIcon size={15} />
               </button>
             )}
           </div>

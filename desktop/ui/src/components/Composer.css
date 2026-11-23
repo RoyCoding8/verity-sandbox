@@ -1,0 +1,398 @@
+/* ==========================================================================
+   Composer — Floating MD3 Expressive Pill Input
+   ========================================================================== */
+
+.pi-composer-shell {
+  width: 100%;
+  padding: 16px 24px 24px;
+  background: transparent;
+  border-top: none;
+  flex-shrink: 0;
+}
+
+.pi-composer-shell--hero {
+  padding: 0;
+}
+
+.pi-composer-container {
+  position: relative;
+  width: 100%;
+  max-width: 680px;
+  margin: 0 auto;
+  background: var(--md-sys-color-surface-container);
+  border: 1px solid var(--verity-hairline);
+  border-radius: 28px;
+  padding: 10px 10px 10px 12px;
+  box-shadow:
+    var(--verity-surface-highlight),
+    0 8px 32px rgba(0, 0, 0, 0.28);
+  transition:
+    border-color var(--md-sys-motion-fast),
+    box-shadow var(--md-sys-motion-fast),
+    background-color var(--md-sys-motion-fast);
+}
+
+.pi-composer-container:focus-within {
+  border-color: color-mix(in srgb, var(--md-sys-color-primary) 36%, var(--verity-hairline));
+  box-shadow:
+    var(--verity-surface-highlight),
+    0 12px 36px rgba(0, 0, 0, 0.34);
+}
+
+:root[data-theme="light"] .pi-composer-container {
+  background: #ffffff;
+  border-color: transparent;
+  box-shadow:
+    0 2px 12px rgba(15, 23, 42, 0.07),
+    0 0 0 1px rgba(15, 23, 42, 0.06);
+}
+
+:root[data-theme="light"] .pi-composer-container:focus-within {
+  border-color: color-mix(in srgb, var(--md-sys-color-primary) 45%, transparent);
+  box-shadow:
+    0 4px 18px rgba(11, 87, 208, 0.1),
+    0 0 0 3px rgba(11, 87, 208, 0.14);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .pi-composer-container {
+    background: #ffffff;
+    border-color: transparent;
+    box-shadow:
+      0 2px 12px rgba(15, 23, 42, 0.07),
+      0 0 0 1px rgba(15, 23, 42, 0.06);
+  }
+
+  :root:not([data-theme="dark"]) .pi-composer-container:focus-within {
+    border-color: color-mix(in srgb, var(--md-sys-color-primary) 45%, transparent);
+    box-shadow:
+      0 4px 18px rgba(11, 87, 208, 0.1),
+      0 0 0 3px rgba(11, 87, 208, 0.14);
+  }
+}
+
+/* Queue bar */
+.pi-composer-queue-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 12px;
+  margin-bottom: 8px;
+  border-radius: 16px;
+  background: var(--verity-warning-container);
+  color: var(--verity-on-warning-container);
+  border: none;
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+/* Attachment chip strip */
+.pi-composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 0 4px;
+}
+
+.pi-attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 6px 3px 4px;
+  border-radius: 9999px;
+  background: var(--md-sys-color-surface-container-high);
+  border: none;
+  color: var(--md-sys-color-on-surface);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  max-width: 240px;
+}
+
+.pi-attachment-chip img {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.pi-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pi-attachment-remove {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.pi-attachment-remove:hover {
+  background: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface);
+}
+
+/* Single-row / auto-grow pill interior */
+.pi-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  min-height: 36px;
+}
+
+.pi-composer-attach-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 9999px;
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.pi-composer-attach-btn:hover {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+}
+
+/* Auto-growing textarea */
+.pi-composer-textarea {
+  flex: 1;
+  min-width: 0;
+  display: block;
+  min-height: 36px;
+  max-height: 180px;
+  resize: none;
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: 1.48;
+  padding: 7px 4px;
+  overflow-y: hidden;
+}
+
+.pi-composer-textarea:focus {
+  outline: none;
+}
+
+.pi-composer-textarea::placeholder {
+  color: var(--md-sys-color-on-surface-variant);
+  opacity: 0.78;
+}
+
+/* Quiet inline trailing controls inside the pill */
+.pi-composer-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.pi-composer-model-select .md3-select-trigger {
+  max-width: 176px;
+}
+
+/* Streaming inline micro-pills */
+.pi-composer-stream-pill {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 9999px;
+  border: none;
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    opacity var(--md-sys-motion-fast);
+}
+
+.pi-composer-stream-pill:hover:not(:disabled) {
+  background: var(--md-sys-color-surface-container-highest);
+}
+
+.pi-composer-stream-pill:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Circular primary Send / Stop button */
+.pi-composer-send-circle {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 9999px;
+  border: none;
+  background: var(--md-sys-color-primary);
+  color: var(--md-sys-color-on-primary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    opacity var(--md-sys-motion-fast),
+    transform var(--md-sys-motion-fast);
+}
+
+.pi-composer-send-circle:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.pi-composer-send-circle:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.pi-composer-send-circle:disabled {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.pi-composer-stop-circle {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 9999px;
+  border: none;
+  background: var(--verity-danger-container);
+  color: var(--verity-on-danger-container);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    transform var(--md-sys-motion-fast);
+}
+
+.pi-composer-stop-circle:hover {
+  background: var(--verity-danger);
+  color: var(--verity-on-danger);
+}
+
+.pi-composer-stop-circle:active {
+  transform: scale(0.95);
+}
+
+/* Slash & Skill Completion Popover */
+.pi-completion-popover {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 10px);
+  max-height: 260px;
+  display: flex;
+  flex-direction: column;
+  background: var(--md-sys-color-surface-container);
+  border: 1px solid var(--verity-hairline);
+  border-radius: 20px;
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  z-index: 30;
+}
+
+.pi-completion-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--verity-hairline);
+  background: var(--md-sys-color-surface-container-low);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.pi-completion-list {
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pi-completion-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--md-sys-motion-fast);
+}
+
+.pi-completion-item:hover {
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.pi-completion-item.selected {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.pi-completion-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface);
+  white-space: nowrap;
+}
+
+.pi-completion-item.selected .pi-completion-name {
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.pi-completion-desc {
+  font-size: var(--text-xs);
+  color: var(--md-sys-color-on-surface-variant);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .pi-composer-row {
+    flex-wrap: wrap;
+  }
+
+  .pi-composer-inline-actions {
+    margin-left: auto;
+  }
+}

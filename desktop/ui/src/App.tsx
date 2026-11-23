@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import "./md3-tokens.css";
+import "./components/AppShell.css";
 import { isTauriRuntime, tauriApi } from "./api/tauri";
-import { ChatTranscript } from "./components/ChatTranscript";
+import { ChatTranscript, STARTER_SUGGESTIONS } from "./components/ChatTranscript";
 import { Composer } from "./components/Composer";
 import { ExtensionUiLayer } from "./components/ExtensionUiLayer";
 import { ForkModal } from "./components/ForkModal";
 import { HistoryTreeModal } from "./components/HistoryTreeModal";
+import {
+  AlertIcon,
+  GitMergeIcon,
+  ShieldCheckIcon,
+  TerminalIcon,
+} from "./components/Icons";
 import { MergeQueueModal } from "./components/MergeQueueModal";
 import { ProviderSettingsModal } from "./components/ProviderSettingsModal";
 import { RunLogDrawer } from "./components/RunLogDrawer";
@@ -96,7 +103,6 @@ const INITIAL_LOG_LINES: string[] = [
   '{"task_id":"audit-sandbox-binds","kind":"completed_readonly","detail":"Verified read-only .git bind mount under bubblewrap"}',
 ];
 
-
 function parseVerdictStatus(raw: string): VerdictStatus {
   const lower = raw.toLowerCase();
   if (lower === "pass") return "pass";
@@ -109,7 +115,7 @@ export function App() {
   const { state, projectSessions, activeSession, actions } = usePiWorkspace();
   const desktopRuntime = isTauriRuntime();
 
-  const [verityPanelOpen, setVerityPanelOpen] = useState(true);
+  const [verityPanelOpen, setVerityPanelOpen] = useState(false);
   const [mergeQueueOpen, setMergeQueueOpen] = useState(false);
   const [runLogOpen, setRunLogOpen] = useState(false);
 
@@ -176,6 +182,19 @@ export function App() {
     () => subagents.find((t) => t.taskId === selectedTaskId) ?? null,
     [subagents, selectedTaskId]
   );
+
+  const pendingHandoffCount = useMemo(
+    () => subagents.filter((t) => t.status === "awaiting_spec_review").length,
+    [subagents]
+  );
+
+  function handleToggleRunLog() {
+    setRunLogOpen((open) => {
+      const next = !open;
+      if (next) setVerityPanelOpen(true);
+      return next;
+    });
+  }
 
   async function handleSpawnSubagent(req: SpawnSubagentRequest) {
     setSpawning(true);
@@ -342,18 +361,44 @@ export function App() {
     }
   }
 
+  const hasMessages = state.messages.length > 0;
+  const isHeroEmpty = !hasMessages && state.liveTools.length === 0;
+  const runLogVisible = verityPanelOpen && runLogOpen;
+
+  const composerElement = (variant: "hero" | "docked") => (
+    <Composer
+      draft={state.draft}
+      attachments={state.attachments}
+      models={state.models}
+      selectedModel={state.selectedModel}
+      thinkingLevels={state.thinkingLevels}
+      thinkingLevel={state.thinkingLevel}
+      commands={state.commands}
+      isStreaming={state.isStreaming}
+      pendingQueueCount={state.pendingQueueCount}
+      variant={variant}
+      onDraftChange={actions.setDraft}
+      onRecallUp={actions.recallUp}
+      onRecallDown={actions.recallDown}
+      onAddAttachment={actions.addAttachment}
+      onRemoveAttachment={actions.removeAttachment}
+      onSelectModel={(p, m) => void actions.selectModel(p, m)}
+      onSelectThinkingLevel={(l) => void actions.selectThinkingLevel(l)}
+      onSend={() => void actions.sendPrompt()}
+      onSteer={() => void actions.steerPrompt()}
+      onFollowUp={() => void actions.followUpPrompt()}
+      onClearQueue={() => void actions.clearQueue()}
+      onAbort={() => void actions.abortTurn()}
+    />
+  );
+
   return (
     <div
-      style={{
-        display: "grid",
-        gridTemplateColumns: verityPanelOpen
-          ? "280px minmax(0, 1fr) 440px"
-          : "280px minmax(0, 1fr)",
-        height: "100vh",
-        overflow: "hidden",
-        background: "var(--md-sys-color-surface)",
-        color: "var(--md-sys-color-on-surface)",
-      }}
+      className={
+        verityPanelOpen
+          ? "verity-shell verity-shell--panel-open"
+          : "verity-shell"
+      }
     >
       <Sidebar
         projects={state.projects}
@@ -374,115 +419,155 @@ export function App() {
         onToggleTheme={actions.toggleTheme}
       />
 
-      <main
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          minWidth: 0,
-          height: "100vh",
-          borderRight: verityPanelOpen
-            ? "1px solid var(--md-sys-color-outline-variant)"
-            : "none",
-        }}
-      >
-        <header
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "12px 20px",
-            borderBottom: "1px solid var(--md-sys-color-outline-variant)",
-            background: "var(--md-sys-color-surface-container-low)",
-            gap: 12,
-          }}
-        >
-          <div style={{ minWidth: 0 }}>
-            <div style={{ fontWeight: 600, fontSize: 15 }}>
-              {activeSession?.name ?? "Verity Orchestrator"}
-            </div>
-            <div
-              style={{
-                fontSize: 12,
-                color: "var(--md-sys-color-on-surface-variant)",
-              }}
-            >
-              {activeProject?.name ?? "No project"} ·{" "}
-              {state.selectedModel.label} · Thinking: {state.thinkingLevel}
-            </div>
+      <main className="verity-main">
+        <header className="verity-topbar">
+          <div className="verity-topbar-left">
+            {hasMessages && (
+              <>
+                <h1 className="verity-topbar-title">
+                  {activeSession?.name ?? "Verity"}
+                </h1>
+                {state.isStreaming && (
+                  <span className="verity-status-pill" role="status">
+                    <span className="verity-status-dot" aria-hidden="true" />
+                    Running
+                  </span>
+                )}
+              </>
+            )}
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div className="verity-topbar-actions">
             <button
               type="button"
-              className="md-btn md-btn--tonal"
+              className={
+                mergeEntries.length > 0
+                  ? "verity-topbar-pill verity-topbar-pill--highlighted"
+                  : "verity-topbar-pill"
+              }
               onClick={() => setMergeQueueOpen(true)}
+              title="Open merge queue"
             >
-              Merge Queue ({mergeEntries.length})
+              <GitMergeIcon size={15} />
+              <span className="verity-topbar-btn-label">Merge Queue</span>
+              {mergeEntries.length > 0 && (
+                <span className="verity-topbar-badge">
+                  {mergeEntries.length}
+                </span>
+              )}
             </button>
+
             <button
               type="button"
-              className="md-btn md-btn--tonal"
-              onClick={() => setRunLogOpen((v) => !v)}
+              className={
+                runLogVisible
+                  ? "verity-topbar-pill verity-topbar-pill--icon verity-topbar-pill--active"
+                  : "verity-topbar-pill verity-topbar-pill--icon"
+              }
+              aria-pressed={runLogVisible}
+              aria-label={runLogVisible ? "Hide run log" : "Show run log"}
+              onClick={handleToggleRunLog}
+              title={runLogVisible ? "Hide run log" : "Show run log"}
             >
-              Run Log
+              <TerminalIcon size={15} />
             </button>
+
             <button
               type="button"
-              className="md-btn md-btn--filled"
+              className={
+                verityPanelOpen
+                  ? "verity-topbar-pill verity-topbar-pill--active"
+                  : "verity-topbar-pill"
+              }
+              aria-pressed={verityPanelOpen}
               onClick={() => setVerityPanelOpen((v) => !v)}
+              title={
+                verityPanelOpen
+                  ? "Hide verification panel"
+                  : "Show verification panel"
+              }
             >
-              {verityPanelOpen ? "Hide Verification" : "Verification"}
+              <ShieldCheckIcon size={15} />
+              <span className="verity-topbar-btn-label">Verification</span>
+              {pendingHandoffCount > 0 ? (
+                <span className="verity-topbar-badge">
+                  {pendingHandoffCount}
+                </span>
+              ) : (
+                subagents.length > 0 && (
+                  <span className="verity-topbar-dot" aria-hidden="true" />
+                )
+              )}
             </button>
           </div>
         </header>
 
-        <div style={{ flex: 1, overflowY: "auto", minHeight: 0 }}>
-          <ChatTranscript
-            messages={state.messages}
-            isStreaming={state.isStreaming}
-            liveTools={state.liveTools}
-            retryBanner={state.retryBanner}
-            onAbortRetry={() => void actions.abortRetry()}
-            onPickStarterPrompt={(prompt) => actions.setDraft(prompt)}
-          />
-        </div>
+        {isHeroEmpty ? (
+          <div className="verity-hero-stage">
+            <div className="verity-hero-content">
+              <h1 className="verity-hero-headline">Where should we start?</h1>
 
-        <Composer
-          draft={state.draft}
-          attachments={state.attachments}
-          models={state.models}
-          selectedModel={state.selectedModel}
-          thinkingLevels={state.thinkingLevels}
-          thinkingLevel={state.thinkingLevel}
-          commands={state.commands}
-          isStreaming={state.isStreaming}
-          pendingQueueCount={state.pendingQueueCount}
-          onDraftChange={actions.setDraft}
-          onRecallUp={actions.recallUp}
-          onRecallDown={actions.recallDown}
-          onAddAttachment={actions.addAttachment}
-          onRemoveAttachment={actions.removeAttachment}
-          onSelectModel={(p, m) => void actions.selectModel(p, m)}
-          onSelectThinkingLevel={(l) => void actions.selectThinkingLevel(l)}
-          onSend={() => void actions.sendPrompt()}
-          onSteer={() => void actions.steerPrompt()}
-          onFollowUp={() => void actions.followUpPrompt()}
-          onClearQueue={() => void actions.clearQueue()}
-          onAbort={() => void actions.abortTurn()}
-        />
+              {state.retryBanner && (
+                <div className="pi-retry-banner" role="status">
+                  <span className="pi-retry-banner-text">
+                    <AlertIcon size={15} />
+                    <span>
+                      Auto-retrying request (attempt {state.retryBanner.attempt} of{" "}
+                      {state.retryBanner.maxAttempts},{" "}
+                      {Math.ceil(state.retryBanner.delayMs / 1000)}s backoff)...
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    className="md3-btn-outlined"
+                    onClick={() => void actions.abortRetry()}
+                  >
+                    Abort retry
+                  </button>
+                </div>
+              )}
+
+              {composerElement("hero")}
+
+              <div className="verity-hero-suggestions">
+                {STARTER_SUGGESTIONS.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className="verity-suggestion-line"
+                    onClick={() => actions.setDraft(item.prompt)}
+                  >
+                    <span className="verity-suggestion-icon" aria-hidden="true">
+                      {item.icon}
+                    </span>
+                    <span>{item.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="verity-transcript-stage">
+              <ChatTranscript
+                messages={state.messages}
+                isStreaming={state.isStreaming}
+                liveTools={state.liveTools}
+                retryBanner={state.retryBanner}
+                onAbortRetry={() => void actions.abortRetry()}
+                onPickStarterPrompt={(prompt) => actions.setDraft(prompt)}
+              />
+            </div>
+
+            {composerElement("docked")}
+          </>
+        )}
       </main>
 
       {verityPanelOpen && (
         <aside
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: 16,
-            padding: 16,
-            overflowY: "auto",
-            background:
-              "var(--md-sys-color-surface-container-lowest, var(--md-sys-color-surface))",
-          }}
+          className="verity-right-rail"
+          aria-label="Verification workspace"
         >
           <SubagentRail
             tasks={subagents}

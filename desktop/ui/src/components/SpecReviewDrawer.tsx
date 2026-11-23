@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   approvalBlockers,
   canApproveHandoff,
@@ -6,7 +6,20 @@ import {
   formatVerifierLabel,
   shortenDigest,
   type HandoffView,
+  type VerdictStatus,
+  type VerifierKind,
 } from "../types/verity";
+import {
+  AlertIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CloseIcon,
+  CopyIcon,
+  ShieldCheckIcon,
+  XCircleIcon,
+} from "./Icons";
+import "./VerificationRail.css";
 
 export interface SpecReviewDrawerProps {
   handoff: HandoffView | null;
@@ -18,242 +31,58 @@ export interface SpecReviewDrawerProps {
   approved?: boolean;
 }
 
-const styles: Record<string, CSSProperties> = {
-  drawer: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 16,
-    background: "var(--md-sys-color-surface)",
-    color: "var(--md-sys-color-on-surface)",
-    borderRadius: "var(--md-sys-shape-corner-lg)",
-    border: "1px solid var(--md-sys-color-outline-variant)",
-    padding: 20,
-  },
-  header: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 10,
-    borderBottom: "1px solid var(--md-sys-color-outline-variant)",
-    paddingBottom: 14,
-  },
-  headerTop: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 12,
-  },
-  titleGroup: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 2,
-  },
-  eyebrow: {
-    fontSize: 11,
-    fontWeight: 700,
-    textTransform: "uppercase",
-    letterSpacing: "0.06em",
-    color: "var(--md-sys-color-on-surface-variant)",
-  },
-  title: {
-    margin: 0,
-    fontSize: 18,
-    fontWeight: 600,
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-  },
-  closeBtn: {
-    border: "1px solid var(--md-sys-color-outline-variant)",
-    background: "transparent",
-    color: "var(--md-sys-color-on-surface-variant)",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    padding: "6px 12px",
-    fontSize: 12,
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  badgeRow: {
-    display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    gap: 8,
-  },
-  chip: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 6,
-    padding: "4px 11px",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    fontSize: 12,
-    fontWeight: 600,
-  },
-  digestPill: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 6,
-    padding: "4px 11px",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    fontSize: 12,
-    fontWeight: 600,
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-    background: "var(--md-sys-color-surface-container-high)",
-    color: "var(--md-sys-color-on-surface)",
-    border: "1px solid var(--md-sys-color-outline-variant)",
-    cursor: "pointer",
-  },
-  verdictReason: {
-    margin: 0,
-    fontSize: 12,
-    color: "var(--md-sys-color-on-surface-variant)",
-  },
-  violationBox: {
-    background: "var(--md-sys-color-error-container)",
-    color: "var(--md-sys-color-on-error-container)",
-    borderRadius: "var(--md-sys-shape-corner-md)",
-    padding: "12px 14px",
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-  },
-  violationTitle: {
-    margin: 0,
-    fontSize: 13,
-    fontWeight: 700,
-  },
-  violationList: {
-    margin: 0,
-    paddingLeft: 18,
-    display: "flex",
-    flexDirection: "column",
-    gap: 6,
-    fontSize: 12,
-  },
-  splitGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
-    gap: 16,
-  },
-  paneCard: {
-    background: "var(--md-sys-color-surface-container)",
-    borderRadius: "var(--md-sys-shape-corner-md)",
-    padding: 14,
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-  },
-  paneHeading: {
-    margin: 0,
-    fontSize: 13,
-    fontWeight: 600,
-    color: "var(--md-sys-color-on-surface)",
-  },
-  codeSurface: {
-    margin: 0,
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-    fontSize: 12.5,
-    lineHeight: 1.5,
-    background: "var(--md-sys-color-surface-container-low)",
-    color: "var(--md-sys-color-on-surface)",
-    borderRadius: 10,
-    padding: 12,
-    overflowX: "auto",
-    whiteSpace: "pre-wrap",
-  },
-  proseSurface: {
-    fontSize: 13.5,
-    lineHeight: 1.55,
-    background: "var(--md-sys-color-surface-container-low)",
-    color: "var(--md-sys-color-on-surface)",
-    borderRadius: 10,
-    padding: 12,
-    whiteSpace: "pre-wrap",
-  },
-  collapsibleCard: {
-    background: "var(--md-sys-color-surface-container)",
-    borderRadius: "var(--md-sys-shape-corner-md)",
-    border: "1px solid var(--md-sys-color-outline-variant)",
-    overflow: "hidden",
-  },
-  collapsibleToggle: {
-    width: "100%",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 8,
-    padding: "11px 14px",
-    border: "none",
-    background: "transparent",
-    color: "var(--md-sys-color-on-surface)",
-    fontSize: 13,
-    fontWeight: 600,
-    cursor: "pointer",
-    textAlign: "left",
-  },
-  collapsibleBody: {
-    padding: "0 14px 14px",
-    display: "flex",
-    flexDirection: "column",
-    gap: 10,
-  },
-  pathList: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: 6,
-  },
-  pathPill: {
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-    fontSize: 12,
-    padding: "3px 9px",
-    borderRadius: 8,
-    background: "var(--md-sys-color-surface-container-low)",
-    color: "var(--md-sys-color-on-surface)",
-    border: "1px solid var(--md-sys-color-outline-variant)",
-  },
-  footer: {
-    display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 12,
-    paddingTop: 12,
-    borderTop: "1px solid var(--md-sys-color-outline-variant)",
-  },
-  blockerHint: {
-    fontSize: 12,
-    color: "var(--md-sys-color-error)",
-    margin: 0,
-  },
-  actions: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10,
-    marginLeft: "auto",
-  },
-  approveBtn: {
-    border: "none",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    padding: "10px 20px",
-    fontSize: 13,
-    fontWeight: 600,
-    background: "var(--md-sys-color-primary)",
-    color: "var(--md-sys-color-on-primary)",
-    cursor: "pointer",
-  },
-  rejectBtn: {
-    border: "1px solid var(--md-sys-color-error)",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    padding: "9px 18px",
-    fontSize: 13,
-    fontWeight: 600,
-    background: "transparent",
-    color: "var(--md-sys-color-error)",
-    cursor: "pointer",
-  },
-  emptyState: {
-    padding: 28,
-    textAlign: "center",
-    color: "var(--md-sys-color-on-surface-variant)",
-    fontSize: 13,
-  },
-};
+function formatProbeLabel(verifier: VerifierKind, count: number): string {
+  switch (verifier) {
+    case "lean":
+      return count === 1
+        ? "Lean 4 proof obligation"
+        : "Lean 4 proof obligations";
+    case "kani":
+      return count === 1 ? "kani::cover! probe" : "kani::cover! probes";
+    default: {
+      const _exhaustive: never = verifier;
+      void _exhaustive;
+      return count === 1 ? "verification probe" : "verification probes";
+    }
+  }
+}
+
+function verdictTone(status: VerdictStatus): "success" | "warning" | "danger" {
+  switch (status) {
+    case "pass":
+      return "success";
+    case "inconclusive":
+      return "warning";
+    case "counterexample":
+    case "invalid_report":
+      return "danger";
+    default: {
+      const _exhaustive: never = status;
+      return _exhaustive;
+    }
+  }
+}
+
+function diffLineClass(line: string): string {
+  if (
+    line.startsWith("diff ") ||
+    line.startsWith("index ") ||
+    line.startsWith("--- ") ||
+    line.startsWith("+++ ")
+  ) {
+    return "vr-diff-line vr-diff-line--meta";
+  }
+  if (line.startsWith("@@")) {
+    return "vr-diff-line vr-diff-line--hunk";
+  }
+  if (line.startsWith("+")) {
+    return "vr-diff-line vr-diff-line--add";
+  }
+  if (line.startsWith("-")) {
+    return "vr-diff-line vr-diff-line--del";
+  }
+  return "vr-diff-line vr-diff-line--ctx";
+}
 
 export function SpecReviewDrawer({
   handoff,
@@ -266,11 +95,43 @@ export function SpecReviewDrawer({
 }: SpecReviewDrawerProps) {
   const [diffExpanded, setDiffExpanded] = useState(false);
   const [copiedDigest, setCopiedDigest] = useState(false);
+  const [rejectNoteOpen, setRejectNoteOpen] = useState(false);
+  const [rejectReason, setRejectReason] = useState("");
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    setRejectNoteOpen(false);
+    setRejectReason("");
+  }, [handoff?.task_id]);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!onClose || handoff === null) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose?.();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose, handoff]);
 
   if (handoff === null) {
     return (
-      <section style={styles.drawer} aria-label="Spec review drawer">
-        <div style={styles.emptyState}>
+      <section
+        className="vr-panel vr-panel--surface"
+        aria-label="Spec review drawer"
+      >
+        <div className="vr-empty-state">
           Select a Write subagent handoff to review its extracted formal spec
           and blind back-translation.
         </div>
@@ -282,100 +143,165 @@ export function SpecReviewDrawer({
   const blockers = approvalBlockers(handoff);
   const hygienePassed =
     handoff.hygiene_clean && handoff.hygiene_violations.length === 0;
-  const verdictPassed = handoff.verdict.status === "pass";
+  const layer2Tone = verdictTone(handoff.verdict.status);
   const specDigest = handoff.spec_digest;
+  const diffLines =
+    diffText !== undefined && diffText.trim().length > 0
+      ? diffText.split("\n")
+      : [];
+  const hasDiffText = diffLines.length > 0;
 
   function handleCopyDigest() {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
       void navigator.clipboard.writeText(specDigest);
       setCopiedDigest(true);
-      window.setTimeout(() => setCopiedDigest(false), 1600);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopiedDigest(false);
+        copyTimerRef.current = null;
+      }, 1600);
     }
   }
 
+  function handleRejectClick() {
+    if (!handoff) {
+      return;
+    }
+    const trimmed = rejectReason.trim();
+    if (trimmed.length > 0) {
+      void onReject(handoff, trimmed);
+    } else {
+      void onReject(handoff);
+    }
+    setRejectReason("");
+    setRejectNoteOpen(false);
+  }
+
   return (
-    <section style={styles.drawer} aria-label="Spec review drawer">
-      <header style={styles.header}>
-        <div style={styles.headerTop}>
-          <div style={styles.titleGroup}>
-            <span style={styles.eyebrow}>Spec Trust Boundary</span>
-            <h2 style={styles.title}>{handoff.task_id}</h2>
-          </div>
-          {onClose && (
-            <button type="button" style={styles.closeBtn} onClick={onClose}>
-              Close
-            </button>
-          )}
+    <section
+      className="vr-panel vr-panel--surface"
+      aria-label="Spec review drawer"
+    >
+      <header className="vr-header vr-header--bordered">
+        <div className="vr-title-group">
+          <span className="vr-eyebrow">Spec Trust Boundary</span>
+          <h2 className="vr-title vr-title--mono" title={handoff.task_id}>
+            {handoff.task_id}
+          </h2>
         </div>
-
-        <div style={styles.badgeRow}>
-          <span
-            style={{
-              ...styles.chip,
-              background: "var(--md-sys-color-primary-container)",
-              color: "var(--md-sys-color-on-primary-container)",
-            }}
-          >
-            {formatVerifierLabel(handoff.verifier)}
-          </span>
-
-          <span
-            style={{
-              ...styles.chip,
-              background: hygienePassed
-                ? "var(--md-sys-color-tertiary-container)"
-                : "var(--md-sys-color-error-container)",
-              color: hygienePassed
-                ? "var(--md-sys-color-on-tertiary-container)"
-                : "var(--md-sys-color-on-error-container)",
-            }}
-          >
-            {hygienePassed
-              ? "Layer 1 Hygiene: 0 violations"
-              : `Layer 1 Hygiene: ${handoff.hygiene_violations.length} violation${handoff.hygiene_violations.length === 1 ? "" : "s"}`}
-          </span>
-
-          <span
-            style={{
-              ...styles.chip,
-              background: verdictPassed
-                ? "var(--md-sys-color-tertiary-container)"
-                : "var(--md-sys-color-error-container)",
-              color: verdictPassed
-                ? "var(--md-sys-color-on-tertiary-container)"
-                : "var(--md-sys-color-on-error-container)",
-            }}
-          >
-            Layer 2 Verdict: {formatVerdictStatus(handoff.verdict.status)} ·{" "}
-            {handoff.verdict.checks_passed} checks ·{" "}
-            {handoff.verdict.probes_satisfied} kani::cover! probe
-            {handoff.verdict.probes_satisfied === 1 ? "" : "s"}
-          </span>
-
+        {onClose && (
           <button
             type="button"
-            onClick={handleCopyDigest}
-            title={`Copy canonical SpecDigest: ${handoff.spec_digest}`}
-            style={styles.digestPill}
+            className="vr-icon-close"
+            onClick={onClose}
+            aria-label="Close spec review drawer"
+            title="Close (Esc)"
           >
-            <span>SpecDigest</span>
-            <code>{shortenDigest(handoff.spec_digest)}</code>
-            <span>{copiedDigest ? "Copied" : "Copy"}</span>
+            <CloseIcon size={15} />
           </button>
-        </div>
-
-        {handoff.verdict.reason.trim().length > 0 && (
-          <p style={styles.verdictReason}>{handoff.verdict.reason}</p>
         )}
       </header>
 
+      <div className="vr-drawer-meta-bar">
+        <span className="verity-badge verity-badge--neutral">
+          <ShieldCheckIcon size={12} />
+          {formatVerifierLabel(handoff.verifier)}
+        </span>
+
+        <button
+          type="button"
+          onClick={handleCopyDigest}
+          title={`Copy canonical SpecDigest: ${handoff.spec_digest}`}
+          className="vr-digest-btn"
+        >
+          <span>SpecDigest</span>
+          <code className="vr-digest-code">
+            {shortenDigest(handoff.spec_digest)}
+          </code>
+          {copiedDigest ? (
+            <span className="vr-digest-status vr-digest-status--copied">
+              <CheckIcon size={12} />
+            </span>
+          ) : (
+            <CopyIcon size={12} />
+          )}
+        </button>
+      </div>
+
+      <div className="vr-layer-grid">
+        <div className="vr-layer-card">
+          <div className="vr-layer-head">
+            <span className="vr-layer-kicker">
+              Layer 1 · Scope &amp; Hygiene
+            </span>
+            <span
+              className={`vr-layer-status vr-layer-status--${
+                hygienePassed ? "success" : "danger"
+              }`}
+            >
+              {hygienePassed ? (
+                <ShieldCheckIcon size={12} />
+              ) : (
+                <XCircleIcon size={12} />
+              )}
+              {hygienePassed ? "Clean" : "Violations"}
+            </span>
+          </div>
+          <div className="vr-layer-headline">
+            {hygienePassed
+              ? "0 AST violations"
+              : `${handoff.hygiene_violations.length} AST violation${
+                  handoff.hygiene_violations.length === 1 ? "" : "s"
+                }`}
+          </div>
+          <p className="vr-layer-detail">
+            {handoff.changed_paths.length} changed file
+            {handoff.changed_paths.length === 1 ? "" : "s"} inspected against
+            write scope.
+          </p>
+        </div>
+
+        <div className="vr-layer-card">
+          <div className="vr-layer-head">
+            <span className="vr-layer-kicker">Layer 2 · Formal Verdict</span>
+            <span className={`vr-layer-status vr-layer-status--${layer2Tone}`}>
+              {layer2Tone === "success" ? (
+                <CheckIcon size={12} />
+              ) : layer2Tone === "warning" ? (
+                <AlertIcon size={12} />
+              ) : (
+                <XCircleIcon size={12} />
+              )}
+              {formatVerdictStatus(handoff.verdict.status)}
+            </span>
+          </div>
+          <div className="vr-layer-headline">
+            {handoff.verdict.checks_passed} check
+            {handoff.verdict.checks_passed === 1 ? "" : "s"} passed
+          </div>
+          <p className="vr-layer-detail">
+            {handoff.verdict.probes_satisfied}{" "}
+            {formatProbeLabel(
+              handoff.verifier,
+              handoff.verdict.probes_satisfied
+            )}
+          </p>
+          {handoff.verdict.reason.trim().length > 0 && (
+            <p className="vr-layer-detail">{handoff.verdict.reason.trim()}</p>
+          )}
+        </div>
+      </div>
+
       {!hygienePassed && (
-        <div style={styles.violationBox} role="alert">
-          <p style={styles.violationTitle}>
+        <div className="vr-violation-banner" role="alert">
+          <p className="vr-violation-title">
+            <AlertIcon size={15} />
             Layer 1 AST Hygiene Violations ({handoff.hygiene_violations.length})
           </p>
           {handoff.hygiene_violations.length > 0 ? (
-            <ul style={styles.violationList}>
+            <ul className="vr-violation-list">
               {handoff.hygiene_violations.map((v, idx) => (
                 <li key={`${v.path}:${v.line}:${v.rule}:${idx}`}>
                   <code>
@@ -386,28 +312,28 @@ export function SpecReviewDrawer({
               ))}
             </ul>
           ) : (
-            <p style={{ margin: 0, fontSize: 12 }}>
+            <p className="vr-layer-detail">
               Hygiene gate marked unclean without itemized diagnostics.
             </p>
           )}
         </div>
       )}
 
-      <div style={styles.splitGrid}>
-        <div style={styles.paneCard}>
-          <h3 style={styles.paneHeading}>Extracted Formal Spec &amp; Bounds</h3>
-          <pre style={styles.codeSurface}>
+      <div className="vr-split-grid">
+        <div className="vr-pane-card">
+          <h3 className="vr-pane-heading">Extracted Formal Spec &amp; Bounds</h3>
+          <pre className="vr-code-surface">
             {handoff.extracted_spec.trim().length > 0
               ? handoff.extracted_spec
               : "No extracted spec lines recorded for this handoff."}
           </pre>
         </div>
 
-        <div style={styles.paneCard}>
-          <h3 style={styles.paneHeading}>
+        <div className="vr-pane-card">
+          <h3 className="vr-pane-heading">
             Blind Back-Translation (Plain English)
           </h3>
-          <div style={styles.proseSurface}>
+          <div className="vr-prose-surface">
             {handoff.back_translation &&
             handoff.back_translation.trim().length > 0
               ? handoff.back_translation
@@ -416,90 +342,126 @@ export function SpecReviewDrawer({
         </div>
       </div>
 
-      <div style={styles.collapsibleCard}>
+      <div className="vr-collapsible">
         <button
           type="button"
-          style={styles.collapsibleToggle}
+          className="vr-collapsible-toggle"
           aria-expanded={diffExpanded}
           onClick={() => setDiffExpanded((prev) => !prev)}
         >
-          <span>
-            Changed Paths &amp; Full Implementation Diff (
+          <span className="vr-collapsible-lead">
+            {diffExpanded ? (
+              <ChevronDownIcon size={15} />
+            ) : (
+              <ChevronRightIcon size={15} />
+            )}
+            Changed Paths &amp; Implementation Diff (
             {handoff.changed_paths.length} file
             {handoff.changed_paths.length === 1 ? "" : "s"})
           </span>
-          <span
-            style={{
-              fontSize: 12,
-              color: "var(--md-sys-color-on-surface-variant)",
-            }}
-          >
+          <span className="vr-collapsible-hint">
             {diffExpanded ? "Hide" : "Show"}
           </span>
         </button>
 
         {diffExpanded && (
-          <div style={styles.collapsibleBody}>
-            <div style={styles.pathList}>
+          <div className="vr-collapsible-body">
+            <div className="vr-path-list">
               {handoff.changed_paths.map((path) => (
-                <span key={path} style={styles.pathPill}>
+                <span key={path} className="vr-path-pill">
                   {path}
                 </span>
               ))}
             </div>
-            <pre style={styles.codeSurface}>
-              {diffText && diffText.trim().length > 0
-                ? diffText
-                : `Candidate commit ${shortenDigest(handoff.candidate_commit, 10, 0)} on base ${shortenDigest(handoff.base_commit, 10, 0)}.\nFull diff text not loaded for this handoff.`}
-            </pre>
+            {hasDiffText ? (
+              <pre className="vr-diff-viewer" aria-label="Unified diff">
+                {diffLines.map((line, index) => (
+                  <span
+                    key={`${index}:${line.slice(0, 24)}`}
+                    className={diffLineClass(line)}
+                  >
+                    {line.length > 0 ? line : " "}
+                  </span>
+                ))}
+              </pre>
+            ) : (
+              <pre className="vr-code-surface">
+                {`Candidate commit ${shortenDigest(handoff.candidate_commit, 10, 0)} on base ${shortenDigest(handoff.base_commit, 10, 0)}.\nFull diff text not loaded for this handoff.`}
+              </pre>
+            )}
           </div>
         )}
       </div>
 
-      <footer style={styles.footer}>
+      <footer className="vr-drawer-footer">
         {blockers.length > 0 && (
-          <p style={styles.blockerHint}>
-            Approval blocked: {blockers.join("; ")}.
+          <p className="vr-blocker-hint" role="alert">
+            <AlertIcon size={14} />
+            <span>Approval blocked: {blockers.join("; ")}.</span>
           </p>
         )}
 
-        <div style={styles.actions}>
+        {rejectNoteOpen && (
+          <div className="vr-reject-note-row">
+            <label className="vr-reject-note-label" htmlFor="vr-reject-reason">
+              Rejection reason (optional)
+            </label>
+            <input
+              id="vr-reject-reason"
+              type="text"
+              className="vr-input"
+              value={rejectReason}
+              disabled={submitting}
+              onChange={(e) => setRejectReason(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !submitting) {
+                  e.preventDefault();
+                  handleRejectClick();
+                }
+              }}
+              placeholder="Explain what the formal spec or implementation missed…"
+            />
+          </div>
+        )}
+
+        <div className="vr-actions-row">
           <button
             type="button"
-            style={{
-              ...styles.rejectBtn,
-              opacity: submitting ? 0.6 : 1,
-              cursor: submitting ? "wait" : "pointer",
-            }}
+            className="vr-btn vr-btn--ghost vr-btn--sm"
+            aria-expanded={rejectNoteOpen}
             disabled={submitting}
-            onClick={() => {
-              void onReject(handoff);
-            }}
+            onClick={() => setRejectNoteOpen((prev) => !prev)}
           >
-            Reject
+            {rejectNoteOpen ? "Hide note" : "Add rejection note"}
           </button>
 
-          <button
-            type="button"
-            style={{
-              ...styles.approveBtn,
-              opacity: !approvable || submitting || approved ? 0.45 : 1,
-              cursor:
-                !approvable || submitting || approved
-                  ? "not-allowed"
-                  : "pointer",
-            }}
-            disabled={!approvable || submitting || approved}
-            onClick={() => {
-              void onApprove(handoff);
-            }}
-          >
-            {approved
-              ? "Approved for Merge"
-              : submitting
-                ? "Approving…"
-                : "Approve Spec for Merge"}
-          </button>
+          <div className="vr-actions-right">
+            <button
+              type="button"
+              className="vr-btn vr-btn--danger-outline"
+              disabled={submitting}
+              onClick={handleRejectClick}
+            >
+              <XCircleIcon size={14} />
+              Reject
+            </button>
+
+            <button
+              type="button"
+              className="vr-btn vr-btn--success"
+              disabled={!approvable || submitting || approved}
+              onClick={() => {
+                void onApprove(handoff);
+              }}
+            >
+              <CheckIcon size={14} />
+              {approved
+                ? "Approved for Merge"
+                : submitting
+                  ? "Approving…"
+                  : "Approve Spec for Merge"}
+            </button>
+          </div>
         </div>
       </footer>
     </section>

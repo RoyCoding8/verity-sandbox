@@ -1,11 +1,20 @@
-import { useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   classifyRunLogKind,
   parseRunLogLines,
+  shortenDigest,
   type RunLogCategory,
   type RunLogEntry,
-  type RunLogFilter,
 } from "../types/verity";
+import {
+  AlertIcon,
+  CheckIcon,
+  ClockIcon,
+  CloseIcon,
+  SearchIcon,
+  TerminalIcon,
+} from "./Icons";
+import "./VerificationRail.css";
 
 export interface RunLogDrawerProps {
   entries?: readonly RunLogEntry[];
@@ -15,198 +24,68 @@ export interface RunLogDrawerProps {
   onClose?: () => void;
 }
 
-const FILTERS: readonly RunLogFilter[] = ["All", "Merged", "Handoff", "ReadOnly"];
+type LedgerFilter = "All" | RunLogCategory;
 
-function categoryBadgeStyle(category: RunLogCategory): {
-  background: string;
-  color: string;
-} {
-  switch (category) {
-    case "Merged":
-      return {
-        background: "var(--md-sys-color-tertiary-container)",
-        color: "var(--md-sys-color-on-tertiary-container)",
-      };
-    case "Handoff":
-      return {
-        background: "var(--md-sys-color-primary-container)",
-        color: "var(--md-sys-color-on-primary-container)",
-      };
-    case "ReadOnly":
-      return {
-        background: "var(--md-sys-color-secondary-container)",
-        color: "var(--md-sys-color-on-secondary-container)",
-      };
-    case "Other":
-      return {
-        background: "var(--md-sys-color-surface-container-high)",
-        color: "var(--md-sys-color-on-surface-variant)",
-      };
-    default: {
-      const _exhaustive: never = category;
-      return _exhaustive;
-    }
-  }
+interface FilterOption {
+  id: LedgerFilter;
+  label: string;
 }
 
-const styles: Record<string, CSSProperties> = {
-  drawer: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 14,
-    background: "var(--md-sys-color-surface)",
-    color: "var(--md-sys-color-on-surface)",
-    border: "1px solid var(--md-sys-color-outline-variant)",
-    borderRadius: "var(--md-sys-shape-corner-lg)",
-    padding: 18,
-  },
-  header: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 10,
-  },
-  titleGroup: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 2,
-  },
-  title: {
-    margin: 0,
-    fontSize: 17,
-    fontWeight: 600,
-  },
-  subtitle: {
-    margin: 0,
-    fontSize: 12,
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-    color: "var(--md-sys-color-on-surface-variant)",
-  },
-  closeBtn: {
-    border: "1px solid var(--md-sys-color-outline-variant)",
-    background: "transparent",
-    color: "var(--md-sys-color-on-surface-variant)",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    padding: "6px 12px",
-    fontSize: 12,
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  controls: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 10,
-  },
-  searchInput: {
-    width: "100%",
-    padding: "9px 14px",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    border: "1px solid var(--md-sys-color-outline-variant)",
-    background: "var(--md-sys-color-surface-container-low)",
-    color: "var(--md-sys-color-on-surface)",
-    fontSize: 13,
-    fontFamily: "inherit",
-  },
-  chipRow: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: 8,
-  },
-  filterChip: {
-    border: "1px solid var(--md-sys-color-outline-variant)",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    padding: "5px 12px",
-    fontSize: 12,
-    fontWeight: 600,
-    cursor: "pointer",
-    background: "var(--md-sys-color-surface-container-low)",
-    color: "var(--md-sys-color-on-surface-variant)",
-  },
-  filterChipActive: {
-    background: "var(--md-sys-color-secondary-container)",
-    color: "var(--md-sys-color-on-secondary-container)",
-    borderColor: "transparent",
-  },
-  list: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-    maxHeight: 460,
-    overflowY: "auto",
-  },
-  receiptCard: {
-    background: "var(--md-sys-color-surface-container)",
-    borderRadius: "var(--md-sys-shape-corner-md)",
-    padding: "11px 13px",
-    display: "flex",
-    flexDirection: "column",
-    gap: 6,
-  },
-  receiptTop: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 8,
-    flexWrap: "wrap",
-  },
-  receiptMeta: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    flexWrap: "wrap",
-  },
-  taskBtn: {
-    border: "none",
-    background: "transparent",
-    padding: 0,
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-    fontSize: 13,
-    fontWeight: 600,
-    color: "var(--md-sys-color-primary)",
-    cursor: "pointer",
-    textDecoration: "underline",
-  },
-  taskPlain: {
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-    fontSize: 13,
-    fontWeight: 600,
-    color: "var(--md-sys-color-on-surface)",
-  },
-  kindBadge: {
-    display: "inline-flex",
-    alignItems: "center",
-    padding: "2px 9px",
-    borderRadius: "var(--md-sys-shape-corner-full)",
-    fontSize: 11,
-    fontWeight: 600,
-  },
-  timestamp: {
-    fontSize: 11,
-    color: "var(--md-sys-color-on-surface-variant)",
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-  },
-  detail: {
-    margin: 0,
-    fontSize: 12.5,
-    lineHeight: 1.45,
-    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-    background: "var(--md-sys-color-surface-container-low)",
-    color: "var(--md-sys-color-on-surface)",
-    borderRadius: 8,
-    padding: "8px 10px",
-    overflowX: "auto",
-    whiteSpace: "pre-wrap",
-    wordBreak: "break-word",
-  },
-  emptyState: {
-    padding: 24,
-    textAlign: "center",
-    fontSize: 13,
-    color: "var(--md-sys-color-on-surface-variant)",
-    background: "var(--md-sys-color-surface-container)",
-    borderRadius: "var(--md-sys-shape-corner-md)",
-  },
-};
+const FILTER_OPTIONS: readonly FilterOption[] = [
+  { id: "All", label: "All" },
+  { id: "Merged", label: "Approved/Merged" },
+  { id: "Handoff", label: "Review" },
+  { id: "ReadOnly", label: "Read-only" },
+  { id: "Other", label: "Other/Unparsed" },
+];
+
+function classifyLedgerCategory(kind: string): RunLogCategory {
+  const normalized = kind.trim().toLowerCase();
+  if (normalized === "approved_for_merge") {
+    return "Merged";
+  }
+  return classifyRunLogKind(kind);
+}
+
+function isUnparsedEntry(entry: RunLogEntry): boolean {
+  return entry.kind.trim().toLowerCase() === "unparsed";
+}
+
+function badgeClassForEntry(entry: RunLogEntry): string {
+  const normalized = entry.kind.trim().toLowerCase();
+  if (
+    normalized === "unparsed" ||
+    normalized === "rejected_scope" ||
+    normalized === "rejected_spec" ||
+    normalized === "merge_conflict"
+  ) {
+    return "verity-badge verity-badge--danger";
+  }
+  if (normalized === "merged" || normalized === "approved_for_merge") {
+    return "verity-badge verity-badge--success";
+  }
+  if (
+    normalized === "awaiting_spec_review" ||
+    normalized === "handoff_ready"
+  ) {
+    return "verity-badge verity-badge--warning";
+  }
+  return "verity-badge verity-badge--neutral";
+}
+
+function hashString(input: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function extractDigest(detail: string): string | null {
+  const match = detail.match(/\b(?:sha256:)?[a-f0-9]{16,64}\b/i);
+  return match ? match[0] : null;
+}
 
 export function RunLogDrawer({
   entries,
@@ -216,7 +95,20 @@ export function RunLogDrawer({
   onClose,
 }: RunLogDrawerProps) {
   const [query, setQuery] = useState("");
-  const [activeFilter, setActiveFilter] = useState<RunLogFilter>("All");
+  const [activeFilter, setActiveFilter] = useState<LedgerFilter>("All");
+
+  useEffect(() => {
+    if (!open || !onClose) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose?.();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [open, onClose]);
 
   const resolvedEntries = useMemo<readonly RunLogEntry[]>(() => {
     if (entries !== undefined) {
@@ -229,39 +121,55 @@ export function RunLogDrawer({
   }, [entries, rawLines]);
 
   const filterCounts = useMemo(() => {
-    const counts: Record<RunLogFilter, number> = {
+    const counts: Record<LedgerFilter, number> = {
       All: resolvedEntries.length,
       Merged: 0,
       Handoff: 0,
       ReadOnly: 0,
+      Other: 0,
     };
     for (const entry of resolvedEntries) {
-      const cat = classifyRunLogKind(entry.kind);
-      if (cat === "Merged" || cat === "Handoff" || cat === "ReadOnly") {
-        counts[cat] += 1;
-      }
+      const cat = classifyLedgerCategory(entry.kind);
+      counts[cat] += 1;
     }
     return counts;
   }, [resolvedEntries]);
 
-  const filteredEntries = useMemo(() => {
+  const keyedFilteredEntries = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    return resolvedEntries.filter((entry) => {
+    const seen = new Map<string, number>();
+    const results: Array<{ entry: RunLogEntry; stableKey: string }> = [];
+
+    for (const entry of resolvedEntries) {
       if (
         activeFilter !== "All" &&
-        classifyRunLogKind(entry.kind) !== activeFilter
+        classifyLedgerCategory(entry.kind) !== activeFilter
       ) {
-        return false;
+        continue;
       }
-      if (needle.length === 0) {
-        return true;
+      if (
+        needle.length > 0 &&
+        !entry.task_id.toLowerCase().includes(needle) &&
+        !entry.kind.toLowerCase().includes(needle) &&
+        !entry.detail.toLowerCase().includes(needle)
+      ) {
+        continue;
       }
-      return (
-        entry.task_id.toLowerCase().includes(needle) ||
-        entry.kind.toLowerCase().includes(needle) ||
-        entry.detail.toLowerCase().includes(needle)
-      );
-    });
+
+      const baseKey = [
+        entry.lineNumber !== undefined ? `L${entry.lineNumber}` : "E",
+        entry.timestamp ?? "nt",
+        entry.task_id,
+        entry.kind,
+        hashString(entry.detail),
+      ].join(":");
+      const dupCount = seen.get(baseKey) ?? 0;
+      seen.set(baseKey, dupCount + 1);
+      const stableKey = dupCount === 0 ? baseKey : `${baseKey}#${dupCount}`;
+      results.push({ entry, stableKey });
+    }
+
+    return results;
   }, [resolvedEntries, activeFilter, query]);
 
   if (!open) {
@@ -269,98 +177,131 @@ export function RunLogDrawer({
   }
 
   return (
-    <section style={styles.drawer} aria-label="Run log drawer">
-      <header style={styles.header}>
-        <div style={styles.titleGroup}>
-          <h2 style={styles.title}>Run Log Receipts</h2>
-          <p style={styles.subtitle}>.verity/run-log.jsonl</p>
+    <section
+      className="vr-panel vr-panel--surface"
+      aria-label="Run log drawer"
+    >
+      <header className="vr-header vr-header--bordered">
+        <div className="vr-title-group">
+          <div className="vr-title-row">
+            <TerminalIcon size={15} />
+            <h2 className="vr-title">Run Log Receipts</h2>
+            <span className="vr-count-pill">{resolvedEntries.length}</span>
+          </div>
+          <p className="vr-subtitle">.verity/run-log.jsonl</p>
         </div>
         {onClose && (
-          <button type="button" style={styles.closeBtn} onClick={onClose}>
-            Close
+          <button
+            type="button"
+            className="vr-icon-close"
+            onClick={onClose}
+            aria-label="Close run log drawer"
+            title="Close (Esc)"
+          >
+            <CloseIcon size={15} />
           </button>
         )}
       </header>
 
-      <div style={styles.controls}>
+      <div className="vr-search-wrap">
+        <span className="vr-search-icon" aria-hidden="true">
+          <SearchIcon size={14} />
+        </span>
         <input
           type="search"
+          className="vr-search-input"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search by task ID, event kind, digest, or detail…"
           aria-label="Search run log receipts"
-          style={styles.searchInput}
         />
-
-        <div style={styles.chipRow} role="group" aria-label="Run log filters">
-          {FILTERS.map((filter) => {
-            const active = filter === activeFilter;
-            return (
-              <button
-                key={filter}
-                type="button"
-                aria-pressed={active}
-                onClick={() => setActiveFilter(filter)}
-                style={{
-                  ...styles.filterChip,
-                  ...(active ? styles.filterChipActive : undefined),
-                }}
-              >
-                {filter} ({filterCounts[filter]})
-              </button>
-            );
-          })}
-        </div>
       </div>
 
-      {filteredEntries.length === 0 ? (
-        <div style={styles.emptyState}>
+      <div className="vr-filter-row" role="group" aria-label="Run log filters">
+        {FILTER_OPTIONS.map(({ id, label }) => {
+          const active = id === activeFilter;
+          const isOtherFilter = id === "Other";
+          return (
+            <button
+              key={id}
+              type="button"
+              aria-pressed={active}
+              onClick={() => setActiveFilter(id)}
+              className={`vr-filter-chip${active ? " is-active" : ""}${
+                isOtherFilter ? " vr-filter-chip--danger" : ""
+              }`}
+            >
+              <span>{label}</span>
+              <span>({filterCounts[id]})</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {keyedFilteredEntries.length === 0 ? (
+        <div className="vr-empty-state">
           {resolvedEntries.length === 0
             ? "No receipts recorded in .verity/run-log.jsonl yet."
             : "No receipts match the current filter and search query."}
         </div>
       ) : (
-        <div style={styles.list}>
-          {filteredEntries.map((entry, idx) => {
-            const category = classifyRunLogKind(entry.kind);
-            const badge = categoryBadgeStyle(category);
-            const key = `${entry.lineNumber ?? idx}-${entry.task_id}-${entry.kind}`;
+        <div className="vr-ledger">
+          {keyedFilteredEntries.map(({ entry, stableKey }) => {
+            const unparsed = isUnparsedEntry(entry);
+            const digest = unparsed ? null : extractDigest(entry.detail);
 
             return (
-              <article key={key} style={styles.receiptCard}>
-                <div style={styles.receiptTop}>
-                  <div style={styles.receiptMeta}>
-                    {onSelectTask ? (
+              <article
+                key={stableKey}
+                className={`vr-ledger-row${
+                  unparsed ? " vr-ledger-row--unparsed" : ""
+                }`}
+              >
+                <div className="vr-ledger-top">
+                  <div className="vr-ledger-meta">
+                    {onSelectTask && !unparsed ? (
                       <button
                         type="button"
-                        style={styles.taskBtn}
+                        className="vr-ledger-task-btn"
                         onClick={() => onSelectTask(entry.task_id)}
                       >
                         {entry.task_id}
                       </button>
                     ) : (
-                      <span style={styles.taskPlain}>{entry.task_id}</span>
+                      <span className="vr-ledger-task-plain">
+                        {entry.task_id}
+                      </span>
                     )}
 
-                    <span
-                      style={{
-                        ...styles.kindBadge,
-                        background: badge.background,
-                        color: badge.color,
-                      }}
-                    >
+                    <span className={badgeClassForEntry(entry)}>
+                      {unparsed ? (
+                        <AlertIcon size={11} />
+                      ) : entry.kind.trim().toLowerCase() === "merged" ||
+                        entry.kind.trim().toLowerCase() ===
+                          "approved_for_merge" ? (
+                        <CheckIcon size={11} />
+                      ) : null}
                       {entry.kind}
                     </span>
+
+                    {digest !== null && (
+                      <span className="vr-ledger-digest" title={digest}>
+                        {shortenDigest(digest, 8, 6)}
+                      </span>
+                    )}
                   </div>
 
                   {entry.timestamp ? (
-                    <span style={styles.timestamp}>{entry.timestamp}</span>
+                    <span className="vr-ledger-time">
+                      <ClockIcon size={11} />
+                      {entry.timestamp}
+                    </span>
                   ) : entry.lineNumber !== undefined ? (
-                    <span style={styles.timestamp}>#{entry.lineNumber}</span>
+                    <span className="vr-ledger-time">#{entry.lineNumber}</span>
                   ) : null}
                 </div>
 
-                <pre style={styles.detail}>{entry.detail}</pre>
+                <pre className="vr-ledger-detail">{entry.detail}</pre>
               </article>
             );
           })}

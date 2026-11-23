@@ -1,6 +1,22 @@
-import { useState, type KeyboardEvent } from "react";
+import { useMemo, useState, type KeyboardEvent } from "react";
+import "./Sidebar.css";
 import type { PiProject, PiSessionSummary } from "../api/tauri";
 import type { ThemeMode } from "../theme/md3";
+import {
+  CopyIcon,
+  DownloadIcon,
+  EditIcon,
+  FolderIcon,
+  GitBranchIcon,
+  GitForkIcon,
+  MessageIcon,
+  MoonIcon,
+  PlusIcon,
+  SettingsIcon,
+  SunIcon,
+  VerityLogoMark,
+} from "./Icons";
+import { Md3Select, type Md3SelectOption } from "./Md3Select";
 
 export interface SidebarProps {
   readonly projects: readonly PiProject[];
@@ -39,8 +55,18 @@ export function Sidebar({
   onOpenProviders,
   onToggleTheme,
 }: SidebarProps) {
+  const [expanded, setExpanded] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
+
+  const projectOptions = useMemo<readonly Md3SelectOption[]>(
+    () =>
+      projects.map((project) => ({
+        value: project.id,
+        label: project.name,
+      })),
+    [projects]
+  );
 
   function beginRename(session: PiSessionSummary) {
     setEditingId(session.id);
@@ -55,7 +81,10 @@ export function Sidebar({
     }
   }
 
-  function handleRenameKeyDown(e: KeyboardEvent<HTMLInputElement>, sessionId: string) {
+  function handleRenameKeyDown(
+    e: KeyboardEvent<HTMLInputElement>,
+    sessionId: string
+  ) {
     if (e.key === "Enter") {
       e.preventDefault();
       commitRename(sessionId);
@@ -65,159 +94,219 @@ export function Sidebar({
     }
   }
 
+  const themeLabel =
+    theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+
   return (
-    <aside className="pi-sidebar" aria-label="Pi sessions and projects">
-      <div className="pi-sidebar-header">
-        <div className="pi-brand">
-          <div className="pi-brand-mark" aria-hidden="true">
-            π
-          </div>
-          <div>
-            <div className="pi-brand-title">Pi Workspace</div>
-            <div className="pi-brand-sub">
-              {isDesktop ? "Tauri RPC" : "Browser Preview"}
-            </div>
-          </div>
-        </div>
+    <aside
+      className={
+        expanded
+          ? "verity-sidebar verity-sidebar--expanded"
+          : "verity-sidebar"
+      }
+      aria-label="Verity workspace navigation"
+    >
+      <div className="verity-sidebar-header">
         <button
           type="button"
-          className="md3-icon-btn"
-          title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-          aria-label="Toggle color theme"
-          onClick={onToggleTheme}
+          className="verity-rail-logo-btn"
+          aria-expanded={expanded}
+          aria-label={expanded ? "Collapse navigation rail" : "Expand navigation rail"}
+          title={expanded ? "Collapse navigation" : "Expand navigation"}
+          onClick={() => setExpanded((prev) => !prev)}
         >
-          {theme === "dark" ? "☀" : "☾"}
+          <VerityLogoMark size={22} />
+          {expanded && <span className="verity-brand-title">Verity</span>}
         </button>
+        {expanded && (
+          <span className="verity-brand-tag">
+            {isDesktop ? "Desktop" : "Preview"}
+          </span>
+        )}
       </div>
 
-      <div>
-        <div className="pi-sidebar-section-label">
-          <span>Project</span>
+      {expanded && (
+        <div className="verity-project-block">
+          <Md3Select
+            variant="tonal"
+            placement="bottom"
+            align="start"
+            ariaLabel="Active project"
+            leadingIcon={<FolderIcon size={14} />}
+            value={activeProjectId}
+            options={projectOptions}
+            onChange={onSelectProject}
+          />
         </div>
-        <select
-          className="pi-project-select"
-          aria-label="Active project"
-          value={activeProjectId}
-          onChange={(e) => onSelectProject(e.target.value)}
-        >
-          {projects.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
-      </div>
+      )}
 
-      <button
-        type="button"
-        className="md3-btn-filled"
-        onClick={onCreateSession}
-      >
-        + New session
-      </button>
-
-      <div className="pi-sidebar-section-label">
-        <span>Sessions</span>
-        <span>{sessions.length}</span>
-      </div>
-
-      <div className="pi-session-list" role="list">
-        {sessions.map((session) => {
-          const isActive = session.id === activeSessionId;
-          const isEditing = editingId === session.id;
-          return (
-            <div
-              key={session.id}
-              role="listitem"
-              className={`pi-session-item ${isActive ? "active" : ""}`}
-              onClick={() => {
-                if (!isEditing) onSelectSession(session);
-              }}
-              onDoubleClick={() => beginRename(session)}
-            >
-              <div className="pi-session-main">
-                {isEditing ? (
-                  <input
-                    className="pi-inline-rename"
-                    aria-label="Rename session"
-                    value={editValue}
-                    autoFocus
-                    onClick={(e) => e.stopPropagation()}
-                    onChange={(e) => setEditValue(e.target.value)}
-                    onBlur={() => commitRename(session.id)}
-                    onKeyDown={(e) => handleRenameKeyDown(e, session.id)}
-                  />
-                ) : (
-                  <>
-                    <div className="pi-session-title">{session.name}</div>
-                    <div className="pi-session-meta">
-                      <span>{session.messageCount} msgs</span>
-                      <span>·</span>
-                      <span>{session.updatedAt}</span>
-                    </div>
-                  </>
-                )}
-              </div>
-              {!isEditing && (
-                <div className="pi-session-actions">
-                  <button
-                    type="button"
-                    className="md3-icon-btn md3-icon-btn-sm"
-                    title="Rename session"
-                    aria-label={`Rename ${session.name}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      beginRename(session);
-                    }}
-                  >
-                    ✎
-                  </button>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="pi-sidebar-toolbar" aria-label="Session actions">
+      <nav className="verity-rail-nav" aria-label="Session actions">
         <button
           type="button"
-          className="md3-btn-tonal"
+          className="verity-rail-btn"
+          title="New session"
+          aria-label="New session"
+          onClick={onCreateSession}
+        >
+          <PlusIcon size={18} />
+          {expanded && <span className="verity-rail-btn-label">New session</span>}
+        </button>
+
+        <button
+          type="button"
+          className={
+            expanded
+              ? "verity-rail-btn verity-rail-btn--active"
+              : "verity-rail-btn"
+          }
+          title={expanded ? "Hide sessions" : "Sessions"}
+          aria-label={expanded ? "Hide sessions" : "Show sessions"}
+          aria-pressed={expanded}
+          onClick={() => setExpanded((prev) => !prev)}
+        >
+          <MessageIcon size={17} />
+          {expanded && <span className="verity-rail-btn-label">Sessions</span>}
+        </button>
+
+        <button
+          type="button"
+          className="verity-rail-btn"
+          title="History tree"
+          aria-label="Open history tree"
           onClick={onOpenHistoryTree}
         >
-          Tree
+          <GitBranchIcon size={17} />
+          {expanded && <span className="verity-rail-btn-label">History tree</span>}
         </button>
+
         <button
           type="button"
-          className="md3-btn-tonal"
+          className="verity-rail-btn"
+          title="Fork session"
+          aria-label="Fork session"
           onClick={onOpenFork}
         >
-          Fork
+          <GitForkIcon size={17} />
+          {expanded && <span className="verity-rail-btn-label">Fork session</span>}
         </button>
+
+        {expanded && (
+          <button
+            type="button"
+            className="verity-rail-btn"
+            title="Clone session"
+            aria-label="Clone session"
+            onClick={onCloneSession}
+          >
+            <CopyIcon size={16} />
+            <span className="verity-rail-btn-label">Clone session</span>
+          </button>
+        )}
+
         <button
           type="button"
-          className="md3-btn-outlined"
-          onClick={onCloneSession}
-        >
-          Clone
-        </button>
-        <button
-          type="button"
-          className="md3-btn-outlined"
+          className="verity-rail-btn"
+          title="Export HTML"
+          aria-label="Export session as HTML"
           onClick={onExportHtml}
         >
-          Export HTML
+          <DownloadIcon size={17} />
+          {expanded && <span className="verity-rail-btn-label">Export HTML</span>}
         </button>
-      </div>
+      </nav>
 
-      <div className="pi-sidebar-footer">
+      {expanded ? (
+        <>
+          <div className="verity-sidebar-section-label">
+            <span>Recent</span>
+            <span className="verity-session-count">{sessions.length}</span>
+          </div>
+
+          <div className="verity-session-list" role="list">
+            {sessions.length === 0 ? (
+              <div className="verity-session-empty">No sessions yet</div>
+            ) : (
+              sessions.map((session) => {
+                const isActive = session.id === activeSessionId;
+                const isEditing = editingId === session.id;
+                return (
+                  <div
+                    key={session.id}
+                    role="listitem"
+                    className={
+                      isActive
+                        ? "verity-session-item active"
+                        : "verity-session-item"
+                    }
+                    onClick={() => {
+                      if (!isEditing) onSelectSession(session);
+                    }}
+                    onDoubleClick={() => beginRename(session)}
+                  >
+                    <div className="verity-session-main">
+                      {isEditing ? (
+                        <input
+                          className="verity-inline-rename"
+                          aria-label="Rename session"
+                          value={editValue}
+                          autoFocus
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) => setEditValue(e.target.value)}
+                          onBlur={() => commitRename(session.id)}
+                          onKeyDown={(e) => handleRenameKeyDown(e, session.id)}
+                        />
+                      ) : (
+                        <div className="verity-session-title">{session.name}</div>
+                      )}
+                    </div>
+                    {!isEditing && (
+                      <div className="verity-session-actions">
+                        <button
+                          type="button"
+                          className="md3-icon-btn md3-icon-btn-sm"
+                          title="Rename session"
+                          aria-label={`Rename ${session.name}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            beginRename(session);
+                          }}
+                        >
+                          <EditIcon size={13} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </>
+      ) : (
+        <div className="verity-rail-spacer" />
+      )}
+
+      <div className="verity-sidebar-footer">
         <button
           type="button"
-          className="md3-btn-text"
-          style={{ width: "100%", justifyContent: "flex-start" }}
+          className="verity-rail-btn verity-footer-settings-btn"
+          title="Provider settings"
+          aria-label="Provider settings"
           onClick={onOpenProviders}
         >
-          ⚙ Provider settings
+          <SettingsIcon size={17} />
+          {expanded && (
+            <span className="verity-rail-btn-label">Provider settings</span>
+          )}
+        </button>
+
+        <button
+          type="button"
+          className="verity-rail-btn verity-footer-theme-btn"
+          title={themeLabel}
+          aria-label={themeLabel}
+          onClick={onToggleTheme}
+        >
+          {theme === "dark" ? <SunIcon size={17} /> : <MoonIcon size={17} />}
         </button>
       </div>
     </aside>

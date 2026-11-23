@@ -1,0 +1,1180 @@
+/* ==========================================================================
+   Verity Formal Verification Rail — Calm MD3 Expressive Styles
+   Applies to SubagentRail, SpecReviewDrawer, and RunLogDrawer.
+   Monochrome-first tonal elevation across both dark and light themes:
+   right rail (surface-container-low) -> panel cards (surface-container).
+   ========================================================================== */
+
+/* Shared panel card (one tonal step above right rail) */
+.vr-panel,
+.vr-panel--surface {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--verity-hairline);
+  border-radius: 18px;
+  padding: 18px;
+  box-shadow: var(--verity-surface-highlight);
+}
+
+.vr-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.vr-header--bordered {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--verity-hairline);
+}
+
+.vr-title-group {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.vr-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.vr-eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: var(--tracking-display);
+  color: var(--md-sys-color-on-surface);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vr-title--mono {
+  font-family: var(--font-mono);
+  font-size: 14.5px;
+  letter-spacing: -0.015em;
+}
+
+.vr-subtitle {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-count-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 9999px;
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.vr-section-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--md-sys-color-on-surface-variant);
+  padding: 4px 2px 0;
+}
+
+/* Full-pill action buttons */
+.vr-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-radius: 9999px;
+  padding: 7px 14px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: pointer;
+  border: none;
+  box-shadow: none;
+  transition: background var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast),
+    filter var(--md-sys-motion-fast),
+    transform var(--md-sys-motion-fast);
+}
+
+.vr-btn:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.vr-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.vr-btn--primary {
+  background: var(--md-sys-color-primary);
+  color: var(--md-sys-color-on-primary);
+}
+
+.vr-btn--primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.vr-btn--success {
+  background: var(--verity-success);
+  color: var(--verity-on-success);
+}
+
+.vr-btn--success:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.vr-btn--ghost {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-btn--ghost:hover:not(:disabled) {
+  background: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-btn--danger-outline {
+  background: var(--verity-danger-container);
+  color: var(--verity-on-danger-container);
+}
+
+.vr-btn--danger-outline:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.vr-btn--sm {
+  padding: 5px 12px;
+  font-size: var(--text-xs);
+}
+
+.vr-btn--full {
+  width: 100%;
+}
+
+.vr-icon-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9999px;
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.vr-icon-close:hover {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+}
+
+/* ==========================================================================
+   SubagentRail — Spawn Form & Task Rows
+   ========================================================================== */
+
+.vr-spawn-form {
+  background: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--verity-hairline-subtle);
+  border-radius: 14px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.vr-spawn-form .md3-select-trigger--field {
+  background: var(--md-sys-color-surface-container);
+}
+
+.vr-spawn-form .md3-select-trigger--field:hover:not(:disabled) {
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.vr-segmented {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 3px;
+  border-radius: 9999px;
+  background: var(--md-sys-color-surface-container);
+  border: 1px solid var(--verity-hairline-subtle);
+}
+
+.vr-segmented-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 9999px;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.vr-segmented-btn:hover {
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-segmented-btn.is-active {
+  background: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-field-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.vr-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-input,
+.vr-textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--verity-hairline);
+  background: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface);
+  font-size: var(--text-sm);
+  font-weight: 400;
+  transition: background var(--md-sys-motion-fast),
+    border-color var(--md-sys-motion-fast),
+    box-shadow var(--md-sys-motion-fast);
+}
+
+.vr-input:hover,
+.vr-textarea:hover {
+  border-color: var(--md-sys-color-outline);
+}
+
+.vr-input:focus,
+.vr-textarea:focus {
+  outline: none;
+  border-color: var(--md-sys-color-primary);
+  box-shadow: 0 0 0 3px var(--md-sys-color-primary-container);
+}
+
+.vr-input--mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.vr-textarea {
+  resize: vertical;
+  min-height: 60px;
+  line-height: 1.5;
+}
+
+.vr-form-error {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border: none;
+  background: var(--verity-danger-container);
+  color: var(--verity-on-danger-container);
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+/* Quiet tonal task items */
+.vr-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vr-task-card {
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  padding: 12px 14px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: background var(--md-sys-motion-fast),
+    border-color var(--md-sys-motion-fast);
+}
+
+.vr-task-card:hover {
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.vr-task-card.is-selected {
+  background: var(--md-sys-color-surface-container-high);
+  border-color: var(--verity-hairline);
+}
+
+.vr-task-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.vr-task-lead {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Flat 6px status dots — zero glow, zero pulse */
+.vr-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+
+.vr-status-dot--success {
+  background: var(--verity-success);
+}
+
+.vr-status-dot--warning {
+  background: var(--verity-warning);
+}
+
+.vr-status-dot--danger {
+  background: var(--verity-danger);
+}
+
+.vr-status-dot--info {
+  background: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-status-dot--neutral {
+  background: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-task-goal {
+  min-width: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--md-sys-color-on-surface);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Single primary status indicator per task row */
+.vr-status-label {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 9999px;
+  border: none;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.vr-status-label--success {
+  background: var(--verity-success-container);
+  color: var(--verity-on-success-container);
+}
+
+.vr-status-label--warning {
+  background: var(--verity-warning-container);
+  color: var(--verity-on-warning-container);
+}
+
+.vr-status-label--danger {
+  background: var(--verity-danger-container);
+  color: var(--verity-on-danger-container);
+}
+
+.vr-status-label--info,
+.vr-status-label--neutral {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-task-card.is-selected .vr-status-label--info,
+.vr-task-card.is-selected .vr-status-label--neutral {
+  background: var(--md-sys-color-surface-container-highest);
+}
+
+.vr-task-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 14px;
+  font-size: var(--text-xs);
+  color: var(--md-sys-color-on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.vr-task-id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vr-meta-sep {
+  opacity: 0.4;
+}
+
+.vr-verifier-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-budget-compact {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.vr-budget-compact--warn {
+  color: var(--verity-warning);
+}
+
+.vr-budget-compact--danger {
+  color: var(--verity-danger);
+}
+
+/* Expanded budget meters separated by adaptive hairline */
+.vr-budget-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 0 2px 14px;
+  border-top: 1px solid var(--verity-hairline);
+  margin-top: 2px;
+}
+
+.vr-budget-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vr-budget-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--md-sys-color-on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.vr-budget-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.vr-budget-value {
+  font-family: var(--font-mono);
+}
+
+/* Ultra-slim 3px calm progress meters */
+.vr-progress-track {
+  width: 100%;
+  height: 3px;
+  border-radius: 9999px;
+  background: var(--md-sys-color-surface-container-highest);
+  overflow: hidden;
+}
+
+.vr-progress-fill {
+  height: 100%;
+  border-radius: 9999px;
+  transition: width var(--md-sys-motion-standard);
+}
+
+.vr-progress-fill--normal {
+  background: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-progress-fill--warn {
+  background: var(--verity-warning);
+}
+
+.vr-progress-fill--danger {
+  background: var(--verity-danger);
+}
+
+/* ==========================================================================
+   SpecReviewDrawer — Quiet Tonal Layer Blocks, Spec Panes, Diff Section
+   ========================================================================== */
+
+.vr-drawer-meta-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.vr-digest-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 11px;
+  border-radius: 9999px;
+  border: none;
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.vr-digest-btn:hover {
+  background: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-digest-code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-digest-status {
+  color: var(--md-sys-color-on-surface-variant);
+  font-weight: 600;
+}
+
+.vr-digest-status--copied {
+  color: var(--verity-success);
+}
+
+/* Layer 1 & Layer 2 Status Blocks — monochrome tonal surface + restrained status pill */
+.vr-layer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+}
+
+.vr-layer-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 13px 15px;
+  border-radius: 14px;
+  border: 1px solid var(--verity-hairline-subtle);
+  background: var(--md-sys-color-surface-container-low);
+}
+
+.vr-layer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vr-layer-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-layer-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.vr-layer-status--success {
+  background: var(--verity-success-container);
+  color: var(--verity-on-success-container);
+}
+
+.vr-layer-status--warning {
+  background: var(--verity-warning-container);
+  color: var(--verity-on-warning-container);
+}
+
+.vr-layer-status--danger {
+  background: var(--verity-danger-container);
+  color: var(--verity-on-danger-container);
+}
+
+.vr-layer-headline {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+  font-variant-numeric: tabular-nums;
+}
+
+.vr-layer-detail {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--md-sys-color-on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Violation alert banner — restrained tonal block with crimson accent edge */
+.vr-violation-banner {
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--verity-hairline);
+  border-left: 3px solid var(--verity-danger);
+  border-radius: 12px;
+  padding: 13px 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vr-violation-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--verity-danger);
+}
+
+.vr-violation-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-violation-list code {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+}
+
+/* Spec & Back-translation panes — flat wrapper, quiet tonal content well */
+.vr-split-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+
+.vr-pane-card {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.vr-pane-heading {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-code-surface {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--verity-hairline-subtle);
+  border-radius: 14px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.vr-prose-surface {
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--verity-hairline-subtle);
+  border-radius: 14px;
+  padding: 12px 14px;
+  white-space: pre-wrap;
+}
+
+/* Collapsible diff section — adaptive hairline divider */
+.vr-collapsible {
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--verity-hairline);
+  border-radius: 0;
+  padding-top: 10px;
+}
+
+.vr-collapsible-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--md-sys-color-on-surface);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--md-sys-motion-fast);
+}
+
+.vr-collapsible-toggle:hover {
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.vr-collapsible-lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vr-collapsible-hint {
+  font-size: var(--text-xs);
+  color: var(--md-sys-color-on-surface-variant);
+  font-weight: 500;
+}
+
+.vr-collapsible-body {
+  padding: 10px 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vr-path-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.vr-path-pill {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  border: none;
+}
+
+/* Unified diff viewer — subtle 9% line tints for effortless code readability */
+.vr-diff-viewer {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  background: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--verity-hairline-subtle);
+  border-radius: 14px;
+  overflow-x: auto;
+  padding: 8px 0;
+}
+
+.vr-diff-line {
+  display: block;
+  padding: 0 12px;
+  white-space: pre;
+  min-width: max-content;
+}
+
+.vr-diff-line--add {
+  background: rgba(129, 201, 149, 0.09);
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-diff-line--del {
+  background: rgba(242, 139, 130, 0.09);
+  color: var(--md-sys-color-on-surface);
+}
+
+:root[data-theme="light"] .vr-diff-line--add {
+  background: rgba(20, 108, 46, 0.09);
+  color: var(--md-sys-color-on-surface);
+}
+
+:root[data-theme="light"] .vr-diff-line--del {
+  background: rgba(179, 38, 30, 0.09);
+  color: var(--md-sys-color-on-surface);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .vr-diff-line--add {
+    background: rgba(20, 108, 46, 0.09);
+    color: var(--md-sys-color-on-surface);
+  }
+
+  :root:not([data-theme="dark"]) .vr-diff-line--del {
+    background: rgba(179, 38, 30, 0.09);
+    color: var(--md-sys-color-on-surface);
+  }
+}
+
+.vr-diff-line--hunk {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  font-weight: 600;
+}
+
+.vr-diff-line--meta {
+  color: var(--md-sys-color-on-surface-variant);
+  font-weight: 600;
+}
+
+.vr-diff-line--ctx {
+  color: var(--md-sys-color-on-surface);
+}
+
+/* SpecReviewDrawer footer & optional rejection reason */
+.vr-drawer-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 14px;
+  border-top: 1px solid var(--verity-hairline);
+}
+
+.vr-blocker-hint {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--verity-danger);
+}
+
+.vr-reject-note-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0;
+  background: transparent;
+  border: none;
+}
+
+.vr-reject-note-label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.vr-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+/* ==========================================================================
+   RunLogDrawer — Pill Search, Filter Chips & Hairline Ledger
+   ========================================================================== */
+
+.vr-search-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.vr-search-icon {
+  position: absolute;
+  left: 13px;
+  color: var(--md-sys-color-on-surface-variant);
+  pointer-events: none;
+  display: inline-flex;
+}
+
+.vr-search-input {
+  width: 100%;
+  padding: 8px 14px 8px 36px;
+  border-radius: 9999px;
+  border: 1px solid var(--verity-hairline-subtle);
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  font-size: var(--text-sm);
+  transition: background var(--md-sys-motion-fast),
+    border-color var(--md-sys-motion-fast),
+    box-shadow var(--md-sys-motion-fast);
+}
+
+.vr-search-input:hover {
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.vr-search-input:focus {
+  outline: none;
+  border-color: var(--md-sys-color-primary);
+  box-shadow: 0 0 0 3px var(--md-sys-color-primary-container);
+}
+
+.vr-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.vr-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background var(--md-sys-motion-fast),
+    border-color var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.vr-filter-chip:hover {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-filter-chip.is-active {
+  background: var(--md-sys-color-surface-container-highest);
+  border-color: var(--verity-hairline);
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-filter-chip--danger.is-active {
+  background: var(--verity-danger-container);
+  border-color: transparent;
+  color: var(--verity-on-danger-container);
+}
+
+.vr-ledger {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-height: 440px;
+  overflow-y: auto;
+}
+
+.vr-ledger-row {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--verity-hairline);
+  border-radius: 0;
+  padding: 12px 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vr-ledger-row:last-child {
+  border-bottom: none;
+}
+
+.vr-ledger-row--unparsed {
+  background: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--verity-hairline);
+  border-left: 3px solid var(--verity-danger);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 4px 0;
+}
+
+.vr-ledger-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.vr-ledger-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.vr-ledger-task-btn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--md-sys-color-outline);
+  text-underline-offset: 2px;
+  transition: color var(--md-sys-motion-fast),
+    text-decoration-color var(--md-sys-motion-fast);
+}
+
+.vr-ledger-task-btn:hover {
+  color: var(--md-sys-color-primary);
+  text-decoration-color: var(--md-sys-color-primary);
+}
+
+.vr-ledger-task-plain {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+}
+
+.vr-ledger-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.vr-ledger-digest {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  border: none;
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.vr-ledger-detail {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--verity-hairline-subtle);
+  border-radius: 10px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.vr-ledger-row--unparsed .vr-ledger-detail {
+  background: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface);
+}
+
+/* Shared empty state — quiet tonal fill, zero dashed border */
+.vr-empty-state {
+  padding: 24px 16px;
+  text-align: center;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  color: var(--md-sys-color-on-surface-variant);
+  background: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--verity-hairline-subtle);
+  border-radius: 14px;
+}
