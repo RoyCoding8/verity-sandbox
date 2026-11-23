@@ -9,6 +9,9 @@
     "beforeBuildCommand": "npm --prefix ../ui run build",
     "frontendDist": "../ui/dist"
   },
+  "bundle": {
+    "icon": ["icons/icon.png"]
+  },
   "app": {
     "windows": [
       {
