@@ -530,6 +530,17 @@ fn kill_tree(pid: u32) {
         let _ = Command::new("pkill").args(["-9", "-P", &pid_str]).status();
         let _ = Command::new("kill").args(["-9", &pid_str]).status();
     }
+    #[cfg(windows)]
+    {
+        let pid_str = pid.to_string();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid_str, "/T", "/F"])
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
 }
 
 /// Long-lived supervisor managing a `pi --mode rpc --no-session` child process.
