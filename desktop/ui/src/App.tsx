@@ -1,195 +1,553 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import "./md3-tokens.css";
+import { isTauriRuntime, tauriApi } from "./api/tauri";
+import { ChatTranscript } from "./components/ChatTranscript";
+import { Composer } from "./components/Composer";
+import { ExtensionUiLayer } from "./components/ExtensionUiLayer";
+import { ForkModal } from "./components/ForkModal";
+import { HistoryTreeModal } from "./components/HistoryTreeModal";
+import { MergeQueueModal } from "./components/MergeQueueModal";
+import { ProviderSettingsModal } from "./components/ProviderSettingsModal";
+import { RunLogDrawer } from "./components/RunLogDrawer";
+import { Sidebar } from "./components/Sidebar";
+import { SpecReviewDrawer } from "./components/SpecReviewDrawer";
+import { SubagentRail } from "./components/SubagentRail";
+import { usePiWorkspace } from "./state/piStore";
+import { applyMd3Theme } from "./theme/md3";
+import type {
+  HandoffView,
+  VerdictStatus,
+  MergeQueueEntry,
+  SpawnSubagentRequest,
+  SubagentTaskItem,
+} from "./types/verity";
 
-type Screen = "orchestrator" | "spec-review" | "merge-queue" | "run-log";
+const INITIAL_HANDOFF: HandoffView = {
+  task_id: "task-session-laws",
+  base_commit: "961b030c0a00bef3fe708972fffe56368abb2499",
+  verifier: "kani",
+  candidate_commit: "880ece1e7691f6c58c4a4f53285bd7741c518897",
+  changed_paths: [
+    "crates/verity-core/src/session.rs",
+    "formal/src/session_laws.rs",
+  ],
+  extracted_spec: [
+    "// crates/verity-core/src/session.rs",
+    "18: pub enum SessionActivity { Idle, Streaming { pending_queue: u16, reload_deferred: bool }, Compacting, SwitchingSession }",
+    "41: pub fn transition_session(activity: SessionActivity, cmd: SessionCommand) -> Result<SessionTransition, SessionError>",
+    "// formal/src/session_laws.rs",
+    "64: #[kani::proof]",
+    "65: pub fn prove_session_exclusivity_and_queue_laws()",
+    "92: assert!(next.activity == SessionActivity::Idle || !next.run_provider_reload);",
+    "95: kani::cover!(next.run_provider_reload, \"deferred_reload_fires_on_settle\");",
+  ].join("\n"),
+  back_translation:
+    "Prompts, compaction, and session switches are accepted only while the session is idle. Steering and follow-up messages are accepted only while streaming and stay bounded without integer overflow. Provider reloads requested mid-turn are deferred and fire only when agent_settled returns the session to idle.",
+  hygiene_clean: true,
+  hygiene_violations: [],
+  verdict: {
+    status: "pass",
+    reason: "0 of 271 checks failed; 6 of 6 kani::cover! probes satisfied",
+    checks_passed: 271,
+    probes_satisfied: 6,
+  },
+  spec_digest:
+    "7c9e2f4b18d3a50692f1e4c8b7a6d5e4f3c2b1a0987654321fedcba012345678",
+};
 
-interface SubagentCard {
-  id: string;
-  mode: "ReadOnly" | "Write";
-  verifier: "RustKani" | "Lean4Comparator" | "None";
-  state: "Running" | "AwaitingSpecReview" | "ApprovedForMerge" | "CompletedReadOnly";
-  toolCallsUsed: number;
-  toolCallsLimit: number;
-  changedPaths: string[];
-  extractedSpec: string;
-  backTranslation: string;
-  probesSatisfied: number;
-  hygieneViolations: number;
-  specDigest: string;
-}
-
-const INITIAL_TASKS: SubagentCard[] = [
+const INITIAL_SUBAGENTS: SubagentTaskItem[] = [
   {
-    id: "task-safe-sub",
-    mode: "Write",
-    verifier: "RustKani",
-    state: "AwaitingSpecReview",
-    toolCallsUsed: 9,
-    toolCallsLimit: 64,
-    changedPaths: ["crates/verity-core/src/scope.rs"],
-    extractedSpec: [
-      "// crates/verity-core/src/scope.rs",
-      "24: pub fn within(path: &RelPath, prefix: &RelPath) -> bool",
-      "35: pub fn check_scope(changed_paths: &[RelPath], write_scope: &[RelPath], forbidden: &[RelPath]) -> Result<(), ScopeError>",
-      "52: assert!(res.is_ok() == expected_ok);",
-      "54: kani::cover!(res.is_ok(), \"scope_accept_reachable\");",
-    ].join("\n"),
-    backTranslation:
-      "check_scope accepts a diff only when changed_paths is non-empty, every path falls inside write_scope on a segment boundary, and no path matches forbidden. Both accept and reject branches are reachable.",
-    probesSatisfied: 3,
-    hygieneViolations: 0,
-    specDigest: "9c8f4b21e0a3...d714",
+    taskId: "task-session-laws",
+    goal: "Prove Pi session exclusivity and deferred reload laws",
+    mode: "write",
+    status: "awaiting_spec_review",
+    verifier: "kani",
+    worktreePath: ".worktrees/core-session-laws",
+    writeScope: ["crates/verity-core/src/session.rs", "formal/src/session_laws.rs"],
+    budget: {
+      toolCallsUsed: 12,
+      toolCallsLimit: 64,
+      wallClockSecsUsed: 42,
+      wallClockSecsLimit: 300,
+    },
+    handoff: INITIAL_HANDOFF,
   },
   {
-    id: "audit-git-hooks",
-    mode: "ReadOnly",
-    verifier: "None",
-    state: "CompletedReadOnly",
-    toolCallsUsed: 4,
-    toolCallsLimit: 32,
-    changedPaths: [],
-    extractedSpec: "",
-    backTranslation: "Confirmed $GIT_COMMON_DIR is mounted read-only in bubblewrap.",
-    probesSatisfied: 0,
-    hygieneViolations: 0,
-    specDigest: "-",
+    taskId: "audit-sandbox-binds",
+    goal: "Audit bubblewrap read-only $GIT_COMMON_DIR mount",
+    mode: "readonly",
+    status: "completed_readonly",
+    verifier: null,
+    worktreePath: null,
+    writeScope: [],
+    budget: {
+      toolCallsUsed: 5,
+      toolCallsLimit: 32,
+      wallClockSecsUsed: 11,
+      wallClockSecsLimit: 120,
+    },
+    readonlySummary:
+      "Verified sandbox.rs binds $GIT_COMMON_DIR read-only and passes --unshare-net on Linux.",
   },
 ];
 
+const INITIAL_LOG_LINES: string[] = [
+  '{"task_id":"task-session-laws","kind":"awaiting_spec_review","detail":"Kani 6/6 proofs verified, 22/22 cover! probes satisfied"}',
+  '{"task_id":"audit-sandbox-binds","kind":"completed_readonly","detail":"Verified read-only .git bind mount under bubblewrap"}',
+];
+
+
+function parseVerdictStatus(raw: string): VerdictStatus {
+  const lower = raw.toLowerCase();
+  if (lower === "pass") return "pass";
+  if (lower === "counterexample") return "counterexample";
+  if (lower === "inconclusive") return "inconclusive";
+  return "invalid_report";
+}
+
 export function App() {
-  const [screen, setScreen] = useState<Screen>("spec-review");
-  const [tasks, setTasks] = useState<SubagentCard[]>(INITIAL_TASKS);
-  const [selectedId, setSelectedId] = useState<string>("task-safe-sub");
+  const { state, projectSessions, activeSession, actions } = usePiWorkspace();
+  const desktopRuntime = isTauriRuntime();
 
-  const active = tasks.find((t) => t.id === selectedId) ?? tasks[0];
+  const [verityPanelOpen, setVerityPanelOpen] = useState(true);
+  const [mergeQueueOpen, setMergeQueueOpen] = useState(false);
+  const [runLogOpen, setRunLogOpen] = useState(false);
 
-  function approveSpec(id: string) {
-    setTasks((prev) =>
+  const [subagents, setSubagents] = useState<SubagentTaskItem[]>(INITIAL_SUBAGENTS);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>("task-session-laws");
+  const [approvedIds, setApprovedIds] = useState<Record<string, boolean>>({});
+  const [mergeEntries, setMergeEntries] = useState<MergeQueueEntry[]>([]);
+  const [rawLogLines, setRawLogLines] = useState<string[]>(INITIAL_LOG_LINES);
+  const [spawning, setSpawning] = useState(false);
+
+  useEffect(() => {
+    applyMd3Theme(state.theme);
+  }, [state.theme]);
+
+  const activeProject = useMemo(
+    () => state.projects.find((p) => p.id === state.activeProjectId) ?? null,
+    [state.projects, state.activeProjectId]
+  );
+
+  useEffect(() => {
+    if (!desktopRuntime || !activeProject) return;
+    let cancelled = false;
+    Promise.all([
+      tauriApi.listHandoffs(activeProject.path).catch(() => []),
+      tauriApi.listRunLog(activeProject.path).catch(() => []),
+    ]).then(([handoffs, logs]) => {
+      if (cancelled) return;
+      if (handoffs.length > 0) {
+        const mapped: SubagentTaskItem[] = handoffs.map((h) => ({
+          taskId: h.task_id,
+          goal: `Write task ${h.task_id}`,
+          mode: "write",
+          status: "awaiting_spec_review",
+          verifier: h.verifier === "lean" ? "lean" : "kani",
+          worktreePath: `.verity/worktrees/${h.task_id}`,
+          writeScope: [...h.changed_paths],
+          budget: {
+            toolCallsUsed: 0,
+            toolCallsLimit: 64,
+            wallClockSecsUsed: 0,
+            wallClockSecsLimit: 300,
+          },
+          handoff: {
+            ...h,
+            verifier: h.verifier === "lean" ? "lean" : "kani",
+            changed_paths: [...h.changed_paths],
+            hygiene_violations: [...h.hygiene_violations],
+            verdict: { ...h.verdict, status: parseVerdictStatus(h.verdict.status) },
+          },
+        }));
+        setSubagents(mapped);
+        setSelectedTaskId(mapped[0]?.taskId ?? null);
+      }
+      if (logs.length > 0) {
+        setRawLogLines([...logs]);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [desktopRuntime, activeProject]);
+
+  const selectedTask = useMemo(
+    () => subagents.find((t) => t.taskId === selectedTaskId) ?? null,
+    [subagents, selectedTaskId]
+  );
+
+  async function handleSpawnSubagent(req: SpawnSubagentRequest) {
+    setSpawning(true);
+    try {
+      const repoPath = activeProject?.path ?? ".";
+      if (req.mode === "readonly") {
+        const res = await tauriApi.runReadonlySubagent(repoPath, req.goal);
+        const taskId = `ro-${Date.now().toString(36)}`;
+        const item: SubagentTaskItem = {
+          taskId,
+          goal: req.goal,
+          mode: "readonly",
+          status: "completed_readonly",
+          verifier: null,
+          worktreePath: null,
+          writeScope: [],
+          budget: {
+            toolCallsUsed: res.tool_calls,
+            toolCallsLimit: 32,
+            wallClockSecsUsed: 3,
+            wallClockSecsLimit: 120,
+          },
+          readonlySummary: res.summary,
+        };
+        setSubagents((prev) => [item, ...prev]);
+        setSelectedTaskId(taskId);
+        setRawLogLines((prev) => [
+          JSON.stringify({ task_id: taskId, kind: "completed_readonly", detail: res.summary }),
+          ...prev,
+        ]);
+      } else {
+        const handoffRaw = await tauriApi.spawnWriteSubagent({
+          repo_path: repoPath,
+          task_id: req.taskId,
+          base_ref: "HEAD",
+          write_scope: [...req.writeScope],
+          forbidden: [],
+          verifier: req.verifier,
+          goal: req.goal,
+        });
+        const handoff: HandoffView = {
+          ...handoffRaw,
+          verifier: handoffRaw.verifier === "lean" ? "lean" : "kani",
+          changed_paths: [...handoffRaw.changed_paths],
+          hygiene_violations: [...handoffRaw.hygiene_violations],
+          verdict: { ...handoffRaw.verdict, status: parseVerdictStatus(handoffRaw.verdict.status) },
+        };
+        const item: SubagentTaskItem = {
+          taskId: handoff.task_id,
+          goal: req.goal,
+          mode: "write",
+          status: "awaiting_spec_review",
+          verifier: handoff.verifier,
+          worktreePath: `.verity/worktrees/${handoff.task_id}`,
+          writeScope: [...handoff.changed_paths],
+          budget: {
+            toolCallsUsed: 8,
+            toolCallsLimit: 64,
+            wallClockSecsUsed: 14,
+            wallClockSecsLimit: 300,
+          },
+          handoff,
+        };
+        setSubagents((prev) => [item, ...prev]);
+        setSelectedTaskId(item.taskId);
+        setRawLogLines((prev) => [
+          JSON.stringify({
+            task_id: item.taskId,
+            kind: "awaiting_spec_review",
+            detail: handoff.spec_digest,
+          }),
+          ...prev,
+        ]);
+      }
+    } finally {
+      setSpawning(false);
+    }
+  }
+
+  function handleApproveSpec(handoff: HandoffView) {
+    setApprovedIds((prev) => ({ ...prev, [handoff.task_id]: true }));
+    setSubagents((prev) =>
       prev.map((t) =>
-        t.id === id && t.state === "AwaitingSpecReview"
-          ? { ...t, state: "ApprovedForMerge" }
-          : t
+        t.taskId === handoff.task_id ? { ...t, status: "approved_for_merge" } : t
       )
     );
+    setMergeEntries((prev) => {
+      if (prev.some((e) => e.taskId === handoff.task_id)) return prev;
+      return [
+        {
+          taskId: handoff.task_id,
+          targetRef: "refs/heads/master",
+          worktreePath: `.verity/worktrees/${handoff.task_id}`,
+          handoff,
+          approvedDigest: handoff.spec_digest,
+          mergeTree: { kind: "clean" },
+          mergeState: "ready",
+        },
+        ...prev,
+      ];
+    });
+    setMergeQueueOpen(true);
+  }
+
+  function handleRejectSpec(handoff: HandoffView, reason?: string) {
+    setSubagents((prev) =>
+      prev.map((t) =>
+        t.taskId === handoff.task_id ? { ...t, status: "rejected" } : t
+      )
+    );
+    setRawLogLines((prev) => [
+      JSON.stringify({
+        task_id: handoff.task_id,
+        kind: "rejected",
+        detail: reason || "Spec rejected by reviewer",
+      }),
+      ...prev,
+    ]);
+  }
+
+  async function handleTriggerMerge(entry: MergeQueueEntry) {
+    const repoPath = activeProject?.path ?? ".";
+    setMergeEntries((prev) =>
+      prev.map((e) =>
+        e.taskId === entry.taskId ? { ...e, mergeState: "merging" } : e
+      )
+    );
+    const res = await tauriApi.approveAndMergeHandoff({
+      repoPath,
+      taskId: entry.taskId,
+      targetRef: entry.targetRef,
+      approvedDigest: entry.approvedDigest,
+    });
+    setMergeEntries((prev) =>
+      prev.map((e) =>
+        e.taskId === entry.taskId
+          ? {
+              ...e,
+              mergeState: res.status === "merged" ? "merged" : "conflict",
+              mergedCommit: res.commit ?? undefined,
+              alreadyMerged: res.already_merged,
+              mergeTree:
+                res.conflicts.length > 0
+                  ? { kind: "conflict", conflictedPaths: [...res.conflicts] }
+                  : { kind: "clean" },
+            }
+          : e
+      )
+    );
+    if (res.status === "merged") {
+      setSubagents((prev) =>
+        prev.map((t) =>
+          t.taskId === entry.taskId ? { ...t, status: "merged" } : t
+        )
+      );
+      setRawLogLines((prev) => [
+        JSON.stringify({
+          task_id: entry.taskId,
+          kind: "merged",
+          detail: res.commit ?? entry.approvedDigest,
+        }),
+        ...prev,
+      ]);
+    }
   }
 
   return (
-    <div className="app-shell">
-      <nav className="nav-rail" aria-label="Verity sections">
-        {(
-          [
-            ["orchestrator", "Agents"],
-            ["spec-review", "Spec"],
-            ["merge-queue", "Merge"],
-            ["run-log", "Log"],
-          ] as [Screen, string][]
-        ).map(([id, label]) => (
-          <button
-            key={id}
-            className={`nav-btn ${screen === id ? "active" : ""}`}
-            onClick={() => setScreen(id)}
-          >
-            {label}
-          </button>
-        ))}
-      </nav>
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: verityPanelOpen
+          ? "280px minmax(0, 1fr) 440px"
+          : "280px minmax(0, 1fr)",
+        height: "100vh",
+        overflow: "hidden",
+        background: "var(--md-sys-color-surface)",
+        color: "var(--md-sys-color-on-surface)",
+      }}
+    >
+      <Sidebar
+        projects={state.projects}
+        activeProjectId={state.activeProjectId}
+        sessions={projectSessions}
+        activeSessionId={state.activeSessionId}
+        theme={state.theme}
+        isDesktop={desktopRuntime}
+        onSelectProject={(id) => void actions.selectProject(id)}
+        onSelectSession={(s) => void actions.switchSession(s)}
+        onCreateSession={() => void actions.createSession()}
+        onRenameSession={(id, name) => void actions.renameSession(id, name)}
+        onOpenHistoryTree={() => void actions.openHistoryTree()}
+        onOpenFork={() => void actions.openForkModal()}
+        onCloneSession={() => void actions.cloneCurrentSession()}
+        onExportHtml={() => void actions.exportSessionHtml()}
+        onOpenProviders={() => void actions.openProvidersModal()}
+        onToggleTheme={actions.toggleTheme}
+      />
 
-      <main className="main-pane">
-        {screen === "orchestrator" && (
-          <section>
-            <h1>Orchestrator workspace</h1>
-            {tasks.map((t) => (
-              <div className="card" key={t.id}>
-                <h3>{t.id}</h3>
-                <div>
-                  <span className="chip chip-info">{t.mode}</span>
-                  <span className="chip chip-pass">{t.state}</span>
-                  <span>
-                    Tools: {t.toolCallsUsed}/{t.toolCallsLimit}
-                  </span>
-                </div>
-              </div>
-            ))}
-          </section>
-        )}
-
-        {screen === "spec-review" && active && (
-          <section>
-            <h1>Spec review drawer</h1>
-            <div className="card">
-              <div>
-                <span className="chip chip-info">{active.verifier}</span>
-                <span className="chip chip-pass">
-                  Hygiene violations: {active.hygieneViolations}
-                </span>
-                <span className="chip chip-pass">
-                  cover! probes satisfied: {active.probesSatisfied}
-                </span>
-              </div>
-              <p>
-                Spec digest: <code>{active.specDigest}</code>
-              </p>
-              <div className="split-grid">
-                <div>
-                  <h3>Extracted spec and bounds</h3>
-                  <pre className="code-block">{active.extractedSpec || "Read-only task."}</pre>
-                </div>
-                <div>
-                  <h3>Blind back-translation</h3>
-                  <div className="code-block">{active.backTranslation}</div>
-                </div>
-              </div>
-              {active.state === "AwaitingSpecReview" && (
-                <div style={{ marginTop: 16 }}>
-                  <button
-                    className="btn-filled"
-                    onClick={() => approveSpec(active.id)}
-                  >
-                    Approve spec for merge
-                  </button>
-                </div>
-              )}
+      <main
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          minWidth: 0,
+          height: "100vh",
+          borderRight: verityPanelOpen
+            ? "1px solid var(--md-sys-color-outline-variant)"
+            : "none",
+        }}
+      >
+        <header
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "12px 20px",
+            borderBottom: "1px solid var(--md-sys-color-outline-variant)",
+            background: "var(--md-sys-color-surface-container-low)",
+            gap: 12,
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 600, fontSize: 15 }}>
+              {activeSession?.name ?? "Verity Orchestrator"}
             </div>
-          </section>
-        )}
-
-        {screen === "merge-queue" && (
-          <section>
-            <h1>Merge queue</h1>
-            {tasks
-              .filter((t) => t.mode === "Write")
-              .map((t) => (
-                <div className="card" key={t.id}>
-                  <h3>{t.id}</h3>
-                  <p>
-                    State: <strong>{t.state}</strong>. Changed paths:{" "}
-                    <code>{t.changedPaths.join(", ")}</code>
-                  </p>
-                  <button
-                    className="btn-filled"
-                    disabled={t.state !== "ApprovedForMerge"}
-                    onClick={() => setSelectedId(t.id)}
-                  >
-                    {t.state === "ApprovedForMerge"
-                      ? "Run merge-tree and CAS merge"
-                      : "Awaiting spec approval"}
-                  </button>
-                </div>
-              ))}
-          </section>
-        )}
-
-        {screen === "run-log" && (
-          <section>
-            <h1>Run log</h1>
-            <div className="card">
-              <pre className="code-block">
-                {`{"task_id":"task-safe-sub","kind":"awaiting_spec_review","detail":"9c8f4b21e0a3...d714"}\n{"task_id":"audit-git-hooks","kind":"completed_readonly","detail":"ok"}`}
-              </pre>
+            <div
+              style={{
+                fontSize: 12,
+                color: "var(--md-sys-color-on-surface-variant)",
+              }}
+            >
+              {activeProject?.name ?? "No project"} ·{" "}
+              {state.selectedModel.label} · Thinking: {state.thinkingLevel}
             </div>
-          </section>
-        )}
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              type="button"
+              className="md-btn md-btn--tonal"
+              onClick={() => setMergeQueueOpen(true)}
+            >
+              Merge Queue ({mergeEntries.length})
+            </button>
+            <button
+              type="button"
+              className="md-btn md-btn--tonal"
+              onClick={() => setRunLogOpen((v) => !v)}
+            >
+              Run Log
+            </button>
+            <button
+              type="button"
+              className="md-btn md-btn--filled"
+              onClick={() => setVerityPanelOpen((v) => !v)}
+            >
+              {verityPanelOpen ? "Hide Verification" : "Verification"}
+            </button>
+          </div>
+        </header>
+
+        <div style={{ flex: 1, overflowY: "auto", minHeight: 0 }}>
+          <ChatTranscript
+            messages={state.messages}
+            isStreaming={state.isStreaming}
+            liveTools={state.liveTools}
+            retryBanner={state.retryBanner}
+            onAbortRetry={() => void actions.abortRetry()}
+            onPickStarterPrompt={(prompt) => actions.setDraft(prompt)}
+          />
+        </div>
+
+        <Composer
+          draft={state.draft}
+          attachments={state.attachments}
+          models={state.models}
+          selectedModel={state.selectedModel}
+          thinkingLevels={state.thinkingLevels}
+          thinkingLevel={state.thinkingLevel}
+          commands={state.commands}
+          isStreaming={state.isStreaming}
+          pendingQueueCount={state.pendingQueueCount}
+          onDraftChange={actions.setDraft}
+          onRecallUp={actions.recallUp}
+          onRecallDown={actions.recallDown}
+          onAddAttachment={actions.addAttachment}
+          onRemoveAttachment={actions.removeAttachment}
+          onSelectModel={(p, m) => void actions.selectModel(p, m)}
+          onSelectThinkingLevel={(l) => void actions.selectThinkingLevel(l)}
+          onSend={() => void actions.sendPrompt()}
+          onSteer={() => void actions.steerPrompt()}
+          onFollowUp={() => void actions.followUpPrompt()}
+          onClearQueue={() => void actions.clearQueue()}
+          onAbort={() => void actions.abortTurn()}
+        />
       </main>
+
+      {verityPanelOpen && (
+        <aside
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 16,
+            padding: 16,
+            overflowY: "auto",
+            background:
+              "var(--md-sys-color-surface-container-lowest, var(--md-sys-color-surface))",
+          }}
+        >
+          <SubagentRail
+            tasks={subagents}
+            selectedTaskId={selectedTaskId}
+            onSelectTask={setSelectedTaskId}
+            onSpawnSubagent={handleSpawnSubagent}
+            spawning={spawning}
+          />
+          <SpecReviewDrawer
+            handoff={selectedTask?.handoff ?? null}
+            approved={
+              selectedTask ? Boolean(approvedIds[selectedTask.taskId]) : false
+            }
+            onApprove={handleApproveSpec}
+            onReject={handleRejectSpec}
+          />
+          {runLogOpen && (
+            <RunLogDrawer
+              rawLines={rawLogLines}
+              open={runLogOpen}
+              onSelectTask={setSelectedTaskId}
+              onClose={() => setRunLogOpen(false)}
+            />
+          )}
+        </aside>
+      )}
+
+      <HistoryTreeModal
+        open={state.modal.kind === "history_tree"}
+        nodes={state.modal.kind === "history_tree" ? state.modal.nodes : []}
+        onForkFromNode={(id) => void actions.forkAtEntry(id)}
+        onClose={actions.closeModal}
+      />
+      <ForkModal
+        open={state.modal.kind === "fork"}
+        candidates={state.modal.kind === "fork" ? state.modal.candidates : []}
+        onFork={(id) => void actions.forkAtEntry(id)}
+        onClose={actions.closeModal}
+      />
+      <ProviderSettingsModal
+        open={state.modal.kind === "providers"}
+        providers={state.providers}
+        onSave={actions.upsertProvider}
+        onDelete={actions.deleteProvider}
+        onClose={actions.closeModal}
+      />
+      <MergeQueueModal
+        open={mergeQueueOpen}
+        entries={mergeEntries}
+        onTriggerMerge={handleTriggerMerge}
+        onInspectSpec={(id) => {
+          setSelectedTaskId(id);
+          setMergeQueueOpen(false);
+          setVerityPanelOpen(true);
+        }}
+        onClose={() => setMergeQueueOpen(false)}
+      />
+      <ExtensionUiLayer
+        dialogs={state.extensionDialogs}
+        snackbars={state.extensionSnackbars}
+        widgets={state.extensionWidgets}
+        onRespond={(id, ans) => void actions.respondExtensionDialog(id, ans)}
+        onDismissSnackbar={actions.dismissSnackbar}
+        onDismissWidget={actions.dismissWidget}
+      />
     </div>
   );
 }
