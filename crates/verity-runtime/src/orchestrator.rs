@@ -4,7 +4,9 @@ use crate::git::{
 };
 use crate::handoff::{build_spec_handoff, RunLog};
 use crate::pi_rpc::{run_pi_prompt, PiRpcConfig, PiRpcError};
-use crate::verifiers::parse_kani_json;
+use crate::verifiers::{
+    discover_kani_targets, parse_kani_json, run_kani_sandboxed, run_lean_comparator_sandboxed,
+};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,19 @@ pub struct WriteTaskRequest {
     pub verifier: VerifierKind,
     pub goal: String,
     pub pi_config: Option<PiRpcConfig>,
+}
+
+/// Optional execution controls for `spawn_write_task_with_options`, keeping
+/// `WriteTaskRequest` backwards-compatible for existing CLI and desktop callers.
+#[derive(Debug, Clone, Default)]
+pub struct WriteTaskOptions {
+    /// When true (and the worker did not pre-emit `.verity-kani-report.json`),
+    /// runs the sandboxed Kani or Lean 4 verifier inside the isolated worktree
+    /// before tearing it down.
+    pub run_live_verifier: bool,
+    /// Optional path to a Lean 4 challenge export file for
+    /// `VerifierKind::Lean4Comparator`. Falls back to `<worktree>/challenge.export`.
+    pub lean_challenge_export: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,40 +382,124 @@ fn write_handoff_atomic(
 
 /// Reads an optional `.verity-kani-report.json` emitted inside the worktree
 /// and removes it before staging so it never pollutes the candidate diff.
-fn consume_optional_kani_report(worktree_dir: &Path) -> Option<CheckerVerdict> {
+fn take_optional_kani_report(worktree_dir: &Path) -> Option<Result<String, String>> {
     let report_path = worktree_dir.join(".verity-kani-report.json");
     if !report_path.exists() {
         return None;
     }
-    let raw = fs::read_to_string(&report_path).ok();
+    let raw = fs::read_to_string(&report_path)
+        .map_err(|_| "failed to read .verity-kani-report.json".to_string());
     let _ = fs::remove_file(&report_path);
+    Some(raw)
+}
+
+fn classify_raw_kani_report(
+    raw: Result<String, String>,
+    expected_probes: &[&str],
+) -> CheckerVerdict {
     match raw {
-        Some(text) => match parse_kani_json(&text) {
-            Ok(report) => Some(classify_kani_report(&report, &[])),
-            Err(msg) => Some(CheckerVerdict {
+        Ok(text) => match parse_kani_json(&text) {
+            Ok(report) => classify_kani_report(&report, expected_probes),
+            Err(msg) => CheckerVerdict {
                 status: VerdictStatus::InvalidReport,
                 reason: msg,
                 checks_passed: 0,
                 probes_satisfied: 0,
-            }),
+            },
         },
-        None => Some(CheckerVerdict {
+        Err(reason) => CheckerVerdict {
             status: VerdictStatus::InvalidReport,
-            reason: "failed to read .verity-kani-report.json".to_string(),
+            reason,
             checks_passed: 0,
             probes_satisfied: 0,
-        }),
+        },
     }
+}
+
+/// Executes the configured live machine checker inside the isolated worktree
+/// before worktree teardown, failing closed on missing targets or missing tools.
+fn execute_live_verifier(
+    worktree_dir: &Path,
+    verifier: VerifierKind,
+    changed_files: &[(RelPath, String)],
+    lean_challenge_export: Option<&Path>,
+) -> CheckerVerdict {
+    match verifier {
+        VerifierKind::RustKani => {
+            let (harness, probes) = discover_kani_targets(changed_files);
+            let Some(harness_name) = harness else {
+                return CheckerVerdict {
+                    status: VerdictStatus::InvalidReport,
+                    reason: "no #[kani::proof] harness discovered in changed Rust files"
+                        .to_string(),
+                    checks_passed: 0,
+                    probes_satisfied: 0,
+                };
+            };
+            let probe_refs: Vec<&str> = probes.iter().map(String::as_str).collect();
+            match run_kani_sandboxed(worktree_dir, &harness_name, &probe_refs) {
+                Ok(verdict) => verdict,
+                Err(err) => CheckerVerdict {
+                    status: VerdictStatus::Inconclusive,
+                    reason: format!(
+                        "unable to run sandboxed cargo kani for harness '{}': {} — ensure bubblewrap/sandbox and cargo-kani are available",
+                        harness_name, err
+                    ),
+                    checks_passed: 0,
+                    probes_satisfied: 0,
+                },
+            }
+        }
+        VerifierKind::Lean4Comparator => {
+            let default_export = worktree_dir.join("challenge.export");
+            let export_path = match lean_challenge_export {
+                Some(p) => p,
+                None if default_export.exists() => default_export.as_path(),
+                None => {
+                    return CheckerVerdict {
+                        status: VerdictStatus::Inconclusive,
+                        reason:
+                            "no Lean 4 challenge export configured or found at challenge.export"
+                                .to_string(),
+                        checks_passed: 0,
+                        probes_satisfied: 0,
+                    };
+                }
+            };
+            match run_lean_comparator_sandboxed(worktree_dir, export_path) {
+                Ok(verdict) => verdict,
+                Err(err) => CheckerVerdict {
+                    status: VerdictStatus::Inconclusive,
+                    reason: format!(
+                        "unable to run sandboxed lake comparator: {} — ensure bubblewrap/sandbox and lake are available",
+                        err
+                    ),
+                    checks_passed: 0,
+                    probes_satisfied: 0,
+                },
+            }
+        }
+    }
+}
+
+/// Runs the full write-subagent pipeline with default options (`run_live_verifier: false`).
+pub fn spawn_write_task(req: WriteTaskRequest) -> Result<PersistedHandoff, OrchestratorError> {
+    spawn_write_task_with_options(req, WriteTaskOptions::default())
 }
 
 /// Runs the full write-subagent pipeline:
 /// 1. Idempotently creates a locked detached git worktree at `<repo>/.verity/worktrees/<task_id>`.
 /// 2. Runs the Pi RPC worker inside that worktree.
 /// 3. Commits candidate changes and verifies the diff against `verity_core::check_scope`.
-/// 4. Reads changed files, builds the spec-only `SpecHandoff` (running hygiene lints),
-///    atomically persists `<repo>/.verity/handoffs/<task_id>.json`, and logs to `RunLog`.
+/// 4. Reads changed files, optionally runs the live sandboxed Kani / Lean 4 verifier inside
+///    the isolated worktree before teardown, builds the spec-only `SpecHandoff` (running
+///    hygiene lints), atomically persists `<repo>/.verity/handoffs/<task_id>.json`, and logs
+///    to `RunLog`.
 /// 5. Cleans up the worktree on every exit path.
-pub fn spawn_write_task(req: WriteTaskRequest) -> Result<PersistedHandoff, OrchestratorError> {
+pub fn spawn_write_task_with_options(
+    req: WriteTaskRequest,
+    options: WriteTaskOptions,
+) -> Result<PersistedHandoff, OrchestratorError> {
     if req.write_scope.is_empty() {
         return Err(OrchestratorError::EmptyWriteScope);
     }
@@ -422,7 +521,7 @@ pub fn spawn_write_task(req: WriteTaskRequest) -> Result<PersistedHandoff, Orche
 
     let pi_res = run_pi_prompt(&pi_cfg, req.task_id.as_str(), &req.goal)?;
 
-    let kani_verdict = consume_optional_kani_report(&wt_path);
+    let raw_kani_report = take_optional_kani_report(&wt_path);
     let commit_msg = format!("verity candidate {}", req.task_id.as_str());
     let candidate_commit = commit_worktree_changes(&wt_path, &commit_msg)?;
 
@@ -449,21 +548,31 @@ pub fn spawn_write_task(req: WriteTaskRequest) -> Result<PersistedHandoff, Orche
         changed_files.push((rel.clone(), content));
     }
 
-    let verdict = match kani_verdict {
-        Some(v) => v,
-        None if pi_res.settled => CheckerVerdict {
+    let verdict = match raw_kani_report {
+        Some(raw) => {
+            let (_, probes) = discover_kani_targets(&changed_files);
+            let probe_refs: Vec<&str> = probes.iter().map(String::as_str).collect();
+            classify_raw_kani_report(raw, &probe_refs)
+        }
+        None if !pi_res.settled => CheckerVerdict {
+            status: VerdictStatus::Inconclusive,
+            reason: "worker exited before emitting agent_settled".to_string(),
+            checks_passed: 0,
+            probes_satisfied: 0,
+        },
+        None if options.run_live_verifier => execute_live_verifier(
+            &wt_path,
+            req.verifier,
+            &changed_files,
+            options.lean_challenge_export.as_deref(),
+        ),
+        None => CheckerVerdict {
             status: VerdictStatus::Pass,
             reason: format!(
                 "worker settled ({} tool call(s)); hygiene lints evaluated",
                 pi_res.tool_calls
             ),
             checks_passed: changed_files.len(),
-            probes_satisfied: 0,
-        },
-        None => CheckerVerdict {
-            status: VerdictStatus::Inconclusive,
-            reason: "worker exited before emitting agent_settled".to_string(),
-            checks_passed: 0,
             probes_satisfied: 0,
         },
     };
