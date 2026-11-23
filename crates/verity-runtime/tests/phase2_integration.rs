@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use verity_core::classify_kani_report;
 use verity_core::{RelPath, TaskId, VerdictStatus};
 use verity_runtime::git::{
     changed_paths, commit_tree, commit_worktree_changes, create_worktree, git_common_dir,
@@ -9,14 +10,9 @@ use verity_runtime::git::{
 use verity_runtime::jail::{JailError, WorkspaceJail};
 use verity_runtime::sandbox::{bwrap_available, default_offline_config, run_sandboxed};
 use verity_runtime::verifiers::{hygiene_lint_lean, hygiene_lint_rust, parse_kani_json};
-use verity_core::classify_kani_report;
 
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "verity_test_{}_{}",
-        label,
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("verity_test_{}_{}", label, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -39,7 +35,11 @@ fn init_test_repo(dir: &PathBuf) {
         .args(["config", "user.email", "test@local"])
         .status()
         .unwrap();
-    fs::write(dir.join("lib.rs"), "pub fn add(a: u32, b: u32) -> u32 { a + b }\n").unwrap();
+    fs::write(
+        dir.join("lib.rs"),
+        "pub fn add(a: u32, b: u32) -> u32 { a + b }\n",
+    )
+    .unwrap();
     Command::new("git")
         .current_dir(dir)
         .args(["add", "-A"])

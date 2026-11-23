@@ -87,7 +87,11 @@ fn kill_child(child: &mut Child) {
 /// Runs a single prompt turn against a Pi JSONL RPC child process with hard
 /// wall-clock timeout and tool-call budget enforcement, tearing down the child
 /// and any descendant processes so no orphan workers survive.
-pub fn run_pi_prompt(cfg: &PiRpcConfig, prompt_id: &str, prompt_text: &str) -> Result<PiPromptResult, PiRpcError> {
+pub fn run_pi_prompt(
+    cfg: &PiRpcConfig,
+    prompt_id: &str,
+    prompt_text: &str,
+) -> Result<PiPromptResult, PiRpcError> {
     let mut child = Command::new(&cfg.program)
         .args(&cfg.args)
         .current_dir(&cfg.cwd)
@@ -111,7 +115,10 @@ pub fn run_pi_prompt(cfg: &PiRpcConfig, prompt_id: &str, prompt_text: &str) -> R
         escape_json_string(prompt_id),
         escape_json_string(prompt_text)
     );
-    if let Err(e) = stdin.write_all(payload.as_bytes()).and_then(|_| stdin.flush()) {
+    if let Err(e) = stdin
+        .write_all(payload.as_bytes())
+        .and_then(|_| stdin.flush())
+    {
         kill_child(&mut child);
         return Err(PiRpcError::Io(e.to_string()));
     }

@@ -113,7 +113,9 @@ impl fmt::Display for TransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TransitionError::AlreadyTerminal => write!(f, "task is already in a terminal state"),
-            TransitionError::InvalidStateForEvent => write!(f, "event is invalid for current state"),
+            TransitionError::InvalidStateForEvent => {
+                write!(f, "event is invalid for current state")
+            }
             TransitionError::ModeMismatch => write!(f, "event does not match task mode"),
             TransitionError::AttemptBudgetExhausted => write!(f, "attempt budget exhausted"),
             TransitionError::ScopeViolation(e) => write!(f, "scope violation: {}", e),
@@ -378,13 +380,11 @@ pub fn transition(
             handoff,
             approved_digest,
         }),
-        (
-            TaskStateCore::Merged,
-            _,
-            TaskEvent::CompleteMerge { merged_commit, .. },
-        ) => Ok(TaskState::Merged {
-            commit: merged_commit,
-        }),
+        (TaskStateCore::Merged, _, TaskEvent::CompleteMerge { merged_commit, .. }) => {
+            Ok(TaskState::Merged {
+                commit: merged_commit,
+            })
+        }
         (TaskStateCore::Rejected, _, TaskEvent::Reject { reason }) => {
             Ok(TaskState::Rejected { reason })
         }

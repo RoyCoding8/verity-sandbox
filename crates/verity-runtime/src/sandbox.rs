@@ -131,7 +131,10 @@ fn run_seatbelt(cfg: &SandboxConfig, program: &str, args: &[&str]) -> Result<Out
     cmd.output().map_err(|e| SandboxError::Io(e.to_string()))
 }
 
-pub fn default_offline_config(worktree_dir: &Path, git_common_dir: Option<PathBuf>) -> SandboxConfig {
+pub fn default_offline_config(
+    worktree_dir: &Path,
+    git_common_dir: Option<PathBuf>,
+) -> SandboxConfig {
     SandboxConfig {
         worktree_dir: worktree_dir.to_path_buf(),
         git_common_dir,

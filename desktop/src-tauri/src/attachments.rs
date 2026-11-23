@@ -149,7 +149,9 @@ pub fn validate_image_bytes(
 
 /// Boundary loader that validates extension and size before reading an image from disk
 /// and returns a Base64-encoded `PendingAttachment`.
-pub fn load_and_validate_image(path: impl AsRef<Path>) -> Result<PendingAttachment, AttachmentError> {
+pub fn load_and_validate_image(
+    path: impl AsRef<Path>,
+) -> Result<PendingAttachment, AttachmentError> {
     let path = path.as_ref();
 
     let filename = path
@@ -188,11 +190,8 @@ mod tests {
 
     fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "verity_attach_test_{}_{}",
-            std::process::id(),
-            id
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("verity_attach_test_{}_{}", std::process::id(), id));
         fs::create_dir_all(&dir).expect("create temp test dir");
         let path = dir.join(name);
         fs::write(&path, bytes).expect("write temp image");

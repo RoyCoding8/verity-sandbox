@@ -46,7 +46,9 @@ impl WorkspaceJail {
         write_scope: Vec<RelPath>,
         forbidden: Vec<RelPath>,
     ) -> Result<Self, JailError> {
-        let canon = root.canonicalize().map_err(|e| JailError::Io(e.to_string()))?;
+        let canon = root
+            .canonicalize()
+            .map_err(|e| JailError::Io(e.to_string()))?;
         Ok(Self {
             root: canon,
             read_scope,
@@ -149,7 +151,11 @@ impl WorkspaceJail {
 
     /// Searches files in scope, safely skipping oversized or binary files
     /// (fixes archive/verity-prototype/src/pi-worker.mjs line 244).
-    pub fn search_substring(&self, needle: &str, limit: usize) -> Result<Vec<(String, usize, String)>, JailError> {
+    pub fn search_substring(
+        &self,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, usize, String)>, JailError> {
         let mut hits = Vec::new();
         self.visit_dir(&self.root, "", needle, limit, &mut hits)?;
         Ok(hits)

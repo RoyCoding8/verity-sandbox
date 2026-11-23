@@ -264,9 +264,18 @@ printf '{"type":"agent_settled"}\n'"#;
     assert_eq!(loaded.handoff.verdict.status, VerdictStatus::Pass);
     assert!(loaded.handoff.extracted_spec.contains("pub fn safe_add"));
     assert!(loaded.handoff.extracted_spec.contains("#[kani::proof]"));
-    assert!(loaded.handoff.extracted_spec.contains("assert!(r >= a && r >= b);"));
-    assert!(loaded.handoff.extracted_spec.contains("kani::cover!(a > 0 && b > 0"));
-    assert!(!loaded.handoff.extracted_spec.contains("internal_secret_impl"));
+    assert!(loaded
+        .handoff
+        .extracted_spec
+        .contains("assert!(r >= a && r >= b);"));
+    assert!(loaded
+        .handoff
+        .extracted_spec
+        .contains("kani::cover!(a > 0 && b > 0"));
+    assert!(!loaded
+        .handoff
+        .extracted_spec
+        .contains("internal_secret_impl"));
 
     // Wrong digest must be rejected before touching target ref.
     let bad_digest = "0".repeat(64);
@@ -274,20 +283,24 @@ printf '{"type":"agent_settled"}\n'"#;
         approve_and_merge(&repo, &task_id, "refs/heads/main", &bad_digest),
         Err(OrchestratorError::DigestMismatch { .. })
     ));
-    assert_eq!(read_ref(&repo, "refs/heads/main").unwrap().unwrap(), base_oid);
+    assert_eq!(
+        read_ref(&repo, "refs/heads/main").unwrap().unwrap(),
+        base_oid
+    );
 
     // Correct digest performs lock-free merge-tree + CAS ref update.
     let digest_hex = loaded.handoff.spec_digest.to_hex();
-    let merged_commit = match approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap() {
-        MergeResult::Merged {
-            commit,
-            already_merged,
-        } => {
-            assert!(!already_merged);
-            commit
-        }
-        MergeResult::Conflict { .. } => panic!("expected clean CAS merge"),
-    };
+    let merged_commit =
+        match approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap() {
+            MergeResult::Merged {
+                commit,
+                already_merged,
+            } => {
+                assert!(!already_merged);
+                commit
+            }
+            MergeResult::Conflict { .. } => panic!("expected clean CAS merge"),
+        };
     assert_ne!(merged_commit, base_oid);
     assert_eq!(
         read_ref(&repo, "refs/heads/main").unwrap().unwrap(),
@@ -367,7 +380,10 @@ printf '{"type":"agent_settled"}\n'"#;
     .unwrap();
     assert!(!worktree_path_for(&repo, &hygiene_task).exists());
     assert!(!persisted.handoff.hygiene.is_clean());
-    assert_eq!(persisted.handoff.hygiene.violations[0].rule, "unreviewed-kani-assume");
+    assert_eq!(
+        persisted.handoff.hygiene.violations[0].rule,
+        "unreviewed-kani-assume"
+    );
 
     let merge_err = approve_and_merge(
         &repo,

@@ -1,10 +1,10 @@
-#[cfg(kani)]
-use verity_core::{
-    can_approve_gate_core, classify_kani_core, GateError, KaniCheckRef, VerdictStatus,
-};
 #[cfg(test)]
 use verity_core::{
     can_approve_gate, classify_kani_report, HygieneReport, HygieneViolation, KaniCheck, KaniReport,
+};
+#[cfg(kani)]
+use verity_core::{
+    can_approve_gate_core, classify_kani_core, GateError, KaniCheckRef, VerdictStatus,
 };
 use verity_core::{CheckKind, CheckStatus};
 

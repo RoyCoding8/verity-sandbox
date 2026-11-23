@@ -10,7 +10,9 @@ pub use provider::{
     validate_external_sign_in_url, validate_provider_url, validate_provider_url_bytes,
     ExternalSignInUrl, ProviderApi, ProviderError, ProviderProfile, ProviderUrl,
 };
-pub use scope::{check_scope, check_scope_core, within, within_str, ScopeError, ScopeViolationKind};
+pub use scope::{
+    check_scope, check_scope_core, within, within_str, ScopeError, ScopeViolationKind,
+};
 pub use session::{
     transition_session, SessionActivity, SessionCommand, SessionError, SessionTransition,
     MAX_PENDING_QUEUE,
@@ -44,7 +46,10 @@ mod tests {
     #[test]
     fn rel_path_blocks_traversal_and_dot_git() {
         assert!(RelPath::parse("src/lib.rs").is_ok());
-        assert_eq!(RelPath::parse("src/lib.rs/").unwrap().as_str(), "src/lib.rs");
+        assert_eq!(
+            RelPath::parse("src/lib.rs/").unwrap().as_str(),
+            "src/lib.rs"
+        );
         assert!(RelPath::parse("../secret").is_err());
         assert!(RelPath::parse(".git/hooks/pre-commit").is_err());
         assert!(RelPath::parse("sub/.GIT/config").is_err());

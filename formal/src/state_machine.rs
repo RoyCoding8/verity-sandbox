@@ -1,13 +1,13 @@
-#[cfg(kani)]
-use verity_core::{transition_core, TaskEventCore, TaskModeKind, TaskStateCore};
+#[cfg(test)]
+use verity_core::SpecDigest;
+use verity_core::VerdictStatus;
 #[cfg(test)]
 use verity_core::{
     transition, CheckerVerdict, CommitOid, HygieneReport, HygieneViolation, RelPath, SpecHandoff,
     TaskEvent, TaskMode, TaskState, TransitionError, VerifierKind,
 };
-#[cfg(test)]
-use verity_core::SpecDigest;
-use verity_core::VerdictStatus;
+#[cfg(kani)]
+use verity_core::{transition_core, TaskEventCore, TaskModeKind, TaskStateCore};
 
 #[cfg(test)]
 fn sample_oid(ch: char) -> CommitOid {

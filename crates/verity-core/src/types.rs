@@ -20,7 +20,9 @@ impl fmt::Display for TypeError {
         match self {
             TypeError::EmptyTaskId => write!(f, "task id cannot be empty"),
             TypeError::InvalidTaskIdChar => write!(f, "task id contains invalid character"),
-            TypeError::InvalidCommitOid => write!(f, "commit oid must be 40 or 64 lowercase hex chars"),
+            TypeError::InvalidCommitOid => {
+                write!(f, "commit oid must be 40 or 64 lowercase hex chars")
+            }
             TypeError::EmptyPath => write!(f, "relative path cannot be empty"),
             TypeError::AbsolutePath => write!(f, "path must be relative"),
             TypeError::BackslashPath => write!(f, "path must use forward slashes"),
@@ -28,7 +30,9 @@ impl fmt::Display for TypeError {
             TypeError::DotGitSegment => write!(f, "path cannot reference '.git'"),
             TypeError::ReservedDeviceName => write!(f, "path segment uses a reserved device name"),
             TypeError::ControlCharInPath => write!(f, "path contains control characters"),
-            TypeError::EmptyWriteScope => write!(f, "write task requires at least one write scope path"),
+            TypeError::EmptyWriteScope => {
+                write!(f, "write task requires at least one write scope path")
+            }
         }
     }
 }
@@ -66,10 +70,7 @@ impl CommitOid {
         if len != 40 && len != 64 {
             return Err(TypeError::InvalidCommitOid);
         }
-        if !raw
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        {
+        if !raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(TypeError::InvalidCommitOid);
         }
         Ok(Self(raw.to_string()))

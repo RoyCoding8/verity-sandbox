@@ -256,7 +256,12 @@ pub fn approve_and_merge_handoff(
     target_ref: String,
     approved_digest: String,
 ) -> Result<MergeResponse, String> {
-    approve_and_merge_view(&PathBuf::from(repo_path), &task_id, &target_ref, &approved_digest)
+    approve_and_merge_view(
+        &PathBuf::from(repo_path),
+        &task_id,
+        &target_ref,
+        &approved_digest,
+    )
 }
 
 #[cfg(test)]

@@ -6,9 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use verity_core::json::{parse_json, to_json_string, JsonValue};
-use verity_core::provider::{
-    validate_external_sign_in_url, validate_provider_url, ProviderApi,
-};
+use verity_core::provider::{validate_external_sign_in_url, validate_provider_url, ProviderApi};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -101,9 +99,7 @@ pub fn validate_provider_id(raw: &str) -> Result<String, String> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(
-            "provider id may only contain ASCII letters, digits, '-' or '_'".to_string(),
-        );
+        return Err("provider id may only contain ASCII letters, digits, '-' or '_'".to_string());
     }
     Ok(raw.to_string())
 }
@@ -172,7 +168,10 @@ fn optional_str(obj: &JsonValue, key: &str) -> Result<Option<String>, String> {
     match obj.get(key) {
         None | Some(JsonValue::Null) => Ok(None),
         Some(JsonValue::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(format!("provider store field '{}' must be string or null", key)),
+        Some(_) => Err(format!(
+            "provider store field '{}' must be string or null",
+            key
+        )),
     }
 }
 
@@ -262,13 +261,7 @@ impl ProviderStore {
                 );
                 obj.insert(
                     "models".to_string(),
-                    JsonValue::Array(
-                        p.models
-                            .iter()
-                            .cloned()
-                            .map(JsonValue::String)
-                            .collect(),
-                    ),
+                    JsonValue::Array(p.models.iter().cloned().map(JsonValue::String).collect()),
                 );
                 obj.insert(
                     "api_key".to_string(),
@@ -302,12 +295,7 @@ impl ProviderStore {
             .and_then(|n| n.to_str())
             .ok_or_else(|| format!("invalid provider store filename: {}", path.display()))?;
         let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = parent.join(format!(
-            ".{}.tmp.{}.{}",
-            file_name,
-            std::process::id(),
-            seq
-        ));
+        let tmp_path = parent.join(format!(".{}.tmp.{}.{}", file_name, std::process::id(), seq));
 
         let write_result = (|| -> Result<(), String> {
             let mut opts = OpenOptions::new();
@@ -356,7 +344,10 @@ impl ProviderStore {
     }
 
     pub fn public_profiles(&self) -> Vec<PublicProviderProfile> {
-        self.profiles.iter().map(PublicProviderProfile::from).collect()
+        self.profiles
+            .iter()
+            .map(PublicProviderProfile::from)
+            .collect()
     }
 
     pub fn upsert(&mut self, input: ProviderProfileInput) -> Result<PublicProviderProfile, String> {
@@ -660,8 +651,20 @@ mod tests {
         assert_eq!(public.len(), 2);
         let debug_repr = format!("{:?}", public);
         assert!(!debug_repr.contains(secret));
-        assert!(public.iter().find(|p| p.id == "my-anthropic").unwrap().has_api_key);
-        assert!(!public.iter().find(|p| p.id == "ollama").unwrap().has_api_key);
+        assert!(
+            public
+                .iter()
+                .find(|p| p.id == "my-anthropic")
+                .unwrap()
+                .has_api_key
+        );
+        assert!(
+            !public
+                .iter()
+                .find(|p| p.id == "ollama")
+                .unwrap()
+                .has_api_key
+        );
 
         let env = build_pi_provider_env(&store);
         assert_eq!(env[0].0, "VERITY_DESKTOP_PROVIDERS");

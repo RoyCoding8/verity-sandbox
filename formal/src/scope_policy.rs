@@ -1,7 +1,7 @@
-#[cfg(kani)]
-use verity_core::{check_scope_core, ScopeViolationKind};
 #[cfg(test)]
 use verity_core::{check_scope, within, RelPath, ScopeError};
+#[cfg(kani)]
+use verity_core::{check_scope_core, ScopeViolationKind};
 
 /// Law 3: Write-scope containment and forbidden-path precedence.
 #[cfg(kani)]

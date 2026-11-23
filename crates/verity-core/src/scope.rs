@@ -21,7 +21,11 @@ impl fmt::Display for ScopeError {
         match self {
             ScopeError::EmptyDiff => write!(f, "write task produced an empty diff"),
             ScopeError::OutsideWriteScope(p) => {
-                write!(f, "changed path '{}' is outside approved write scope", p.as_str())
+                write!(
+                    f,
+                    "changed path '{}' is outside approved write scope",
+                    p.as_str()
+                )
             }
             ScopeError::ForbiddenPath(p) => {
                 write!(f, "changed path '{}' hits a forbidden path", p.as_str())

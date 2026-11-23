@@ -592,11 +592,7 @@ pub fn approve_and_merge(
         MergeOutcome::Conflict { conflicted_paths } => {
             if let Ok(log) = RunLog::open(repo_dir) {
                 let joined: Vec<&str> = conflicted_paths.iter().map(RelPath::as_str).collect();
-                let _ = log.append_event(
-                    task_id.as_str(),
-                    "merge_conflict",
-                    &joined.join(","),
-                );
+                let _ = log.append_event(task_id.as_str(), "merge_conflict", &joined.join(","));
             }
             Ok(MergeResult::Conflict { conflicted_paths })
         }

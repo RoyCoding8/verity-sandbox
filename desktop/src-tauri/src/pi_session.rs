@@ -614,7 +614,8 @@ impl PiSessionSupervisor {
                         match &event {
                             PiUiEvent::AgentSettled { .. } => {
                                 let mut act = r_activity.lock().expect("activity lock poisoned");
-                                if let Ok(tr) = transition_session(*act, SessionCommand::AgentSettled)
+                                if let Ok(tr) =
+                                    transition_session(*act, SessionCommand::AgentSettled)
                                 {
                                     *act = tr.activity;
                                     trigger_reload = tr.run_provider_reload;
@@ -1009,7 +1010,10 @@ impl PiSessionSupervisor {
 
         // Join stdout reader thread.
         {
-            let mut handle_guard = self.reader_handle.lock().expect("reader_handle lock poisoned");
+            let mut handle_guard = self
+                .reader_handle
+                .lock()
+                .expect("reader_handle lock poisoned");
             if let Some(handle) = handle_guard.take() {
                 let _ = handle.join();
             }
@@ -1017,9 +1021,8 @@ impl PiSessionSupervisor {
     }
 
     fn send_expect_response(&self, cmd: PiRpcCommand) -> Result<PiRpcResponse, PiSessionError> {
-        self.send_command(cmd)?.ok_or_else(|| {
-            PiSessionError::Protocol("expected correlated rpc response".to_string())
-        })
+        self.send_command(cmd)?
+            .ok_or_else(|| PiSessionError::Protocol("expected correlated rpc response".to_string()))
     }
 
     fn allocate_request_id(&self) -> RequestId {
@@ -1029,7 +1032,9 @@ impl PiSessionSupervisor {
 
     fn write_jsonl(&self, line: &str) -> Result<(), PiSessionError> {
         let mut stdin_guard = self.stdin.lock().expect("stdin lock poisoned");
-        let stdin = stdin_guard.as_mut().ok_or(PiSessionError::AlreadyShutdown)?;
+        let stdin = stdin_guard
+            .as_mut()
+            .ok_or(PiSessionError::AlreadyShutdown)?;
         stdin
             .write_all(line.as_bytes())
             .and_then(|_| stdin.write_all(b"\n"))
@@ -1324,9 +1329,9 @@ done
         assert!(recorded
             .iter()
             .any(|e| matches!(e, PiUiEvent::MessageStart { .. })));
-        assert!(recorded
-            .iter()
-            .any(|e| matches!(e, PiUiEvent::MessageUpdate { delta: Some(d), .. } if d == "hello ")));
+        assert!(recorded.iter().any(
+            |e| matches!(e, PiUiEvent::MessageUpdate { delta: Some(d), .. } if d == "hello ")
+        ));
         assert!(recorded
             .iter()
             .any(|e| matches!(e, PiUiEvent::ToolExecutionStart { .. })));
@@ -1347,9 +1352,6 @@ done
         // Idempotent shutdown + Drop.
         sup.shutdown();
         sup.shutdown();
-        assert_eq!(
-            sup.get_state(),
-            Err(PiSessionError::AlreadyShutdown)
-        );
+        assert_eq!(sup.get_state(), Err(PiSessionError::AlreadyShutdown));
     }
 }

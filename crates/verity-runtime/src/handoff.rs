@@ -107,7 +107,12 @@ impl RunLog {
         })
     }
 
-    pub fn append_event(&self, task_id: &str, kind: &str, detail: &str) -> Result<(), std::io::Error> {
+    pub fn append_event(
+        &self,
+        task_id: &str,
+        kind: &str,
+        detail: &str,
+    ) -> Result<(), std::io::Error> {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)

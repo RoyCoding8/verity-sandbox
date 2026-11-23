@@ -183,8 +183,16 @@ pub fn parse_extension_ui_request(
                 .filter_map(|item| {
                     item.as_str()
                         .map(ToString::to_string)
-                        .or_else(|| item.get("value").and_then(JsonValue::as_str).map(ToString::to_string))
-                        .or_else(|| item.get("label").and_then(JsonValue::as_str).map(ToString::to_string))
+                        .or_else(|| {
+                            item.get("value")
+                                .and_then(JsonValue::as_str)
+                                .map(ToString::to_string)
+                        })
+                        .or_else(|| {
+                            item.get("label")
+                                .and_then(JsonValue::as_str)
+                                .map(ToString::to_string)
+                        })
                 })
                 .collect()
         })
@@ -381,7 +389,11 @@ mod tests {
 
         // Wrong answer kind is rejected and dialog remains open.
         assert_eq!(
-            tracker.resolve_at(&confirm_id, ExtensionUiAnswer::Value("yes".to_string()), now),
+            tracker.resolve_at(
+                &confirm_id,
+                ExtensionUiAnswer::Value("yes".to_string()),
+                now
+            ),
             Err(ExtensionUiError::InvalidAnswerForKind {
                 id: confirm_id.clone(),
                 kind: DialogKind::Confirm,
@@ -397,8 +409,14 @@ mod tests {
             parsed.get("type").and_then(JsonValue::as_str),
             Some("extension_ui_response")
         );
-        assert_eq!(parsed.get("id").and_then(JsonValue::as_str), Some("dlg-confirm"));
-        assert_eq!(parsed.get("confirmed").and_then(JsonValue::as_bool), Some(true));
+        assert_eq!(
+            parsed.get("id").and_then(JsonValue::as_str),
+            Some("dlg-confirm")
+        );
+        assert_eq!(
+            parsed.get("confirmed").and_then(JsonValue::as_bool),
+            Some(true)
+        );
         assert_eq!(tracker.open_count(), 0);
 
         // Select dialog validates options.
@@ -416,14 +434,25 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            tracker.resolve_at(&select_id, ExtensionUiAnswer::Value("gamma".to_string()), now),
+            tracker.resolve_at(
+                &select_id,
+                ExtensionUiAnswer::Value("gamma".to_string()),
+                now
+            ),
             Err(ExtensionUiError::InvalidSelection { .. })
         ));
         let sel_resp = tracker
-            .resolve_at(&select_id, ExtensionUiAnswer::Value("beta".to_string()), now)
+            .resolve_at(
+                &select_id,
+                ExtensionUiAnswer::Value("beta".to_string()),
+                now,
+            )
             .unwrap();
         let sel_json = parse_json(&sel_resp.to_jsonl()).unwrap();
-        assert_eq!(sel_json.get("value").and_then(JsonValue::as_str), Some("beta"));
+        assert_eq!(
+            sel_json.get("value").and_then(JsonValue::as_str),
+            Some("beta")
+        );
 
         // Input and Editor accept values and cancellation.
         let input_id = DialogId::parse("dlg-input").unwrap();
@@ -453,7 +482,11 @@ mod tests {
             )
             .unwrap();
         let in_resp = tracker
-            .resolve_at(&input_id, ExtensionUiAnswer::Value("hello".to_string()), now)
+            .resolve_at(
+                &input_id,
+                ExtensionUiAnswer::Value("hello".to_string()),
+                now,
+            )
             .unwrap();
         assert_eq!(
             parse_json(&in_resp.to_jsonl())
@@ -492,16 +525,24 @@ mod tests {
             )
             .unwrap();
 
-        assert!(tracker.purge_expired_at(t0 + Duration::from_secs(4)).is_empty());
+        assert!(tracker
+            .purge_expired_at(t0 + Duration::from_secs(4))
+            .is_empty());
         let expired = tracker.purge_expired_at(t0 + Duration::from_secs(5));
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, id);
         assert_eq!(expired[0].answer, ExtensionUiAnswer::Cancelled);
         // Second purge is idempotent.
-        assert!(tracker.purge_expired_at(t0 + Duration::from_secs(6)).is_empty());
+        assert!(tracker
+            .purge_expired_at(t0 + Duration::from_secs(6))
+            .is_empty());
         // Resolving an already-purged dialog returns UnknownDialog.
         assert_eq!(
-            tracker.resolve_at(&id, ExtensionUiAnswer::Cancelled, t0 + Duration::from_secs(6)),
+            tracker.resolve_at(
+                &id,
+                ExtensionUiAnswer::Cancelled,
+                t0 + Duration::from_secs(6)
+            ),
             Err(ExtensionUiError::UnknownDialog(id))
         );
     }

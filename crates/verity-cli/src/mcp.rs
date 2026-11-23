@@ -11,7 +11,10 @@ use verity_runtime::orchestrator::{
 use verity_runtime::pi_rpc::{run_pi_prompt, PiRpcConfig};
 
 fn jsonrpc_result(id_str: &str, result_json: &str) -> String {
-    format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}\n", id_str, result_json)
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}\n",
+        id_str, result_json
+    )
 }
 
 fn jsonrpc_error(id_str: &str, code: i32, message: &str) -> String {
@@ -57,7 +60,11 @@ fn parse_optional_string_array(args: &JsonValue, key: &str) -> Result<Vec<String
     }
 }
 
-fn parse_rel_paths_array(args: &JsonValue, key: &str, required: bool) -> Result<Vec<RelPath>, String> {
+fn parse_rel_paths_array(
+    args: &JsonValue,
+    key: &str,
+    required: bool,
+) -> Result<Vec<RelPath>, String> {
     if required && args.get(key).is_none() {
         return Err(format!("missing required array argument '{}'", key));
     }
@@ -70,7 +77,11 @@ fn parse_rel_paths_array(args: &JsonValue, key: &str, required: bool) -> Result<
     Ok(out)
 }
 
-fn build_pi_config(args: &JsonValue, cwd: PathBuf, read_only: bool) -> Result<Option<PiRpcConfig>, String> {
+fn build_pi_config(
+    args: &JsonValue,
+    cwd: PathBuf,
+    read_only: bool,
+) -> Result<Option<PiRpcConfig>, String> {
     let Some(pi_bin) = args.get("pi_bin").and_then(|v| v.as_str()) else {
         return Ok(None);
     };
@@ -139,7 +150,9 @@ fn exec_merge_approved(args: &JsonValue) -> Result<(String, bool), String> {
             .get("target_ref")
             .or_else(|| args.get("ref_name"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing required string argument 'target_ref' or 'ref_name'".to_string())?;
+            .ok_or_else(|| {
+                "missing required string argument 'target_ref' or 'ref_name'".to_string()
+            })?;
         return match approve_and_merge(&repo, &task_id, target_ref, approved_digest) {
             Ok(MergeResult::Merged {
                 commit,
@@ -158,7 +171,10 @@ fn exec_merge_approved(args: &JsonValue) -> Result<(String, bool), String> {
                     .map(|p| escape_json_string(p.as_str()))
                     .collect();
                 Ok((
-                    format!("{{\"status\":\"conflict\",\"paths\":[{}]}}", paths.join(",")),
+                    format!(
+                        "{{\"status\":\"conflict\",\"paths\":[{}]}}",
+                        paths.join(",")
+                    ),
                     true,
                 ))
             }
@@ -196,7 +212,10 @@ fn exec_merge_approved(args: &JsonValue) -> Result<(String, bool), String> {
                 .map(|p| escape_json_string(p.as_str()))
                 .collect();
             Ok((
-                format!("{{\"status\":\"conflict\",\"paths\":[{}]}}", paths.join(",")),
+                format!(
+                    "{{\"status\":\"conflict\",\"paths\":[{}]}}",
+                    paths.join(",")
+                ),
                 true,
             ))
         }
@@ -350,7 +369,11 @@ mod tests {
         let ro_resp = parse_json(&handle_mcp_request(&ro_req).unwrap()).unwrap();
         let ro_res = ro_resp.get("result").unwrap();
         assert_eq!(ro_res.get("isError").and_then(|v| v.as_bool()), Some(false));
-        let ro_text = ro_res.get("content").unwrap().as_array().unwrap()[0].get("text").unwrap().as_str().unwrap();
+        let ro_text = ro_res.get("content").unwrap().as_array().unwrap()[0]
+            .get("text")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert!(ro_text.contains("clean repo"));
 
         // 2. verity_spawn_write
@@ -374,8 +397,15 @@ printf '{\"type\":\"agent_settled\"}\\n'";
         .unwrap();
         let spawn_resp = parse_json(&handle_mcp_request(&spawn_req).unwrap()).unwrap();
         let spawn_res = spawn_resp.get("result").unwrap();
-        assert_eq!(spawn_res.get("isError").and_then(|v| v.as_bool()), Some(false));
-        let handoff_text = spawn_res.get("content").unwrap().as_array().unwrap()[0].get("text").unwrap().as_str().unwrap();
+        assert_eq!(
+            spawn_res.get("isError").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let handoff_text = spawn_res.get("content").unwrap().as_array().unwrap()[0]
+            .get("text")
+            .unwrap()
+            .as_str()
+            .unwrap();
         let handoff_val = parse_json(handoff_text).unwrap();
         let digest = handoff_val.get("spec_digest").unwrap().as_str().unwrap();
 
@@ -388,11 +418,17 @@ printf '{\"type\":\"agent_settled\"}\\n'";
         .unwrap();
         let merge_resp = parse_json(&handle_mcp_request(&merge_req).unwrap()).unwrap();
         let merge_res = merge_resp.get("result").unwrap();
-        assert_eq!(merge_res.get("isError").and_then(|v| v.as_bool()), Some(false));
-        let merge_text = merge_res.get("content").unwrap().as_array().unwrap()[0].get("text").unwrap().as_str().unwrap();
+        assert_eq!(
+            merge_res.get("isError").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let merge_text = merge_res.get("content").unwrap().as_array().unwrap()[0]
+            .get("text")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert!(merge_text.contains("\"status\":\"merged\""));
 
         let _ = fs::remove_dir_all(&repo);
     }
-
 }

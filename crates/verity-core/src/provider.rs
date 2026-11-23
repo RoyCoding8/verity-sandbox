@@ -25,7 +25,9 @@ impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProviderError::EmptyUrl => write!(f, "provider URL cannot be empty"),
-            ProviderError::WhitespaceNotAllowed => write!(f, "provider URL cannot contain whitespace"),
+            ProviderError::WhitespaceNotAllowed => {
+                write!(f, "provider URL cannot contain whitespace")
+            }
             ProviderError::ControlCharNotAllowed => {
                 write!(f, "provider URL cannot contain control characters")
             }
@@ -41,7 +43,9 @@ impl fmt::Display for ProviderError {
                 write!(f, "provider URL cannot contain '#' fragment")
             }
             ProviderError::EmptyHost => write!(f, "provider URL must include a non-empty host"),
-            ProviderError::InvalidHost => write!(f, "provider URL contains an invalid host or port"),
+            ProviderError::InvalidHost => {
+                write!(f, "provider URL contains an invalid host or port")
+            }
         }
     }
 }

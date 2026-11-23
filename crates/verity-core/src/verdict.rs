@@ -241,12 +241,15 @@ pub fn classify_kani_core<C: CheckView>(
         let mut i = 0usize;
         while i < checks.len() {
             let check = &checks[i];
-            if check.kind() == CheckKind::Cover && bytes_eq(check.description().as_bytes(), expected)
+            if check.kind() == CheckKind::Cover
+                && bytes_eq(check.description().as_bytes(), expected)
             {
                 matched_count += 1;
                 match check.status() {
                     CheckStatus::Satisfied => {}
-                    CheckStatus::Unsatisfiable | CheckStatus::Unreachable | CheckStatus::Failure => {
+                    CheckStatus::Unsatisfiable
+                    | CheckStatus::Unreachable
+                    | CheckStatus::Failure => {
                         return VerdictCore {
                             status: VerdictStatus::Counterexample,
                             reason: VerdictReason::ProbeUnreachable { probe_index },
@@ -361,6 +364,9 @@ pub fn can_approve_gate_core(
     Ok(())
 }
 
-pub fn can_approve_gate(hygiene: &HygieneReport, verdict: &CheckerVerdict) -> Result<(), GateError> {
+pub fn can_approve_gate(
+    hygiene: &HygieneReport,
+    verdict: &CheckerVerdict,
+) -> Result<(), GateError> {
     can_approve_gate_core(hygiene.violations.len(), verdict.status)
 }

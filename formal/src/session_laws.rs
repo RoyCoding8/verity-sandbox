@@ -1,11 +1,11 @@
 #[cfg(kani)]
 use verity_core::validate_provider_url_bytes;
-#[cfg(test)]
-use verity_core::{validate_external_sign_in_url, validate_provider_url};
 use verity_core::{
     transition_session, ProviderError, SessionActivity, SessionCommand, SessionError,
     MAX_PENDING_QUEUE,
 };
+#[cfg(test)]
+use verity_core::{validate_external_sign_in_url, validate_provider_url};
 
 #[cfg(kani)]
 fn any_activity() -> SessionActivity {
@@ -187,7 +187,10 @@ pub fn prove_session_exclusivity_and_queue_laws() {
         "send_prompt_accept_reachable"
     );
     kani::cover!(
-        matches!((command, res), (SessionCommand::SendPrompt, Err(SessionError::NotIdle))),
+        matches!(
+            (command, res),
+            (SessionCommand::SendPrompt, Err(SessionError::NotIdle))
+        ),
         "send_prompt_reject_reachable"
     );
     kani::cover!(
@@ -426,10 +429,7 @@ mod tests {
     fn provider_and_external_sign_in_validation_edges() {
         assert!(validate_provider_url("https://api.example.com").is_ok());
         assert!(validate_provider_url("http://127.0.0.1:8000/v1").is_ok());
-        assert_eq!(
-            validate_provider_url(""),
-            Err(ProviderError::EmptyUrl)
-        );
+        assert_eq!(validate_provider_url(""), Err(ProviderError::EmptyUrl));
         assert_eq!(
             validate_provider_url("https://"),
             Err(ProviderError::EmptyHost)

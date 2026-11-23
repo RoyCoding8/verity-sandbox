@@ -34,7 +34,8 @@ fn parse_csv_paths(raw: &str) -> Result<Vec<RelPath>, String> {
         if trimmed.is_empty() {
             continue;
         }
-        let rel = RelPath::parse(trimmed).map_err(|e| format!("invalid path '{}': {}", trimmed, e))?;
+        let rel =
+            RelPath::parse(trimmed).map_err(|e| format!("invalid path '{}': {}", trimmed, e))?;
         out.push(rel);
     }
     Ok(out)
@@ -212,12 +213,10 @@ fn main() {
                                     eprintln!("commit-tree failed: {}", e);
                                     process::exit(1);
                                 });
-                        update_ref_cas(&repo, ref_name, &merged, Some(&base)).unwrap_or_else(
-                            |e| {
-                                eprintln!("cas update-ref failed: {}", e);
-                                process::exit(1);
-                            },
-                        );
+                        update_ref_cas(&repo, ref_name, &merged, Some(&base)).unwrap_or_else(|e| {
+                            eprintln!("cas update-ref failed: {}", e);
+                            process::exit(1);
+                        });
                         if let Ok(log) = RunLog::open(&repo) {
                             let _ = log.append_event("merge", "merged", merged.as_str());
                         }

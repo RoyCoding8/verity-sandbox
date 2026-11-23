@@ -359,8 +359,9 @@ pub fn hygiene_lint_rust(rel_path: &str, source: &str) -> HygieneReport {
                 rule: "unreviewed-kani-assume".to_string(),
                 path: rel_path.to_string(),
                 line: line_no,
-                detail: "kani::assume must be marked with '// verity:trusted-assume' for spec review"
-                    .to_string(),
+                detail:
+                    "kani::assume must be marked with '// verity:trusted-assume' for spec review"
+                        .to_string(),
             });
         }
     }
@@ -375,17 +376,37 @@ pub fn hygiene_lint_lean(rel_path: &str, source: &str) -> HygieneReport {
     let mut violations = Vec::new();
     let banned = [
         ("no-sorry", "sorry", "proof contains sorry"),
-        ("no-custom-axiom", "axiom ", "custom axiom weakens logical soundness"),
-        ("no-partial", "partial def", "partial def allows compiled runtime divergence"),
+        (
+            "no-custom-axiom",
+            "axiom ",
+            "custom axiom weakens logical soundness",
+        ),
+        (
+            "no-partial",
+            "partial def",
+            "partial def allows compiled runtime divergence",
+        ),
         ("no-unsafe", "unsafe ", "unsafe bypasses the Lean kernel"),
         (
             "no-implemented-by",
             "@[implemented_by",
             "@[implemented_by] diverges from proved definition",
         ),
-        ("no-extern", "@[extern", "@[extern] diverges from proved definition"),
-        ("no-csimp", "@[csimp", "@[csimp] rewrites compiled code outside kernel"),
-        ("no-native-decide", "native_decide", "native_decide trusts the compiler"),
+        (
+            "no-extern",
+            "@[extern",
+            "@[extern] diverges from proved definition",
+        ),
+        (
+            "no-csimp",
+            "@[csimp",
+            "@[csimp] rewrites compiled code outside kernel",
+        ),
+        (
+            "no-native-decide",
+            "native_decide",
+            "native_decide trusts the compiler",
+        ),
     ];
 
     for (idx, raw_code) in scan_lean_lines(source).into_iter().enumerate() {
@@ -510,8 +531,7 @@ pub fn run_kani_sandboxed(
         });
     }
 
-    let raw = std::fs::read_to_string(&report_path)
-        .map_err(|e| SandboxError::Io(e.to_string()))?;
+    let raw = std::fs::read_to_string(&report_path).map_err(|e| SandboxError::Io(e.to_string()))?;
     let _ = std::fs::remove_file(&report_path);
 
     match parse_kani_json(&raw) {

@@ -18,7 +18,13 @@ impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GitError::CommandFailed { args, code, stderr } => {
-                write!(f, "git {:?} failed (exit {:?}): {}", args, code, stderr.trim())
+                write!(
+                    f,
+                    "git {:?} failed (exit {:?}): {}",
+                    args,
+                    code,
+                    stderr.trim()
+                )
             }
             GitError::InvalidOutput(msg) => write!(f, "invalid git output: {}", msg),
             GitError::Io(msg) => write!(f, "git io error: {}", msg),
@@ -130,7 +136,10 @@ pub fn remove_worktree(repo_dir: &Path, worktree_path: &Path) -> Result<(), GitE
     let wt_str = worktree_path
         .to_str()
         .ok_or_else(|| GitError::InvalidOutput("non-utf8 worktree path".to_string()))?;
-    let _ = run_git(repo_dir, &["worktree", "remove", "--force", "--force", wt_str]);
+    let _ = run_git(
+        repo_dir,
+        &["worktree", "remove", "--force", "--force", wt_str],
+    );
     if worktree_path.exists() {
         std::fs::remove_dir_all(worktree_path).map_err(|e| GitError::Io(e.to_string()))?;
     }
@@ -139,10 +148,7 @@ pub fn remove_worktree(repo_dir: &Path, worktree_path: &Path) -> Result<(), GitE
 }
 
 /// Stages all non-gitignored changes inside a worktree and creates a commit.
-pub fn commit_worktree_changes(
-    worktree_dir: &Path,
-    message: &str,
-) -> Result<CommitOid, GitError> {
+pub fn commit_worktree_changes(worktree_dir: &Path, message: &str) -> Result<CommitOid, GitError> {
     require_git_ok(worktree_dir, &["add", "--all"])?;
     require_git_ok(
         worktree_dir,
