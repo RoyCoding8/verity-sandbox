@@ -7,9 +7,11 @@ use crate::providers::{
     build_pi_provider_env, default_store_path, ProviderStore, PublicProviderProfile,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Runtime, State};
 use verity_core::json::{parse_json, JsonValue};
@@ -605,11 +607,175 @@ fn models_from_providers(providers: &[PublicProviderProfile]) -> Vec<ModelOption
     out
 }
 
+/// Built-in fallback catalog used whenever live Pi RPC, custom `ProviderStore`,
+/// and `~/.pi/agent/models.json` yield no models so the picker is never empty or `"default"`.
+pub fn default_catalog_models() -> Vec<ModelOption> {
+    vec![
+        ModelOption {
+            provider: "anthropic".to_string(),
+            model_id: "claude-sonnet-4-5".to_string(),
+            label: "Claude Sonnet 4.5".to_string(),
+        },
+        ModelOption {
+            provider: "anthropic".to_string(),
+            model_id: "claude-opus-4-5".to_string(),
+            label: "Claude Opus 4.5".to_string(),
+        },
+        ModelOption {
+            provider: "openai".to_string(),
+            model_id: "gpt-5".to_string(),
+            label: "GPT-5".to_string(),
+        },
+        ModelOption {
+            provider: "google".to_string(),
+            model_id: "gemini-2.5-pro".to_string(),
+            label: "Gemini 2.5 Pro".to_string(),
+        },
+    ]
+}
+
+/// Pure boundary parser for `~/.pi/agent/models.json` supporting both Pi's
+/// `{"providers": {"<provider>": {"models": [...]}}}` map and top-level `models` arrays.
+pub fn parse_pi_agent_models(val: &JsonValue) -> Vec<ModelOption> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    let mut push_unique = |provider: String, model_id: String, label: String| {
+        let p = provider.trim();
+        let m = model_id.trim();
+        if p.is_empty() || m.is_empty() {
+            return;
+        }
+        let key = (p.to_string(), m.to_string());
+        if seen.insert(key) {
+            let lbl = if label.trim().is_empty() {
+                m.to_string()
+            } else {
+                label.trim().to_string()
+            };
+            out.push(ModelOption {
+                provider: p.to_string(),
+                model_id: m.to_string(),
+                label: lbl,
+            });
+        }
+    };
+
+    if let Some(JsonValue::Object(providers)) = val.get("providers") {
+        for (provider_id, provider_cfg) in providers {
+            if let Some(models) = provider_cfg.get("models").and_then(JsonValue::as_array) {
+                for item in models {
+                    match item {
+                        JsonValue::String(id) => {
+                            push_unique(provider_id.clone(), id.clone(), id.clone());
+                        }
+                        JsonValue::Object(_) => {
+                            if let Some(model_id) = opt_str(item, &["id", "modelId", "model_id"]) {
+                                let provider = opt_str(item, &["provider"])
+                                    .unwrap_or_else(|| provider_id.clone());
+                                let label = opt_str(item, &["label", "name"])
+                                    .unwrap_or_else(|| model_id.clone());
+                                push_unique(provider, model_id, label);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    for model in parse_models_list(val) {
+        push_unique(model.provider, model.model_id, model.label);
+    }
+
+    out
+}
+
+/// Reads and parses a Pi agent `models.json` file from an explicit path.
+pub fn load_pi_agent_models_from_path(path: &Path) -> Vec<ModelOption> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(val) = parse_json(&raw) else {
+        return Vec::new();
+    };
+    parse_pi_agent_models(&val)
+}
+
+/// Optionally reads `$PI_CODING_AGENT_DIR/models.json` (or `~/.pi/agent/models.json`)
+/// and extracts configured models cleanly.
+pub fn load_pi_agent_models() -> Vec<ModelOption> {
+    let models_path = env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|dir| PathBuf::from(dir).join("models.json"))
+        .or_else(|| {
+            env::var("HOME")
+                .ok()
+                .or_else(|| env::var("USERPROFILE").ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|home| {
+                    PathBuf::from(home)
+                        .join(".pi")
+                        .join("agent")
+                        .join("models.json")
+                })
+        });
+
+    match models_path {
+        Some(path) => load_pi_agent_models_from_path(&path),
+        None => Vec::new(),
+    }
+}
+
+/// Merges RPC, custom provider store, and Pi agent models deduplicated by `(provider, model_id)`.
+/// Falls back to `default_catalog_models()` if all sources yield no models.
+pub fn merge_models_with_fallback(
+    rpc_models: Vec<ModelOption>,
+    provider_models: Vec<ModelOption>,
+    agent_models: Vec<ModelOption>,
+) -> Vec<ModelOption> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut merged = Vec::new();
+    for model in rpc_models
+        .into_iter()
+        .chain(provider_models)
+        .chain(agent_models)
+    {
+        let p = model.provider.trim();
+        let m = model.model_id.trim();
+        if p.is_empty() || m.is_empty() {
+            continue;
+        }
+        let key = (p.to_string(), m.to_string());
+        if seen.insert(key) {
+            merged.push(model);
+        }
+    }
+    if merged.is_empty() {
+        default_catalog_models()
+    } else {
+        merged
+    }
+}
+
+fn resolve_model_label(provider: &str, model_id: &str) -> String {
+    default_catalog_models()
+        .into_iter()
+        .find(|m| m.provider == provider && m.model_id == model_id)
+        .map(|m| m.label)
+        .unwrap_or_else(|| model_id.to_string())
+}
+
 fn fallback_model(models: &[ModelOption]) -> ModelOption {
-    models.first().cloned().unwrap_or_else(|| ModelOption {
-        provider: "default".to_string(),
-        model_id: "default".to_string(),
-        label: "Default".to_string(),
+    models.first().cloned().unwrap_or_else(|| {
+        default_catalog_models()
+            .into_iter()
+            .next()
+            .expect("default catalog must not be empty")
     })
 }
 
@@ -631,6 +797,10 @@ pub struct PiAppState {
     project_path: Mutex<PathBuf>,
     provider_store_path: PathBuf,
     base_config: Option<PiSessionConfig>,
+    selected_model: Mutex<Option<ModelOption>>,
+    thinking_level: Mutex<ThinkingLevel>,
+    model_pending_sync: AtomicBool,
+    thinking_level_pending_sync: AtomicBool,
 }
 
 impl PiAppState {
@@ -642,6 +812,10 @@ impl PiAppState {
             project_path: Mutex::new(project_path),
             provider_store_path: default_store_path(),
             base_config: None,
+            selected_model: Mutex::new(None),
+            thinking_level: Mutex::new(ThinkingLevel::Medium),
+            model_pending_sync: AtomicBool::new(false),
+            thinking_level_pending_sync: AtomicBool::new(false),
         }
     }
 
@@ -656,6 +830,10 @@ impl PiAppState {
             project_path: Mutex::new(project_path),
             provider_store_path,
             base_config: Some(base_config),
+            selected_model: Mutex::new(None),
+            thinking_level: Mutex::new(ThinkingLevel::Medium),
+            model_pending_sync: AtomicBool::new(false),
+            thinking_level_pending_sync: AtomicBool::new(false),
         }
     }
 
@@ -710,7 +888,54 @@ impl PiAppState {
             .map_err(|e| e.to_string())?;
         let arc = Arc::new(spawned);
         *guard = Some(Arc::clone(&arc));
+        drop(guard);
+        self.replay_pending_preferences(&arc);
         Ok(arc)
+    }
+
+    /// Replays any model or thinking-level selections made while Pi was unavailable
+    /// so a newly started supervisor converges idempotently to `PiAppState`.
+    fn replay_pending_preferences(&self, sup: &PiSessionSupervisor) {
+        if self.model_pending_sync.load(Ordering::Acquire) {
+            let pending_model = self
+                .selected_model
+                .lock()
+                .expect("selected_model lock poisoned")
+                .clone();
+            if let Some(model) = pending_model {
+                if let Ok(resp) = sup.set_model(&model.provider, &model.model_id) {
+                    let confirmed = parse_data_json(&resp)
+                        .map(|v| parse_model_option(&v, &model.provider, &model.model_id))
+                        .unwrap_or(model);
+                    *self
+                        .selected_model
+                        .lock()
+                        .expect("selected_model lock poisoned") = Some(confirmed);
+                    self.model_pending_sync.store(false, Ordering::Release);
+                }
+            } else {
+                self.model_pending_sync.store(false, Ordering::Release);
+            }
+        }
+
+        if self.thinking_level_pending_sync.load(Ordering::Acquire) {
+            let pending_level = *self
+                .thinking_level
+                .lock()
+                .expect("thinking_level lock poisoned");
+            if let Ok(resp) = sup.set_thinking_level(pending_level.as_str()) {
+                let confirmed = parse_data_json(&resp)
+                    .and_then(|v| opt_str(&v, &["level", "thinkingLevel", "thinking_level"]))
+                    .and_then(|raw| ThinkingLevel::parse(&raw))
+                    .unwrap_or(pending_level);
+                *self
+                    .thinking_level
+                    .lock()
+                    .expect("thinking_level lock poisoned") = confirmed;
+                self.thinking_level_pending_sync
+                    .store(false, Ordering::Release);
+            }
+        }
     }
 
     /// Idempotently shuts down any running `PiSessionSupervisor` (safe to call on `RunEvent::Exit` and `Drop`).
@@ -737,23 +962,36 @@ impl PiAppState {
         let store = ProviderStore::load(&self.provider_store_path).unwrap_or_default();
         let providers = store.public_profiles();
         let provider_models = models_from_providers(&providers);
+        let agent_models = load_pi_agent_models();
 
         let Ok(sup) = self.ensure_supervisor_with_sink(event_sink) else {
-            let selected_model = fallback_model(&provider_models);
+            let models = merge_models_with_fallback(Vec::new(), provider_models, agent_models);
+            let stored_model = self
+                .selected_model
+                .lock()
+                .expect("selected_model lock poisoned")
+                .clone();
+            let selected_model = stored_model.unwrap_or_else(|| fallback_model(&models));
+            let thinking_level = *self
+                .thinking_level
+                .lock()
+                .expect("thinking_level lock poisoned");
             return PiBootstrapData {
                 active_project_id: project.id.clone(),
                 projects: vec![project],
                 sessions: Vec::new(),
                 active_session_id: String::new(),
                 messages: Vec::new(),
-                models: provider_models,
+                models,
                 selected_model,
                 thinking_levels: ThinkingLevel::all(),
-                thinking_level: ThinkingLevel::Medium,
+                thinking_level,
                 commands: Vec::new(),
                 providers,
             };
         };
+
+        self.replay_pending_preferences(&sup);
 
         let state_val = sup.get_state().ok().and_then(|r| parse_data_json(&r));
         let messages = sup
@@ -769,11 +1007,7 @@ impl PiAppState {
             .and_then(|r| parse_data_json(&r))
             .map(|v| parse_models_list(&v))
             .unwrap_or_default();
-        let models = if rpc_models.is_empty() {
-            provider_models
-        } else {
-            rpc_models
-        };
+        let models = merge_models_with_fallback(rpc_models, provider_models, agent_models);
 
         let thinking_levels = sup
             .get_available_thinking_levels()
@@ -789,18 +1023,35 @@ impl PiAppState {
             .map(|v| parse_commands_list(&v))
             .unwrap_or_default();
 
-        let default_model = fallback_model(&models);
+        let stored_model = self
+            .selected_model
+            .lock()
+            .expect("selected_model lock poisoned")
+            .clone();
+        let default_model = stored_model.unwrap_or_else(|| fallback_model(&models));
         let selected_model = state_val
             .as_ref()
             .and_then(|v| v.get("model"))
             .map(|m| parse_model_option(m, &default_model.provider, &default_model.model_id))
             .unwrap_or(default_model);
+        *self
+            .selected_model
+            .lock()
+            .expect("selected_model lock poisoned") = Some(selected_model.clone());
 
+        let stored_thinking = *self
+            .thinking_level
+            .lock()
+            .expect("thinking_level lock poisoned");
         let thinking_level = state_val
             .as_ref()
             .and_then(|v| opt_str(v, &["thinkingLevel", "thinking_level"]))
             .and_then(|raw| ThinkingLevel::parse(&raw))
-            .unwrap_or(ThinkingLevel::Medium);
+            .unwrap_or(stored_thinking);
+        *self
+            .thinking_level
+            .lock()
+            .expect("thinking_level lock poisoned") = thinking_level;
 
         let session = state_val
             .as_ref()
@@ -974,17 +1225,34 @@ impl PiAppState {
     ) -> Result<ModelOption, String> {
         let provider = require_non_empty("provider", &provider)?;
         let model_id = require_non_empty("modelId", &model_id)?;
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let updated_model = ModelOption {
+            label: resolve_model_label(&provider, &model_id),
+            provider: provider.clone(),
+            model_id: model_id.clone(),
+        };
+
+        *self
+            .selected_model
+            .lock()
+            .expect("selected_model lock poisoned") = Some(updated_model.clone());
+
+        let Ok(sup) = self.ensure_supervisor_with_sink(event_sink) else {
+            self.model_pending_sync.store(true, Ordering::Release);
+            return Ok(updated_model);
+        };
+
         let resp = sup
             .set_model(&provider, &model_id)
             .map_err(|e| e.to_string())?;
-        Ok(parse_data_json(&resp)
+        let confirmed = parse_data_json(&resp)
             .map(|v| parse_model_option(&v, &provider, &model_id))
-            .unwrap_or_else(|| ModelOption {
-                label: model_id.clone(),
-                provider,
-                model_id,
-            }))
+            .unwrap_or(updated_model);
+        *self
+            .selected_model
+            .lock()
+            .expect("selected_model lock poisoned") = Some(confirmed.clone());
+        self.model_pending_sync.store(false, Ordering::Release);
+        Ok(confirmed)
     }
 
     pub fn set_thinking_level_with_sink(
@@ -992,7 +1260,17 @@ impl PiAppState {
         event_sink: EventSink,
         level: ThinkingLevel,
     ) -> Result<ThinkingLevel, String> {
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        *self
+            .thinking_level
+            .lock()
+            .expect("thinking_level lock poisoned") = level;
+
+        let Ok(sup) = self.ensure_supervisor_with_sink(event_sink) else {
+            self.thinking_level_pending_sync
+                .store(true, Ordering::Release);
+            return Ok(level);
+        };
+
         let resp = sup
             .set_thinking_level(level.as_str())
             .map_err(|e| e.to_string())?;
@@ -1000,6 +1278,12 @@ impl PiAppState {
             .and_then(|v| opt_str(&v, &["level", "thinkingLevel", "thinking_level"]))
             .and_then(|raw| ThinkingLevel::parse(&raw))
             .unwrap_or(level);
+        *self
+            .thinking_level
+            .lock()
+            .expect("thinking_level lock poisoned") = confirmed;
+        self.thinking_level_pending_sync
+            .store(false, Ordering::Release);
         Ok(confirmed)
     }
 
@@ -1792,6 +2076,140 @@ done
         assert_eq!(spawns.lines().count(), 2);
 
         state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn degraded_bootstrap_with_empty_provider_store_returns_selectable_catalog_models() {
+        let dir = unique_temp_dir("degraded-empty-providers");
+        let store_path = dir.join("providers.json");
+        let missing_cfg = PiSessionConfig {
+            program: "/nonexistent/verity-missing-pi-binary".to_string(),
+            args: vec![],
+            cwd: dir.clone(),
+            env: Vec::new(),
+            command_timeout: Duration::from_secs(1),
+        };
+        let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let data = state.bootstrap_with_sink(sink);
+        assert!(!state.has_live_supervisor());
+        assert!(!data.models.is_empty());
+        assert!(data.models.len() >= 4);
+        assert_ne!(data.selected_model.provider, "default");
+        assert_ne!(data.selected_model.model_id, "default");
+        assert!(data
+            .models
+            .iter()
+            .any(|m| m.provider == "anthropic" && m.model_id == "claude-sonnet-4-5"));
+        assert!(data
+            .models
+            .iter()
+            .any(|m| m.provider == "openai" && m.model_id == "gpt-5"));
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn degraded_set_thinking_level_succeeds_and_persists_across_bootstrap() {
+        let dir = unique_temp_dir("degraded-thinking");
+        let store_path = dir.join("providers.json");
+        let missing_cfg = PiSessionConfig {
+            program: "/nonexistent/verity-missing-pi-binary".to_string(),
+            args: vec![],
+            cwd: dir.clone(),
+            env: Vec::new(),
+            command_timeout: Duration::from_secs(1),
+        };
+        let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let updated = state
+            .set_thinking_level_with_sink(Arc::clone(&sink), ThinkingLevel::High)
+            .expect("degraded set_thinking_level should succeed");
+        assert_eq!(updated, ThinkingLevel::High);
+
+        let boot = state.bootstrap_with_sink(sink);
+        assert_eq!(boot.thinking_level, ThinkingLevel::High);
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn degraded_set_model_succeeds_and_persists_across_bootstrap() {
+        let dir = unique_temp_dir("degraded-model");
+        let store_path = dir.join("providers.json");
+        let missing_cfg = PiSessionConfig {
+            program: "/nonexistent/verity-missing-pi-binary".to_string(),
+            args: vec![],
+            cwd: dir.clone(),
+            env: Vec::new(),
+            command_timeout: Duration::from_secs(1),
+        };
+        let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let updated = state
+            .set_model_with_sink(Arc::clone(&sink), "openai".to_string(), "gpt-5".to_string())
+            .expect("degraded set_model should succeed");
+        assert_eq!(updated.provider, "openai");
+        assert_eq!(updated.model_id, "gpt-5");
+
+        let boot = state.bootstrap_with_sink(sink);
+        assert_eq!(boot.selected_model.provider, "openai");
+        assert_eq!(boot.selected_model.model_id, "gpt-5");
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_pi_agent_models_and_merges_deduplicated_sources() {
+        let dir = unique_temp_dir("agent-models");
+        let models_json = dir.join("models.json");
+        fs::write(
+            &models_json,
+            r#"{"providers":{"anthropic":{"models":[{"id":"claude-sonnet-4-5","name":"Claude Sonnet 4.5"},"claude-opus-4-5"]},"openai":{"models":[{"id":"gpt-5","name":"GPT-5"}]}}}"#,
+        )
+        .unwrap();
+
+        let agent_models = load_pi_agent_models_from_path(&models_json);
+        assert_eq!(agent_models.len(), 3);
+
+        let rpc_models = vec![ModelOption {
+            provider: "openai".to_string(),
+            model_id: "gpt-5".to_string(),
+            label: "GPT-5 RPC".to_string(),
+        }];
+        let provider_models = vec![
+            ModelOption {
+                provider: "openai".to_string(),
+                model_id: "gpt-5".to_string(),
+                label: "gpt-5".to_string(),
+            },
+            ModelOption {
+                provider: "local-vllm".to_string(),
+                model_id: "qwen-2.5".to_string(),
+                label: "qwen-2.5".to_string(),
+            },
+        ];
+
+        let merged = merge_models_with_fallback(rpc_models, provider_models, agent_models);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0].label, "GPT-5 RPC");
+        assert!(merged
+            .iter()
+            .any(|m| m.provider == "local-vllm" && m.model_id == "qwen-2.5"));
+        assert!(merged
+            .iter()
+            .any(|m| m.provider == "anthropic" && m.model_id == "claude-opus-4-5"));
+
+        let fallback = merge_models_with_fallback(Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(fallback, default_catalog_models());
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -53,11 +53,36 @@ pub struct PiSessionConfig {
     pub command_timeout: Duration,
 }
 
+/// Resolves the Pi CLI executable name across platforms.
+/// On Windows, npm global shims are `.cmd` files, so the default `"pi"` program
+/// resolves to `pi.cmd` (or `pi.exe` if present on `PATH`).
+pub fn resolve_pi_program(program: &str) -> String {
+    #[cfg(windows)]
+    {
+        if program == "pi" {
+            if let Some(paths) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&paths) {
+                    let exe = dir.join("pi.exe");
+                    if exe.is_file() {
+                        return exe.to_string_lossy().to_string();
+                    }
+                    let cmd = dir.join("pi.cmd");
+                    if cmd.is_file() {
+                        return cmd.to_string_lossy().to_string();
+                    }
+                }
+            }
+            return "pi.cmd".to_string();
+        }
+    }
+    program.to_string()
+}
+
 impl PiSessionConfig {
     /// Standard long-lived Pi RPC configuration (`pi --mode rpc --no-session`).
     pub fn default_pi(cwd: PathBuf) -> Self {
         Self {
-            program: "pi".to_string(),
+            program: resolve_pi_program("pi"),
             args: vec![
                 "--mode".to_string(),
                 "rpc".to_string(),
@@ -564,7 +589,8 @@ impl PiSessionSupervisor {
         event_sink: EventSink,
         reload_hook: ReloadHook,
     ) -> Result<Self, PiSessionError> {
-        let mut child = Command::new(&config.program)
+        let resolved_program = resolve_pi_program(&config.program);
+        let mut child = Command::new(&resolved_program)
             .args(&config.args)
             .current_dir(&config.cwd)
             .envs(config.env.iter().map(|(k, v)| (k, v)))
