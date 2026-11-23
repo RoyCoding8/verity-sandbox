@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/verity-core",
+    "crates/verity-runtime",
+    "crates/verity-cli",
+    "formal",
+]
+exclude = ["desktop/src-tauri"]
+resolver = "2"

@@ -1,0 +1,36 @@
+name: Formal verification (Kani)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  kani:
+    name: Kani proofs (formal/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo and Kani
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+            target
+          key: kani-0.68.0-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/verity-core/Cargo.toml', 'formal/Cargo.toml') }}
+
+      - name: Install Kani 0.68.0
+        run: |
+          if ! command -v cargo-kani >/dev/null 2>&1; then
+            cargo install --locked kani-verifier --version 0.68.0
+            cargo kani setup
+          fi
+
+      - name: Run Kani proofs on verity-formal
+        run: cargo kani -p verity-formal --enable-unstable

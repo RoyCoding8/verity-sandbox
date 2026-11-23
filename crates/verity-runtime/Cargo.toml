@@ -1,0 +1,9 @@
+[package]
+name = "verity-runtime"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "IO shell for Verity: git worktrees, OS sandboxing, Pi JSONL RPC, and verifier adapters"
+
+[dependencies]
+verity-core = { path = "../verity-core" }

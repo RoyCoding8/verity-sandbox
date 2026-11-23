@@ -1,0 +1,8 @@
+[package]
+name = "verity-core"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Zero-IO pure Rust domain types, state machine, scope policy, and verdict gate for Verity"
+
+[dependencies]

@@ -1,0 +1,6 @@
+/target/
+/desktop/src-tauri/target/
+/desktop/ui/node_modules/
+/desktop/ui/dist/
+/.verity/
+*.log
