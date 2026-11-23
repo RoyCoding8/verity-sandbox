@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import "./md3-tokens.css";
 
 type Screen = "orchestrator" | "spec-review" | "merge-queue" | "run-log";
