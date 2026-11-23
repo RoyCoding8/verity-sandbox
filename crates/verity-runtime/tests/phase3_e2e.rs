@@ -1,22 +1,70 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 use verity_core::{
-    transition, CheckerVerdict, CommitOid, RelPath, TaskEvent, TaskMode, TaskState, VerdictStatus,
-    VerifierKind,
+    transition, CheckerVerdict, CommitOid, GateError, RelPath, ScopeError, TaskEvent, TaskId,
+    TaskMode, TaskState, VerdictStatus, VerifierKind,
 };
+use verity_runtime::git::{read_ref, run_git};
 use verity_runtime::handoff::{build_spec_handoff, extract_spec_only, RunLog};
+use verity_runtime::orchestrator::{
+    approve_and_merge, handoff_path_for, load_handoff, spawn_write_task, worktree_path_for,
+    MergeResult, OrchestratorError, WriteTaskRequest,
+};
 use verity_runtime::pi_rpc::{run_pi_prompt, PiRpcConfig, PiRpcError};
 
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "verity_p3_{}_{}",
-        label,
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("verity_p3_{}_{}", label, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+fn init_git_repo(dir: &Path) {
+    assert!(Command::new("git")
+        .current_dir(dir)
+        .args(["init", "-b", "main"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .current_dir(dir)
+        .args(["config", "user.name", "Test"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .current_dir(dir)
+        .args(["config", "user.email", "test@local"])
+        .status()
+        .unwrap()
+        .success());
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/lib.rs"), "pub fn base() -> u32 { 0 }\n").unwrap();
+    fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+    assert!(Command::new("git")
+        .current_dir(dir)
+        .args(["add", "-A"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .current_dir(dir)
+        .args(["commit", "-m", "initial"])
+        .status()
+        .unwrap()
+        .success());
+}
+
+fn mock_pi_config(script: &str) -> PiRpcConfig {
+    PiRpcConfig {
+        program: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        cwd: PathBuf::new(),
+        timeout: Duration::from_secs(10),
+        max_tool_calls: 16,
+    }
 }
 
 #[test]
@@ -154,8 +202,184 @@ fn verify_safe_sub() {
     assert!(matches!(s4, TaskState::Merged { .. }));
 
     let log = RunLog::open(&dir).unwrap();
-    log.append_event("math-1", "merged", &digest.to_hex()).unwrap();
+    log.append_event("math-1", "merged", &digest.to_hex())
+        .unwrap();
     assert_eq!(log.read_lines().unwrap().len(), 1);
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn write_subagent_pipeline_spawn_review_and_cas_merge() {
+    let repo = temp_dir("write_pipeline");
+    init_git_repo(&repo);
+    let base_oid = read_ref(&repo, "refs/heads/main").unwrap().unwrap();
+    let task_id = TaskId::parse("math-safe-add").unwrap();
+
+    // Mock Pi worker writes a Rust implementation + Kani proof, including a
+    // nested block comment mentioning kani::assume(false) to prove no false positive.
+    let worker_script = r#"read line
+mkdir -p src
+cat <<'EOF' > src/math.rs
+/* nested /* kani::assume(false) */ comment must not trigger lint */
+pub fn safe_add(a: u32, b: u32) -> u32 {
+    let internal_secret_impl = a.saturating_add(b);
+    internal_secret_impl
+}
+
+#[kani::proof]
+fn verify_safe_add() {
+    let a: u32 = kani::any();
+    let b: u32 = kani::any();
+    let r = safe_add(a, b);
+    assert!(r >= a && r >= b);
+    kani::cover!(a > 0 && b > 0, "both_positive");
+}
+EOF
+printf '{"type":"tool_call","name":"write"}\n'
+printf '{"type":"message_update","delta":"safe_add saturates and is bounded below by both inputs."}\n'
+printf '{"type":"agent_settled"}\n'"#;
+
+    let spawned = spawn_write_task(WriteTaskRequest {
+        repo_dir: repo.clone(),
+        task_id: task_id.clone(),
+        base_ref: "refs/heads/main".to_string(),
+        write_scope: vec![RelPath::parse("src").unwrap()],
+        forbidden: vec![RelPath::parse("Cargo.toml").unwrap()],
+        verifier: VerifierKind::RustKani,
+        goal: "implement and verify safe_add".to_string(),
+        pi_config: Some(mock_pi_config(worker_script)),
+    })
+    .unwrap();
+
+    // Worktree must be cleaned up after spawn returns.
+    assert!(!worktree_path_for(&repo, &task_id).exists());
+    // Persisted handoff JSON must exist and round-trip identically via load_handoff.
+    assert!(handoff_path_for(&repo, &task_id).exists());
+    let loaded = load_handoff(&repo, &task_id).unwrap();
+    assert_eq!(loaded, spawned);
+
+    // Spec-only extraction includes public signature + Kani proof checks, never impl body.
+    assert!(loaded.handoff.hygiene.is_clean());
+    assert_eq!(loaded.handoff.verdict.status, VerdictStatus::Pass);
+    assert!(loaded.handoff.extracted_spec.contains("pub fn safe_add"));
+    assert!(loaded.handoff.extracted_spec.contains("#[kani::proof]"));
+    assert!(loaded.handoff.extracted_spec.contains("assert!(r >= a && r >= b);"));
+    assert!(loaded.handoff.extracted_spec.contains("kani::cover!(a > 0 && b > 0"));
+    assert!(!loaded.handoff.extracted_spec.contains("internal_secret_impl"));
+
+    // Wrong digest must be rejected before touching target ref.
+    let bad_digest = "0".repeat(64);
+    assert!(matches!(
+        approve_and_merge(&repo, &task_id, "refs/heads/main", &bad_digest),
+        Err(OrchestratorError::DigestMismatch { .. })
+    ));
+    assert_eq!(read_ref(&repo, "refs/heads/main").unwrap().unwrap(), base_oid);
+
+    // Correct digest performs lock-free merge-tree + CAS ref update.
+    let digest_hex = loaded.handoff.spec_digest.to_hex();
+    let merged_commit = match approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap() {
+        MergeResult::Merged {
+            commit,
+            already_merged,
+        } => {
+            assert!(!already_merged);
+            commit
+        }
+        MergeResult::Conflict { .. } => panic!("expected clean CAS merge"),
+    };
+    assert_ne!(merged_commit, base_oid);
+    assert_eq!(
+        read_ref(&repo, "refs/heads/main").unwrap().unwrap(),
+        merged_commit
+    );
+
+    // Verify merged tree actually contains src/math.rs on refs/heads/main.
+    let show = run_git(&repo, &["show", "refs/heads/main:src/math.rs"]).unwrap();
+    assert!(show.status.success());
+    assert!(String::from_utf8_lossy(&show.stdout).contains("pub fn safe_add"));
+
+    // Re-running approve_and_merge is idempotent and does not create a duplicate commit.
+    let second = approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap();
+    assert_eq!(
+        second,
+        MergeResult::Merged {
+            commit: merged_commit,
+            already_merged: true,
+        }
+    );
+
+    // RunLog recorded handoff_ready and merged events.
+    let log_lines = RunLog::open(&repo).unwrap().read_lines().unwrap();
+    assert!(log_lines.iter().any(|l| l.contains("\"handoff_ready\"")));
+    assert!(log_lines.iter().any(|l| l.contains("\"merged\"")));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn write_subagent_enforces_scope_hygiene_and_cleans_up_worktree_on_failure() {
+    let repo = temp_dir("write_guards");
+    init_git_repo(&repo);
+
+    // 1. Scope violation (touching forbidden Cargo.toml) fails and cleans up worktree.
+    let scope_task = TaskId::parse("bad-scope").unwrap();
+    let escape_script = r##"read line
+echo "# hacked" >> Cargo.toml
+printf '{"type":"agent_settled"}\n'"##;
+    let err = spawn_write_task(WriteTaskRequest {
+        repo_dir: repo.clone(),
+        task_id: scope_task.clone(),
+        base_ref: "refs/heads/main".to_string(),
+        write_scope: vec![RelPath::parse("src").unwrap()],
+        forbidden: vec![RelPath::parse("Cargo.toml").unwrap()],
+        verifier: VerifierKind::RustKani,
+        goal: "edit src".to_string(),
+        pi_config: Some(mock_pi_config(escape_script)),
+    })
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        OrchestratorError::ScopeViolation(ScopeError::ForbiddenPath(_))
+    ));
+    assert!(!worktree_path_for(&repo, &scope_task).exists());
+
+    // 2. Block-comment-smuggled kani::assume is caught by hygiene lint and blocks merge.
+    let hygiene_task = TaskId::parse("bad-hygiene").unwrap();
+    let cheat_script = r#"read line
+cat <<'EOF' > src/cheat.rs
+pub fn f(x: u32) -> u32 {
+    /* innocent */ kani::assume(false);
+    x
+}
+EOF
+printf '{"type":"agent_settled"}\n'"#;
+    let persisted = spawn_write_task(WriteTaskRequest {
+        repo_dir: repo.clone(),
+        task_id: hygiene_task.clone(),
+        base_ref: "refs/heads/main".to_string(),
+        write_scope: vec![RelPath::parse("src").unwrap()],
+        forbidden: vec![],
+        verifier: VerifierKind::RustKani,
+        goal: "add f".to_string(),
+        pi_config: Some(mock_pi_config(cheat_script)),
+    })
+    .unwrap();
+    assert!(!worktree_path_for(&repo, &hygiene_task).exists());
+    assert!(!persisted.handoff.hygiene.is_clean());
+    assert_eq!(persisted.handoff.hygiene.violations[0].rule, "unreviewed-kani-assume");
+
+    let merge_err = approve_and_merge(
+        &repo,
+        &hygiene_task,
+        "refs/heads/main",
+        &persisted.handoff.spec_digest.to_hex(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        merge_err,
+        OrchestratorError::GateFailed(GateError::HygieneFailed(1))
+    ));
+
+    let _ = fs::remove_dir_all(&repo);
 }
