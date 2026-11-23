@@ -1,0 +1,16 @@
+{
+  "name": "verity",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Verity v2: Rust formal-verification controller, Pi agent harness, and Tauri v2 Material Design 3 desktop app",
+  "scripts": {
+    "setup": "npm --prefix desktop install && npm --prefix desktop/ui install",
+    "dev": "npm --prefix desktop/ui run dev",
+    "build": "npm --prefix desktop/ui run build",
+    "tauri": "npm --prefix desktop run tauri --",
+    "tauri:dev": "npm --prefix desktop run tauri:dev",
+    "tauri:build": "npm --prefix desktop run tauri:build",
+    "test": "cargo test --workspace && cargo test --manifest-path desktop/src-tauri/Cargo.toml",
+    "formal": "cargo kani -p verity-formal"
+  }
+}
