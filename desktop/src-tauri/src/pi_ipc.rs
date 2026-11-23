@@ -1,0 +1,1797 @@
+use crate::attachments::PendingAttachment;
+use crate::extension_ui::{DialogId, ExtensionUiAnswer};
+use crate::pi_session::{
+    EventSink, PiRpcResponse, PiSessionConfig, PiSessionSupervisor, ReloadHook,
+};
+use crate::providers::{
+    build_pi_provider_env, default_store_path, ProviderStore, PublicProviderProfile,
+};
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Runtime, State};
+use verity_core::json::{parse_json, JsonValue};
+
+/// Tauri event name emitted for every Pi stdout event.
+pub const PI_EVENT_NAME: &str = "pi:event";
+
+// ============================================================
+// IPC Domain Types (matching desktop/ui/src/api/tauri.ts)
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ThinkingLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            _ => None,
+        }
+    }
+
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Off,
+            Self::Minimal,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+            Self::Xhigh,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOption {
+    pub provider: String,
+    pub model_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashOrSkillCommand {
+    pub trigger: String,
+    pub name: String,
+    pub description: String,
+    pub insert_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiProject {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiSessionSummary {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub path: String,
+    pub updated_at: String,
+    pub message_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiToolCallState {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiChatMessage {
+    pub id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<PendingAttachment>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<PiToolCallState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryTreeNode {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub role: String,
+    pub preview: String,
+    pub timestamp: String,
+    pub depth: usize,
+    pub is_active_branch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkCandidate {
+    pub entry_id: String,
+    pub role: String,
+    pub preview: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWithMessages {
+    pub session: PiSessionSummary,
+    pub messages: Vec<PiChatMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportHtmlResult {
+    pub path: String,
+    pub html: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiBootstrapData {
+    pub projects: Vec<PiProject>,
+    pub sessions: Vec<PiSessionSummary>,
+    pub active_project_id: String,
+    pub active_session_id: String,
+    pub messages: Vec<PiChatMessage>,
+    pub models: Vec<ModelOption>,
+    pub selected_model: ModelOption,
+    pub thinking_levels: Vec<ThinkingLevel>,
+    pub thinking_level: ThinkingLevel,
+    pub commands: Vec<SlashOrSkillCommand>,
+    pub providers: Vec<PublicProviderProfile>,
+}
+
+// ============================================================
+// Launch Env & MCP Binary Resolution (Pure Boundary Helpers)
+// ============================================================
+
+/// Resolves the local `verity` CLI binary for `verity mcp` launch wiring.
+pub fn resolve_verity_mcp_bin(project_path: &Path) -> Option<PathBuf> {
+    if let Ok(explicit) = env::var("VERITY_MCP_BIN") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    let bin_name = if cfg!(windows) {
+        "verity.exe"
+    } else {
+        "verity"
+    };
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join(bin_name);
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+
+    for rel in [
+        Path::new("target").join("release").join(bin_name),
+        Path::new("target").join("debug").join(bin_name),
+    ] {
+        let candidate = project_path.join(rel);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join(bin_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Builds the full child-process environment for Pi:
+/// - `VERITY_DESKTOP_PROVIDERS` + `VERITY_DESKTOP_KEY_<ID>` from the `0o600` provider store
+/// - `VERITY_MCP_BIN` + `VERITY_MCP_ARGS=mcp` when a local `verity` binary is available
+pub fn build_pi_launch_env(
+    store: &ProviderStore,
+    verity_mcp_bin: Option<&Path>,
+) -> Vec<(String, String)> {
+    let mut env_pairs = build_pi_provider_env(store);
+    if let Some(bin) = verity_mcp_bin {
+        env_pairs.push((
+            "VERITY_MCP_BIN".to_string(),
+            bin.to_string_lossy().to_string(),
+        ));
+        env_pairs.push(("VERITY_MCP_ARGS".to_string(), "mcp".to_string()));
+    }
+    env_pairs
+}
+
+// ============================================================
+// Pure RPC Response Boundary Parsers
+// ============================================================
+
+fn parse_data_json(resp: &PiRpcResponse) -> Option<JsonValue> {
+    resp.data_json
+        .as_deref()
+        .and_then(|raw| parse_json(raw).ok())
+}
+
+fn opt_str(val: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| val.get(k).and_then(JsonValue::as_str))
+        .map(ToString::to_string)
+}
+
+fn opt_usize(val: &JsonValue, keys: &[&str]) -> Option<usize> {
+    keys.iter().find_map(|k| match val.get(k) {
+        Some(JsonValue::Number(n)) if *n >= 0.0 && n.is_finite() => Some(*n as usize),
+        _ => None,
+    })
+}
+
+fn opt_bool(val: &JsonValue, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|k| val.get(k).and_then(JsonValue::as_bool))
+}
+
+fn normalize_role(raw: Option<String>) -> String {
+    match raw.as_deref() {
+        Some("user") => "user".to_string(),
+        Some("system") => "system".to_string(),
+        _ => "assistant".to_string(),
+    }
+}
+
+fn extract_message_content(val: &JsonValue) -> String {
+    match val.get("content") {
+        Some(JsonValue::String(s)) => s.clone(),
+        Some(JsonValue::Array(blocks)) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                if let Some(text) = block.as_str() {
+                    parts.push(text.to_string());
+                } else if let Some(text) = opt_str(block, &["text", "content"]) {
+                    parts.push(text);
+                }
+            }
+            parts.join("\n")
+        }
+        _ => opt_str(val, &["text", "message"]).unwrap_or_default(),
+    }
+}
+
+fn parse_tool_calls(val: &JsonValue) -> Option<Vec<PiToolCallState>> {
+    let arr = val
+        .get("toolCalls")
+        .or_else(|| val.get("tool_calls"))
+        .and_then(JsonValue::as_array)?;
+    let parsed: Vec<PiToolCallState> = arr
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| PiToolCallState {
+            id: opt_str(item, &["id", "toolCallId", "tool_call_id"])
+                .unwrap_or_else(|| format!("tc-{}", idx + 1)),
+            name: opt_str(item, &["name", "toolName", "tool_name"])
+                .unwrap_or_else(|| "tool".to_string()),
+            status: opt_str(item, &["status"]).unwrap_or_else(|| "done".to_string()),
+            detail: opt_str(item, &["detail", "output", "error"]),
+        })
+        .collect();
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+pub fn parse_chat_messages(val: &JsonValue) -> Vec<PiChatMessage> {
+    let items = match val {
+        JsonValue::Array(arr) => arr,
+        JsonValue::Object(_) => match val.get("messages").and_then(JsonValue::as_array) {
+            Some(arr) => arr,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| PiChatMessage {
+            id: opt_str(item, &["id", "messageId", "message_id"])
+                .unwrap_or_else(|| format!("msg-{}", idx + 1)),
+            role: normalize_role(opt_str(item, &["role"])),
+            content: extract_message_content(item),
+            timestamp: opt_str(item, &["timestamp", "createdAt", "created_at"])
+                .unwrap_or_else(|| "now".to_string()),
+            streaming: opt_bool(item, &["streaming"]),
+            attachments: None,
+            tool_calls: parse_tool_calls(item),
+        })
+        .collect()
+}
+
+pub fn parse_session_summary(
+    val: &JsonValue,
+    fallback_project_id: &str,
+    fallback_id: &str,
+    fallback_name: &str,
+) -> PiSessionSummary {
+    let obj = val.get("session").unwrap_or(val);
+    let id =
+        opt_str(obj, &["id", "sessionId", "session_id"]).unwrap_or_else(|| fallback_id.to_string());
+    let project_id = opt_str(obj, &["projectId", "project_id"])
+        .unwrap_or_else(|| fallback_project_id.to_string());
+    let name = opt_str(obj, &["name", "sessionName", "session_name", "title"])
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| fallback_name.to_string());
+    let path = opt_str(obj, &["path", "sessionPath", "session_path"]).unwrap_or_default();
+    let updated_at = opt_str(obj, &["updatedAt", "updated_at", "timestamp"])
+        .unwrap_or_else(|| "Just now".to_string());
+    let message_count = opt_usize(obj, &["messageCount", "message_count"]).unwrap_or(0);
+    let parent_session_id = opt_str(obj, &["parentSessionId", "parent_session_id"]);
+
+    PiSessionSummary {
+        id,
+        project_id,
+        name,
+        path,
+        updated_at,
+        message_count,
+        parent_session_id,
+    }
+}
+
+pub fn parse_history_tree(val: &JsonValue) -> Vec<HistoryTreeNode> {
+    let items = match val {
+        JsonValue::Array(arr) => arr,
+        JsonValue::Object(_) => match val
+            .get("nodes")
+            .or_else(|| val.get("tree"))
+            .or_else(|| val.get("entries"))
+            .and_then(JsonValue::as_array)
+        {
+            Some(arr) => arr,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| HistoryTreeNode {
+            id: opt_str(item, &["id", "entryId", "entry_id"])
+                .unwrap_or_else(|| format!("node-{}", idx + 1)),
+            parent_id: opt_str(item, &["parentId", "parent_id"]),
+            role: normalize_role(opt_str(item, &["role"])),
+            preview: opt_str(item, &["preview", "text", "content"]).unwrap_or_default(),
+            timestamp: opt_str(item, &["timestamp", "createdAt", "created_at"])
+                .unwrap_or_else(|| "now".to_string()),
+            depth: opt_usize(item, &["depth"]).unwrap_or(0),
+            is_active_branch: opt_bool(item, &["isActiveBranch", "is_active_branch"])
+                .unwrap_or(true),
+        })
+        .collect()
+}
+
+pub fn parse_fork_candidates(val: &JsonValue) -> Vec<ForkCandidate> {
+    let items = match val {
+        JsonValue::Array(arr) => arr,
+        JsonValue::Object(_) => match val
+            .get("messages")
+            .or_else(|| val.get("candidates"))
+            .or_else(|| val.get("entries"))
+            .and_then(JsonValue::as_array)
+        {
+            Some(arr) => arr,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let role = match opt_str(item, &["role"]).as_deref() {
+                Some("assistant") => "assistant".to_string(),
+                _ => "user".to_string(),
+            };
+            ForkCandidate {
+                entry_id: opt_str(item, &["entryId", "entry_id", "id"])
+                    .unwrap_or_else(|| format!("entry-{}", idx + 1)),
+                role,
+                preview: opt_str(item, &["preview", "text", "content"]).unwrap_or_default(),
+                timestamp: opt_str(item, &["timestamp", "createdAt", "created_at"])
+                    .unwrap_or_else(|| "now".to_string()),
+            }
+        })
+        .collect()
+}
+
+pub fn parse_model_option(
+    val: &JsonValue,
+    fallback_provider: &str,
+    fallback_model_id: &str,
+) -> ModelOption {
+    let obj = val.get("model").unwrap_or(val);
+    let provider = opt_str(obj, &["provider"]).unwrap_or_else(|| fallback_provider.to_string());
+    let model_id = opt_str(obj, &["modelId", "model_id", "id"])
+        .unwrap_or_else(|| fallback_model_id.to_string());
+    let label = opt_str(obj, &["label", "name"]).unwrap_or_else(|| model_id.clone());
+    ModelOption {
+        provider,
+        model_id,
+        label,
+    }
+}
+
+pub fn parse_models_list(val: &JsonValue) -> Vec<ModelOption> {
+    let items = match val {
+        JsonValue::Array(arr) => arr,
+        JsonValue::Object(_) => match val.get("models").and_then(JsonValue::as_array) {
+            Some(arr) => arr,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let model_id = opt_str(item, &["modelId", "model_id", "id"])?;
+            let provider = opt_str(item, &["provider"]).unwrap_or_else(|| "default".to_string());
+            let label = opt_str(item, &["label", "name"]).unwrap_or_else(|| model_id.clone());
+            Some(ModelOption {
+                provider,
+                model_id,
+                label,
+            })
+        })
+        .collect()
+}
+
+pub fn parse_thinking_levels(val: &JsonValue) -> Vec<ThinkingLevel> {
+    let items = match val {
+        JsonValue::Array(arr) => arr,
+        JsonValue::Object(_) => match val
+            .get("levels")
+            .or_else(|| val.get("thinkingLevels"))
+            .or_else(|| val.get("thinking_levels"))
+            .and_then(JsonValue::as_array)
+        {
+            Some(arr) => arr,
+            None => return ThinkingLevel::all(),
+        },
+        _ => return ThinkingLevel::all(),
+    };
+
+    let parsed: Vec<ThinkingLevel> = items
+        .iter()
+        .filter_map(|v| v.as_str().and_then(ThinkingLevel::parse))
+        .collect();
+    if parsed.is_empty() {
+        ThinkingLevel::all()
+    } else {
+        parsed
+    }
+}
+
+pub fn parse_commands_list(val: &JsonValue) -> Vec<SlashOrSkillCommand> {
+    let items = match val {
+        JsonValue::Array(arr) => arr,
+        JsonValue::Object(_) => match val.get("commands").and_then(JsonValue::as_array) {
+            Some(arr) => arr,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let name = opt_str(item, &["name"])?;
+            let trigger = match opt_str(item, &["trigger"]).as_deref() {
+                Some("$") => "$".to_string(),
+                _ => "/".to_string(),
+            };
+            let description = opt_str(item, &["description"]).unwrap_or_default();
+            let insert_text = opt_str(item, &["insertText", "insert_text"])
+                .unwrap_or_else(|| format!("{}{} ", trigger, name));
+            Some(SlashOrSkillCommand {
+                trigger,
+                name,
+                description,
+                insert_text,
+            })
+        })
+        .collect()
+}
+
+pub fn parse_export_html(val: &JsonValue, fallback_path: Option<&str>) -> ExportHtmlResult {
+    let path = opt_str(val, &["path", "outputPath", "output_path"])
+        .or_else(|| fallback_path.map(ToString::to_string))
+        .unwrap_or_default();
+    let html = opt_str(val, &["html", "content"]).unwrap_or_else(|| {
+        if !path.is_empty() {
+            fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    });
+    ExportHtmlResult { path, html }
+}
+
+fn project_from_path(path: &Path) -> PiProject {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("workspace")
+        .to_string();
+    let slug: String = name
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    PiProject {
+        id: format!("proj-{}", slug),
+        name,
+        path: path.to_string_lossy().to_string(),
+    }
+}
+
+fn models_from_providers(providers: &[PublicProviderProfile]) -> Vec<ModelOption> {
+    let mut out = Vec::new();
+    for p in providers {
+        for m in &p.models {
+            out.push(ModelOption {
+                provider: p.id.clone(),
+                model_id: m.clone(),
+                label: m.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn fallback_model(models: &[ModelOption]) -> ModelOption {
+    models.first().cloned().unwrap_or_else(|| ModelOption {
+        provider: "default".to_string(),
+        model_id: "default".to_string(),
+        label: "Default".to_string(),
+    })
+}
+
+fn require_non_empty(field: &str, value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{} must not be empty", field));
+    }
+    Ok(trimmed.to_string())
+}
+
+// ============================================================
+// Managed Tauri Application State
+// ============================================================
+
+/// Managed Tauri v2 state owning the long-lived `PiSessionSupervisor` lifecycle.
+pub struct PiAppState {
+    supervisor: Mutex<Option<Arc<PiSessionSupervisor>>>,
+    project_path: Mutex<PathBuf>,
+    provider_store_path: PathBuf,
+    base_config: Option<PiSessionConfig>,
+}
+
+impl PiAppState {
+    /// Creates default desktop state using the current working directory and standard provider store.
+    pub fn new_default() -> Self {
+        let project_path = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self {
+            supervisor: Mutex::new(None),
+            project_path: Mutex::new(project_path),
+            provider_store_path: default_store_path(),
+            base_config: None,
+        }
+    }
+
+    /// Creates state with explicit paths and base `PiSessionConfig` (used for deterministic tests).
+    pub fn with_config(
+        project_path: PathBuf,
+        provider_store_path: PathBuf,
+        base_config: PiSessionConfig,
+    ) -> Self {
+        Self {
+            supervisor: Mutex::new(None),
+            project_path: Mutex::new(project_path),
+            provider_store_path,
+            base_config: Some(base_config),
+        }
+    }
+
+    /// Returns the active project path.
+    pub fn project_path(&self) -> PathBuf {
+        self.project_path
+            .lock()
+            .expect("project_path lock poisoned")
+            .clone()
+    }
+
+    /// Lazily spawns (or reuses an existing live) `PiSessionSupervisor` wired to `app.emit("pi:event", ...)`.
+    pub fn ensure_supervisor<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+    ) -> Result<Arc<PiSessionSupervisor>, String> {
+        let app_handle = app.clone();
+        let sink: EventSink = Arc::new(move |event| {
+            let _ = app_handle.emit(PI_EVENT_NAME, event);
+        });
+        self.ensure_supervisor_with_sink(sink)
+    }
+
+    /// Idempotently returns a live `PiSessionSupervisor`, reconciling any exited/stale instance
+    /// and injecting `0o600` provider env vars + `VERITY_MCP_BIN` into the child process.
+    pub fn ensure_supervisor_with_sink(
+        &self,
+        event_sink: EventSink,
+    ) -> Result<Arc<PiSessionSupervisor>, String> {
+        let mut guard = self.supervisor.lock().expect("supervisor lock poisoned");
+        if let Some(existing) = guard.as_ref() {
+            if existing.is_alive() {
+                return Ok(Arc::clone(existing));
+            }
+            existing.shutdown();
+            *guard = None;
+        }
+
+        let project_path = self.project_path();
+        let store = ProviderStore::load(&self.provider_store_path).unwrap_or_default();
+        let verity_bin = resolve_verity_mcp_bin(&project_path);
+        let launch_env = build_pi_launch_env(&store, verity_bin.as_deref());
+
+        let mut config = match &self.base_config {
+            Some(cfg) => cfg.clone(),
+            None => PiSessionConfig::default_pi(project_path),
+        };
+        config.env.extend(launch_env);
+
+        let reload_hook: ReloadHook = Arc::new(|| {});
+        let spawned = PiSessionSupervisor::spawn(config, event_sink, reload_hook)
+            .map_err(|e| e.to_string())?;
+        let arc = Arc::new(spawned);
+        *guard = Some(Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// Idempotently shuts down any running `PiSessionSupervisor` (safe to call on `RunEvent::Exit` and `Drop`).
+    pub fn shutdown(&self) {
+        let taken = {
+            let mut guard = self.supervisor.lock().expect("supervisor lock poisoned");
+            guard.take()
+        };
+        if let Some(sup) = taken {
+            sup.shutdown();
+        }
+    }
+
+    /// Returns whether a live supervisor is currently active.
+    pub fn has_live_supervisor(&self) -> bool {
+        let guard = self.supervisor.lock().expect("supervisor lock poisoned");
+        guard.as_ref().is_some_and(|s| s.is_alive())
+    }
+
+    // --- Pure/Testable IPC Operation Implementations ---
+
+    pub fn bootstrap_with_sink(&self, event_sink: EventSink) -> PiBootstrapData {
+        let project = project_from_path(&self.project_path());
+        let store = ProviderStore::load(&self.provider_store_path).unwrap_or_default();
+        let providers = store.public_profiles();
+        let provider_models = models_from_providers(&providers);
+
+        let Ok(sup) = self.ensure_supervisor_with_sink(event_sink) else {
+            let selected_model = fallback_model(&provider_models);
+            return PiBootstrapData {
+                active_project_id: project.id.clone(),
+                projects: vec![project],
+                sessions: Vec::new(),
+                active_session_id: String::new(),
+                messages: Vec::new(),
+                models: provider_models,
+                selected_model,
+                thinking_levels: ThinkingLevel::all(),
+                thinking_level: ThinkingLevel::Medium,
+                commands: Vec::new(),
+                providers,
+            };
+        };
+
+        let state_val = sup.get_state().ok().and_then(|r| parse_data_json(&r));
+        let messages = sup
+            .get_messages()
+            .ok()
+            .and_then(|r| parse_data_json(&r))
+            .map(|v| parse_chat_messages(&v))
+            .unwrap_or_default();
+
+        let rpc_models = sup
+            .get_available_models()
+            .ok()
+            .and_then(|r| parse_data_json(&r))
+            .map(|v| parse_models_list(&v))
+            .unwrap_or_default();
+        let models = if rpc_models.is_empty() {
+            provider_models
+        } else {
+            rpc_models
+        };
+
+        let thinking_levels = sup
+            .get_available_thinking_levels()
+            .ok()
+            .and_then(|r| parse_data_json(&r))
+            .map(|v| parse_thinking_levels(&v))
+            .unwrap_or_else(ThinkingLevel::all);
+
+        let commands = sup
+            .get_commands()
+            .ok()
+            .and_then(|r| parse_data_json(&r))
+            .map(|v| parse_commands_list(&v))
+            .unwrap_or_default();
+
+        let default_model = fallback_model(&models);
+        let selected_model = state_val
+            .as_ref()
+            .and_then(|v| v.get("model"))
+            .map(|m| parse_model_option(m, &default_model.provider, &default_model.model_id))
+            .unwrap_or(default_model);
+
+        let thinking_level = state_val
+            .as_ref()
+            .and_then(|v| opt_str(v, &["thinkingLevel", "thinking_level"]))
+            .and_then(|raw| ThinkingLevel::parse(&raw))
+            .unwrap_or(ThinkingLevel::Medium);
+
+        let session = state_val
+            .as_ref()
+            .map(|v| parse_session_summary(v, &project.id, "session-1", "Current session"))
+            .unwrap_or_else(|| PiSessionSummary {
+                id: "session-1".to_string(),
+                project_id: project.id.clone(),
+                name: "Current session".to_string(),
+                path: String::new(),
+                updated_at: "Just now".to_string(),
+                message_count: messages.len(),
+                parent_session_id: None,
+            });
+
+        let active_session_id = session.id.clone();
+        PiBootstrapData {
+            active_project_id: project.id.clone(),
+            projects: vec![project],
+            sessions: vec![session],
+            active_session_id,
+            messages,
+            models,
+            selected_model,
+            thinking_levels,
+            thinking_level,
+            commands,
+            providers,
+        }
+    }
+
+    pub fn switch_session_with_sink(
+        &self,
+        event_sink: EventSink,
+        session_path: String,
+    ) -> Result<Vec<PiChatMessage>, String> {
+        let session_path = require_non_empty("sessionPath", &session_path)?;
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup
+            .switch_session(session_path)
+            .map_err(|e| e.to_string())?;
+        if let Some(val) = parse_data_json(&resp) {
+            let msgs = parse_chat_messages(&val);
+            if !msgs.is_empty() {
+                return Ok(msgs);
+            }
+        }
+        let msgs_resp = sup.get_messages().map_err(|e| e.to_string())?;
+        Ok(parse_data_json(&msgs_resp)
+            .map(|v| parse_chat_messages(&v))
+            .unwrap_or_default())
+    }
+
+    pub fn new_session_with_sink(
+        &self,
+        event_sink: EventSink,
+        project_id: Option<String>,
+        parent_session: Option<String>,
+    ) -> Result<PiSessionSummary, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup
+            .new_session(parent_session.clone())
+            .map_err(|e| e.to_string())?;
+        let fallback_project_id =
+            project_id.unwrap_or_else(|| project_from_path(&self.project_path()).id);
+        let mut summary = parse_data_json(&resp)
+            .map(|v| parse_session_summary(&v, &fallback_project_id, "session-new", "New session"))
+            .unwrap_or_else(|| PiSessionSummary {
+                id: "session-new".to_string(),
+                project_id: fallback_project_id,
+                name: "New session".to_string(),
+                path: String::new(),
+                updated_at: "Just now".to_string(),
+                message_count: 0,
+                parent_session_id: parent_session.clone(),
+            });
+        if summary.parent_session_id.is_none() {
+            summary.parent_session_id = parent_session;
+        }
+        Ok(summary)
+    }
+
+    pub fn set_session_name_with_sink(
+        &self,
+        event_sink: EventSink,
+        session_id: String,
+        name: String,
+    ) -> Result<PiSessionSummary, String> {
+        let session_id = require_non_empty("sessionId", &session_id)?;
+        let name = require_non_empty("name", &name)?;
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.set_session_name(&name).map_err(|e| e.to_string())?;
+        let project_id = project_from_path(&self.project_path()).id;
+        Ok(parse_data_json(&resp)
+            .map(|v| parse_session_summary(&v, &project_id, &session_id, &name))
+            .unwrap_or_else(|| PiSessionSummary {
+                id: session_id,
+                project_id,
+                name,
+                path: String::new(),
+                updated_at: "Just now".to_string(),
+                message_count: 0,
+                parent_session_id: None,
+            }))
+    }
+
+    pub fn get_tree_with_sink(
+        &self,
+        event_sink: EventSink,
+    ) -> Result<Vec<HistoryTreeNode>, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.get_tree().map_err(|e| e.to_string())?;
+        Ok(parse_data_json(&resp)
+            .map(|v| parse_history_tree(&v))
+            .unwrap_or_default())
+    }
+
+    pub fn get_fork_messages_with_sink(
+        &self,
+        event_sink: EventSink,
+    ) -> Result<Vec<ForkCandidate>, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.get_fork_messages().map_err(|e| e.to_string())?;
+        Ok(parse_data_json(&resp)
+            .map(|v| parse_fork_candidates(&v))
+            .unwrap_or_default())
+    }
+
+    pub fn fork_with_sink(
+        &self,
+        event_sink: EventSink,
+        entry_id: String,
+    ) -> Result<SessionWithMessages, String> {
+        let entry_id = require_non_empty("entryId", &entry_id)?;
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.fork(&entry_id).map_err(|e| e.to_string())?;
+        self.parse_session_with_messages(&sup, &resp, "session-fork", "Forked session")
+    }
+
+    pub fn clone_with_sink(
+        &self,
+        event_sink: EventSink,
+        entry_id: Option<String>,
+    ) -> Result<SessionWithMessages, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.clone_session(entry_id).map_err(|e| e.to_string())?;
+        self.parse_session_with_messages(&sup, &resp, "session-clone", "Cloned session")
+    }
+
+    pub fn export_html_with_sink(
+        &self,
+        event_sink: EventSink,
+        output_path: Option<String>,
+    ) -> Result<ExportHtmlResult, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup
+            .export_html(output_path.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(parse_data_json(&resp)
+            .map(|v| parse_export_html(&v, output_path.as_deref()))
+            .unwrap_or_else(|| ExportHtmlResult {
+                path: output_path.unwrap_or_default(),
+                html: String::new(),
+            }))
+    }
+
+    pub fn set_model_with_sink(
+        &self,
+        event_sink: EventSink,
+        provider: String,
+        model_id: String,
+    ) -> Result<ModelOption, String> {
+        let provider = require_non_empty("provider", &provider)?;
+        let model_id = require_non_empty("modelId", &model_id)?;
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup
+            .set_model(&provider, &model_id)
+            .map_err(|e| e.to_string())?;
+        Ok(parse_data_json(&resp)
+            .map(|v| parse_model_option(&v, &provider, &model_id))
+            .unwrap_or_else(|| ModelOption {
+                label: model_id.clone(),
+                provider,
+                model_id,
+            }))
+    }
+
+    pub fn set_thinking_level_with_sink(
+        &self,
+        event_sink: EventSink,
+        level: ThinkingLevel,
+    ) -> Result<ThinkingLevel, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup
+            .set_thinking_level(level.as_str())
+            .map_err(|e| e.to_string())?;
+        let confirmed = parse_data_json(&resp)
+            .and_then(|v| opt_str(&v, &["level", "thinkingLevel", "thinking_level"]))
+            .and_then(|raw| ThinkingLevel::parse(&raw))
+            .unwrap_or(level);
+        Ok(confirmed)
+    }
+
+    pub fn prompt_with_sink(
+        &self,
+        event_sink: EventSink,
+        message: String,
+        images: Vec<PendingAttachment>,
+    ) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.prompt(message, images).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn steer_with_sink(
+        &self,
+        event_sink: EventSink,
+        message: String,
+        images: Vec<PendingAttachment>,
+    ) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.steer(message, images).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn follow_up_with_sink(
+        &self,
+        event_sink: EventSink,
+        message: String,
+        images: Vec<PendingAttachment>,
+    ) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.follow_up(message, images).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear_queue_with_sink(&self, event_sink: EventSink) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.clear_queue().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn abort_with_sink(&self, event_sink: EventSink) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.abort().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn abort_retry_with_sink(&self, event_sink: EventSink) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.abort_retry().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn extension_ui_response_with_sink(
+        &self,
+        event_sink: EventSink,
+        dialog_id: String,
+        answer: ExtensionUiAnswer,
+    ) -> Result<(), String> {
+        let parsed_id = DialogId::parse(dialog_id).map_err(|e| e.to_string())?;
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.extension_ui_response(&parsed_id, answer)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn parse_session_with_messages(
+        &self,
+        sup: &PiSessionSupervisor,
+        resp: &PiRpcResponse,
+        fallback_id: &str,
+        fallback_name: &str,
+    ) -> Result<SessionWithMessages, String> {
+        let project_id = project_from_path(&self.project_path()).id;
+        let data = parse_data_json(resp);
+        let mut session = data
+            .as_ref()
+            .map(|v| parse_session_summary(v, &project_id, fallback_id, fallback_name))
+            .unwrap_or_else(|| PiSessionSummary {
+                id: fallback_id.to_string(),
+                project_id,
+                name: fallback_name.to_string(),
+                path: String::new(),
+                updated_at: "Just now".to_string(),
+                message_count: 0,
+                parent_session_id: None,
+            });
+
+        let mut messages = data.as_ref().map(parse_chat_messages).unwrap_or_default();
+
+        if messages.is_empty() {
+            if let Ok(msgs_resp) = sup.get_messages() {
+                if let Some(val) = parse_data_json(&msgs_resp) {
+                    messages = parse_chat_messages(&val);
+                }
+            }
+        }
+        if session.message_count == 0 {
+            session.message_count = messages.len();
+        }
+        Ok(SessionWithMessages { session, messages })
+    }
+}
+
+impl Drop for PiAppState {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn tauri_event_sink<R: Runtime>(app: &AppHandle<R>) -> EventSink {
+    let app_handle = app.clone();
+    Arc::new(move |event| {
+        let _ = app_handle.emit(PI_EVENT_NAME, event);
+    })
+}
+
+// ============================================================
+// 18 Thin Tauri v2 IPC Commands
+// ============================================================
+
+#[tauri::command]
+pub fn pi_bootstrap(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<PiBootstrapData, String> {
+    Ok(state.bootstrap_with_sink(tauri_event_sink(&app)))
+}
+
+#[tauri::command]
+pub fn pi_switch_session(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    session_path: String,
+) -> Result<Vec<PiChatMessage>, String> {
+    state.switch_session_with_sink(tauri_event_sink(&app), session_path)
+}
+
+#[tauri::command]
+pub fn pi_new_session(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    project_id: Option<String>,
+    parent_session: Option<String>,
+) -> Result<PiSessionSummary, String> {
+    state.new_session_with_sink(tauri_event_sink(&app), project_id, parent_session)
+}
+
+#[tauri::command]
+pub fn pi_set_session_name(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    session_id: String,
+    name: String,
+) -> Result<PiSessionSummary, String> {
+    state.set_session_name_with_sink(tauri_event_sink(&app), session_id, name)
+}
+
+#[tauri::command]
+pub fn pi_get_tree(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<Vec<HistoryTreeNode>, String> {
+    state.get_tree_with_sink(tauri_event_sink(&app))
+}
+
+#[tauri::command]
+pub fn pi_get_fork_messages(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<Vec<ForkCandidate>, String> {
+    state.get_fork_messages_with_sink(tauri_event_sink(&app))
+}
+
+#[tauri::command]
+pub fn pi_fork(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    entry_id: String,
+) -> Result<SessionWithMessages, String> {
+    state.fork_with_sink(tauri_event_sink(&app), entry_id)
+}
+
+#[tauri::command]
+pub fn pi_clone(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    entry_id: Option<String>,
+) -> Result<SessionWithMessages, String> {
+    state.clone_with_sink(tauri_event_sink(&app), entry_id)
+}
+
+#[tauri::command]
+pub fn pi_export_html(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    output_path: Option<String>,
+) -> Result<ExportHtmlResult, String> {
+    state.export_html_with_sink(tauri_event_sink(&app), output_path)
+}
+
+#[tauri::command]
+pub fn pi_set_model(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    provider: String,
+    model_id: String,
+) -> Result<ModelOption, String> {
+    state.set_model_with_sink(tauri_event_sink(&app), provider, model_id)
+}
+
+#[tauri::command]
+pub fn pi_set_thinking_level(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    level: ThinkingLevel,
+) -> Result<ThinkingLevel, String> {
+    state.set_thinking_level_with_sink(tauri_event_sink(&app), level)
+}
+
+#[tauri::command]
+pub fn pi_prompt(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    message: String,
+    images: Vec<PendingAttachment>,
+) -> Result<(), String> {
+    state.prompt_with_sink(tauri_event_sink(&app), message, images)
+}
+
+#[tauri::command]
+pub fn pi_steer(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    message: String,
+    images: Vec<PendingAttachment>,
+) -> Result<(), String> {
+    state.steer_with_sink(tauri_event_sink(&app), message, images)
+}
+
+#[tauri::command]
+pub fn pi_follow_up(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    message: String,
+    images: Vec<PendingAttachment>,
+) -> Result<(), String> {
+    state.follow_up_with_sink(tauri_event_sink(&app), message, images)
+}
+
+#[tauri::command]
+pub fn pi_clear_queue(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
+    state.clear_queue_with_sink(tauri_event_sink(&app))
+}
+
+#[tauri::command]
+pub fn pi_abort(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
+    state.abort_with_sink(tauri_event_sink(&app))
+}
+
+#[tauri::command]
+pub fn pi_abort_retry(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
+    state.abort_retry_with_sink(tauri_event_sink(&app))
+}
+
+#[tauri::command]
+pub fn pi_extension_ui_response(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    dialog_id: String,
+    answer: ExtensionUiAnswer,
+) -> Result<(), String> {
+    state.extension_ui_response_with_sink(tauri_event_sink(&app), dialog_id, answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attachments::{validate_image_bytes, ImageMimeType};
+    use crate::pi_session::PiUiEvent;
+    use crate::providers::ProviderProfileInput;
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "verity-pi-ipc-{}-{}-{}",
+            label,
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mock_sh_config(cwd: PathBuf, script: &str) -> PiSessionConfig {
+        PiSessionConfig {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd,
+            env: Vec::new(),
+            command_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn builds_launch_env_with_provider_secrets_and_verity_mcp_bin() {
+        let mut store = ProviderStore::default();
+        store
+            .upsert(ProviderProfileInput {
+                id: "anthropic-main".to_string(),
+                name: "Anthropic".to_string(),
+                api: "anthropic-messages".to_string(),
+                base_url: "https://api.anthropic.com/v1".to_string(),
+                sign_in_url: None,
+                models: vec!["claude-sonnet-4".to_string()],
+                api_key: Some("sk-secret-token".to_string()),
+            })
+            .unwrap();
+
+        let env_pairs = build_pi_launch_env(&store, Some(Path::new("/usr/local/bin/verity")));
+        assert!(env_pairs
+            .iter()
+            .any(|(k, v)| k == "VERITY_DESKTOP_PROVIDERS" && !v.contains("sk-secret-token")));
+        assert!(env_pairs.contains(&(
+            "VERITY_DESKTOP_KEY_ANTHROPIC_MAIN".to_string(),
+            "sk-secret-token".to_string()
+        )));
+        assert!(env_pairs.contains(&(
+            "VERITY_MCP_BIN".to_string(),
+            "/usr/local/bin/verity".to_string()
+        )));
+        assert!(env_pairs.contains(&("VERITY_MCP_ARGS".to_string(), "mcp".to_string())));
+    }
+
+    #[test]
+    fn parses_all_ipc_response_payloads_to_frontend_shapes() {
+        let msgs_val = parse_json(
+            r#"{"messages":[{"id":"m1","role":"user","content":"hello","timestamp":"10:00"},{"id":"m2","role":"assistant","content":[{"text":"world"}],"timestamp":"10:01","toolCalls":[{"id":"tc1","name":"read","status":"done"}]}]}"#,
+        )
+        .unwrap();
+        let msgs = parse_chat_messages(&msgs_val);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "hello");
+        assert_eq!(msgs[1].content, "world");
+        assert_eq!(msgs[1].tool_calls.as_ref().unwrap()[0].name, "read");
+
+        let tree_val = parse_json(
+            r#"{"nodes":[{"id":"n1","parentId":null,"role":"user","preview":"start","timestamp":"10:00","depth":0,"isActiveBranch":true}]}"#,
+        )
+        .unwrap();
+        let tree = parse_history_tree(&tree_val);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].parent_id, None);
+        assert!(tree[0].is_active_branch);
+
+        let forks_val = parse_json(
+            r#"{"messages":[{"entryId":"e1","role":"user","preview":"fork point","timestamp":"10:00"}]}"#,
+        )
+        .unwrap();
+        let forks = parse_fork_candidates(&forks_val);
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].entry_id, "e1");
+
+        let models_val = parse_json(
+            r#"{"models":[{"provider":"anthropic","modelId":"claude-sonnet-4","label":"Claude Sonnet 4"}]}"#,
+        )
+        .unwrap();
+        let models = parse_models_list(&models_val);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, "claude-sonnet-4");
+
+        let levels_val = parse_json(r#"{"levels":["off","medium","high","xhigh"]}"#).unwrap();
+        assert_eq!(
+            parse_thinking_levels(&levels_val),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::Xhigh
+            ]
+        );
+
+        let cmds_val = parse_json(
+            r#"{"commands":[{"trigger":"/","name":"compact","description":"Compact session"}]}"#,
+        )
+        .unwrap();
+        let cmds = parse_commands_list(&cmds_val);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].insert_text, "/compact ");
+
+        let export_val =
+            parse_json(r#"{"path":"/tmp/export.html","html":"<html>ok</html>"}"#).unwrap();
+        let exported = parse_export_html(&export_val, None);
+        assert_eq!(exported.path, "/tmp/export.html");
+        assert_eq!(exported.html, "<html>ok</html>");
+    }
+
+    #[test]
+    fn degraded_bootstrap_succeeds_cleanly_when_pi_cli_is_missing() {
+        let dir = unique_temp_dir("degraded");
+        let store_path = dir.join("providers.json");
+        let mut store = ProviderStore::default();
+        store
+            .upsert(ProviderProfileInput {
+                id: "local-vllm".to_string(),
+                name: "Local vLLM".to_string(),
+                api: "openai-completions".to_string(),
+                base_url: "http://127.0.0.1:8000/v1".to_string(),
+                sign_in_url: None,
+                models: vec!["qwen-2.5".to_string()],
+                api_key: Some("sk-local".to_string()),
+            })
+            .unwrap();
+        store.save_atomic(&store_path).unwrap();
+
+        let missing_cfg = PiSessionConfig {
+            program: "/nonexistent/verity-missing-pi-binary".to_string(),
+            args: vec![],
+            cwd: dir.clone(),
+            env: Vec::new(),
+            command_timeout: Duration::from_secs(1),
+        };
+        let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
+        let sink: EventSink = Arc::new(|_| {});
+
+        let data = state.bootstrap_with_sink(sink);
+        assert!(!state.has_live_supervisor());
+        assert_eq!(data.projects.len(), 1);
+        assert_eq!(data.providers.len(), 1);
+        assert_eq!(data.providers[0].id, "local-vllm");
+        assert!(data.providers[0].has_api_key);
+        assert_eq!(data.models.len(), 1);
+        assert_eq!(data.selected_model.model_id, "qwen-2.5");
+        assert_eq!(data.thinking_level, ThinkingLevel::Medium);
+        assert_eq!(data.thinking_levels.len(), 6);
+        assert!(data.sessions.is_empty());
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_lifecycle_all_18_operations_env_injection_and_live_events_against_mock_sh() {
+        let dir = unique_temp_dir("lifecycle");
+        let store_path = dir.join("providers.json");
+        let env_dump_path = dir.join("captured_env.txt");
+        let fake_verity_bin = dir.join("target").join("debug").join("verity");
+        fs::create_dir_all(fake_verity_bin.parent().unwrap()).unwrap();
+        fs::write(&fake_verity_bin, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let mut store = ProviderStore::default();
+        store
+            .upsert(ProviderProfileInput {
+                id: "openai-dev".to_string(),
+                name: "OpenAI Dev".to_string(),
+                api: "openai-responses".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                sign_in_url: None,
+                models: vec!["gpt-5".to_string()],
+                api_key: Some("sk-test-env-injection-42".to_string()),
+            })
+            .unwrap();
+        store.save_atomic(&store_path).unwrap();
+
+        let script = format!(
+            r#"
+printf 'KEY=%s\nMCP=%s\nARGS=%s\n' "$VERITY_DESKTOP_KEY_OPENAI_DEV" "$VERITY_MCP_BIN" "$VERITY_MCP_ARGS" > "{env_dump}"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    get_state)
+      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"id":"sess-live","name":"Live Session","path":"/tmp/sess-live.jsonl","thinkingLevel":"high","model":{{"provider":"openai-dev","modelId":"gpt-5","label":"GPT-5"}}}}}}\n' "$id"
+      ;;
+    get_messages)
+      printf '{{"type":"response","id":"%s","command":"get_messages","success":true,"data":{{"messages":[{{"id":"m1","role":"user","content":"hi","timestamp":"10:00"}}]}}}}\n' "$id"
+      ;;
+    get_available_models)
+      printf '{{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{{"models":[{{"provider":"openai-dev","modelId":"gpt-5","label":"GPT-5"}}]}}}}\n' "$id"
+      ;;
+    get_available_thinking_levels)
+      printf '{{"type":"response","id":"%s","command":"get_available_thinking_levels","success":true,"data":{{"levels":["off","low","medium","high"]}}}}\n' "$id"
+      ;;
+    get_commands)
+      printf '{{"type":"response","id":"%s","command":"get_commands","success":true,"data":{{"commands":[{{"trigger":"/","name":"compact","description":"Compact context"}}]}}}}\n' "$id"
+      ;;
+    switch_session)
+      printf '{{"type":"response","id":"%s","command":"switch_session","success":true,"data":{{"messages":[{{"id":"sw1","role":"assistant","content":"switched","timestamp":"10:02"}}]}}}}\n' "$id"
+      ;;
+    new_session)
+      printf '{{"type":"response","id":"%s","command":"new_session","success":true,"data":{{"id":"sess-2","name":"Fresh Session","path":"/tmp/sess-2.jsonl"}}}}\n' "$id"
+      ;;
+    set_session_name)
+      printf '{{"type":"response","id":"%s","command":"set_session_name","success":true,"data":{{"id":"sess-2","name":"Renamed Session","path":"/tmp/sess-2.jsonl"}}}}\n' "$id"
+      ;;
+    get_tree)
+      printf '{{"type":"response","id":"%s","command":"get_tree","success":true,"data":{{"nodes":[{{"id":"n1","parentId":null,"role":"user","preview":"root","timestamp":"10:00","depth":0,"isActiveBranch":true}}]}}}}\n' "$id"
+      ;;
+    get_fork_messages)
+      printf '{{"type":"response","id":"%s","command":"get_fork_messages","success":true,"data":{{"messages":[{{"entryId":"e1","role":"user","preview":"branch here","timestamp":"10:00"}}]}}}}\n' "$id"
+      ;;
+    fork)
+      printf '{{"type":"response","id":"%s","command":"fork","success":true,"data":{{"session":{{"id":"sess-fork","name":"Forked","path":"/tmp/fork.jsonl"}},"messages":[{{"id":"fm1","role":"user","content":"forked msg","timestamp":"10:03"}}]}}}}\n' "$id"
+      ;;
+    clone)
+      printf '{{"type":"response","id":"%s","command":"clone","success":true,"data":{{"session":{{"id":"sess-clone","name":"Cloned","path":"/tmp/clone.jsonl"}},"messages":[{{"id":"cm1","role":"user","content":"cloned msg","timestamp":"10:04"}}]}}}}\n' "$id"
+      ;;
+    export_html)
+      printf '{{"type":"response","id":"%s","command":"export_html","success":true,"data":{{"path":"/tmp/out.html","html":"<html>exported</html>"}}}}\n' "$id"
+      ;;
+    set_model)
+      printf '{{"type":"response","id":"%s","command":"set_model","success":true,"data":{{"provider":"openai-dev","modelId":"gpt-5","label":"GPT-5"}}}}\n' "$id"
+      ;;
+    set_thinking_level)
+      printf '{{"type":"response","id":"%s","command":"set_thinking_level","success":true,"data":{{"level":"xhigh"}}}}\n' "$id"
+      ;;
+    prompt)
+      printf '{{"type":"response","id":"%s","command":"prompt","success":true}}\n' "$id"
+      printf '{{"type":"message_start","messageId":"m2","role":"assistant"}}\n'
+      printf '{{"type":"extension_ui_request","id":"dlg-1","method":"confirm","title":"Approve?"}}\n'
+      ;;
+    steer)
+      printf '{{"type":"response","id":"%s","command":"steer","success":true}}\n' "$id"
+      ;;
+    follow_up)
+      printf '{{"type":"response","id":"%s","command":"follow_up","success":true}}\n' "$id"
+      printf '{{"type":"agent_settled","summary":"done"}}\n'
+      ;;
+    clear_queue|abort|abort_retry)
+      printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
+      ;;
+    extension_ui_response)
+      ;;
+    *)
+      printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#,
+            env_dump = env_dump_path.display()
+        );
+
+        let state = PiAppState::with_config(
+            dir.clone(),
+            store_path,
+            mock_sh_config(dir.clone(), &script),
+        );
+
+        let events: Arc<Mutex<Vec<PiUiEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let (dlg_tx, dlg_rx) = mpsc::channel();
+        let (settled_tx, settled_rx) = mpsc::channel();
+        let events_clone = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| {
+            let is_dlg = matches!(ev, PiUiEvent::ExtensionUiRequest { .. });
+            let is_settled = matches!(ev, PiUiEvent::AgentSettled { .. });
+            events_clone.lock().unwrap().push(ev);
+            if is_dlg {
+                let _ = dlg_tx.send(());
+            }
+            if is_settled {
+                let _ = settled_tx.send(());
+            }
+        });
+
+        // 1. pi_bootstrap (lazily spawns supervisor and injects env)
+        let boot = state.bootstrap_with_sink(Arc::clone(&sink));
+        assert!(state.has_live_supervisor());
+        assert_eq!(boot.active_session_id, "sess-live");
+        assert_eq!(boot.selected_model.model_id, "gpt-5");
+        assert_eq!(boot.thinking_level, ThinkingLevel::High);
+        assert_eq!(boot.messages.len(), 1);
+        assert_eq!(boot.commands.len(), 1);
+
+        // Verify 0o600 provider secret + VERITY_MCP_BIN were injected into child process.
+        let dumped_env = fs::read_to_string(&env_dump_path).expect("env dump written");
+        assert!(dumped_env.contains("KEY=sk-test-env-injection-42"));
+        assert!(dumped_env.contains(&format!("MCP={}", fake_verity_bin.display())));
+        assert!(dumped_env.contains("ARGS=mcp"));
+
+        // 2. pi_switch_session
+        let switched = state
+            .switch_session_with_sink(Arc::clone(&sink), "/tmp/sess-2.jsonl".to_string())
+            .unwrap();
+        assert_eq!(switched[0].content, "switched");
+
+        // 3. pi_new_session
+        let created = state
+            .new_session_with_sink(Arc::clone(&sink), None, Some("sess-live".to_string()))
+            .unwrap();
+        assert_eq!(created.id, "sess-2");
+        assert_eq!(created.parent_session_id.as_deref(), Some("sess-live"));
+
+        // 4. pi_set_session_name
+        let renamed = state
+            .set_session_name_with_sink(
+                Arc::clone(&sink),
+                "sess-2".to_string(),
+                "Renamed Session".to_string(),
+            )
+            .unwrap();
+        assert_eq!(renamed.name, "Renamed Session");
+
+        // 5. pi_get_tree
+        let tree = state.get_tree_with_sink(Arc::clone(&sink)).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, "n1");
+
+        // 6. pi_get_fork_messages
+        let forks = state
+            .get_fork_messages_with_sink(Arc::clone(&sink))
+            .unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].entry_id, "e1");
+
+        // 7. pi_fork
+        let forked = state
+            .fork_with_sink(Arc::clone(&sink), "e1".to_string())
+            .unwrap();
+        assert_eq!(forked.session.id, "sess-fork");
+        assert_eq!(forked.messages[0].content, "forked msg");
+
+        // 8. pi_clone
+        let cloned = state
+            .clone_with_sink(Arc::clone(&sink), Some("e1".to_string()))
+            .unwrap();
+        assert_eq!(cloned.session.id, "sess-clone");
+        assert_eq!(cloned.messages[0].content, "cloned msg");
+
+        // 9. pi_export_html
+        let exported = state
+            .export_html_with_sink(Arc::clone(&sink), Some("/tmp/out.html".to_string()))
+            .unwrap();
+        assert_eq!(exported.html, "<html>exported</html>");
+
+        // 10. pi_set_model
+        let model = state
+            .set_model_with_sink(
+                Arc::clone(&sink),
+                "openai-dev".to_string(),
+                "gpt-5".to_string(),
+            )
+            .unwrap();
+        assert_eq!(model.model_id, "gpt-5");
+
+        // 11. pi_set_thinking_level
+        let level = state
+            .set_thinking_level_with_sink(Arc::clone(&sink), ThinkingLevel::Xhigh)
+            .unwrap();
+        assert_eq!(level, ThinkingLevel::Xhigh);
+
+        // 12. pi_prompt (triggers live message_start + extension_ui_request)
+        let img = validate_image_bytes("shot.png", ImageMimeType::Png, b"pngdata").unwrap();
+        state
+            .prompt_with_sink(Arc::clone(&sink), "run check".to_string(), vec![img])
+            .unwrap();
+        dlg_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("should receive extension_ui_request event");
+
+        // 18. pi_extension_ui_response
+        state
+            .extension_ui_response_with_sink(
+                Arc::clone(&sink),
+                "dlg-1".to_string(),
+                ExtensionUiAnswer::Confirmed(true),
+            )
+            .unwrap();
+
+        // 13. pi_steer
+        state
+            .steer_with_sink(Arc::clone(&sink), "focus".to_string(), vec![])
+            .unwrap();
+
+        // 15. pi_clear_queue
+        state.clear_queue_with_sink(Arc::clone(&sink)).unwrap();
+
+        // 14. pi_follow_up (triggers agent_settled)
+        state
+            .follow_up_with_sink(Arc::clone(&sink), "wrap up".to_string(), vec![])
+            .unwrap();
+        settled_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("should receive agent_settled event");
+
+        // 16. pi_abort & 17. pi_abort_retry
+        state.abort_with_sink(Arc::clone(&sink)).unwrap();
+        state.abort_retry_with_sink(Arc::clone(&sink)).unwrap();
+
+        // Verify live events reached the EventSink.
+        let recorded = events.lock().unwrap();
+        assert!(recorded
+            .iter()
+            .any(|e| matches!(e, PiUiEvent::MessageStart { .. })));
+        assert!(recorded
+            .iter()
+            .any(|e| matches!(e, PiUiEvent::ExtensionUiRequest { id, .. } if id == "dlg-1")));
+        assert!(recorded
+            .iter()
+            .any(|e| matches!(e, PiUiEvent::AgentSettled { .. })));
+        drop(recorded);
+
+        // Idempotent shutdown.
+        state.shutdown();
+        state.shutdown();
+        assert!(!state.has_live_supervisor());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_empty_boundary_inputs_and_reuses_or_respawns_supervisor_idempotently() {
+        let dir = unique_temp_dir("idempotent");
+        let store_path = dir.join("providers.json");
+        let counter_path = dir.join("spawns.log");
+
+        let script = format!(
+            r#"
+printf 'spawn\n' >> "{counter}"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
+done
+"#,
+            counter = counter_path.display()
+        );
+
+        let state = PiAppState::with_config(
+            dir.clone(),
+            store_path,
+            mock_sh_config(dir.clone(), &script),
+        );
+        let sink: EventSink = Arc::new(|_| {});
+
+        // Boundary validation rejects empty inputs without spawning the child process.
+        assert!(state
+            .switch_session_with_sink(Arc::clone(&sink), "   ".to_string())
+            .is_err());
+        assert!(state
+            .set_session_name_with_sink(Arc::clone(&sink), "".to_string(), "ok".to_string())
+            .is_err());
+        assert!(state
+            .set_session_name_with_sink(Arc::clone(&sink), "s1".to_string(), "  ".to_string())
+            .is_err());
+        assert!(state
+            .fork_with_sink(Arc::clone(&sink), "".to_string())
+            .is_err());
+        assert!(state
+            .set_model_with_sink(Arc::clone(&sink), "".to_string(), "m".to_string())
+            .is_err());
+        assert!(state
+            .set_model_with_sink(Arc::clone(&sink), "p".to_string(), "".to_string())
+            .is_err());
+        assert!(state
+            .extension_ui_response_with_sink(
+                Arc::clone(&sink),
+                " ".to_string(),
+                ExtensionUiAnswer::Cancelled,
+            )
+            .is_err());
+        assert!(!state.has_live_supervisor());
+
+        // Calling ensure_supervisor_with_sink twice reuses the exact same live supervisor.
+        let sup1 = state
+            .ensure_supervisor_with_sink(Arc::clone(&sink))
+            .unwrap();
+        sup1.get_state().unwrap();
+        let sup2 = state
+            .ensure_supervisor_with_sink(Arc::clone(&sink))
+            .unwrap();
+        assert!(Arc::ptr_eq(&sup1, &sup2));
+
+        // After shutting down the underlying supervisor, ensure_supervisor_with_sink reconciles and respawns.
+        sup1.shutdown();
+        let sup3 = state
+            .ensure_supervisor_with_sink(Arc::clone(&sink))
+            .unwrap();
+        sup3.get_state().unwrap();
+        assert!(!Arc::ptr_eq(&sup1, &sup3));
+        assert!(sup3.is_alive());
+
+        let spawns = fs::read_to_string(&counter_path).unwrap();
+        assert_eq!(spawns.lines().count(), 2);
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

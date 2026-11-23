@@ -49,6 +49,7 @@ pub struct PiSessionConfig {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    pub env: Vec<(String, String)>,
     pub command_timeout: Duration,
 }
 
@@ -63,6 +64,7 @@ impl PiSessionConfig {
                 "--no-session".to_string(),
             ],
             cwd,
+            env: Vec::new(),
             command_timeout: Duration::from_secs(30),
         }
     }
@@ -554,6 +556,7 @@ impl PiSessionSupervisor {
         let mut child = Command::new(&config.program)
             .args(&config.args)
             .current_dir(&config.cwd)
+            .envs(config.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -668,6 +671,18 @@ impl PiSessionSupervisor {
     /// Returns the current `SessionActivity` snapshot.
     pub fn activity(&self) -> SessionActivity {
         *self.activity.lock().expect("activity lock poisoned")
+    }
+
+    /// Returns true if the supervisor has not been shut down and the child process is still running.
+    pub fn is_alive(&self) -> bool {
+        if self.shutdown_flag.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut child_guard = self.child.lock().expect("child lock poisoned");
+        match child_guard.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        }
     }
 
     /// Returns the number of currently open Extension UI dialogs.
@@ -1060,6 +1075,7 @@ mod tests {
             program: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             cwd: std::env::temp_dir(),
+            env: Vec::new(),
             command_timeout: Duration::from_secs(5),
         }
     }
