@@ -7,3 +7,6 @@ description = "Kani formal verification proof drivers and finite-model checks fo
 
 [dependencies]
 verity-core = { path = "../crates/verity-core" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

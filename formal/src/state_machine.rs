@@ -1,16 +1,21 @@
 #[cfg(kani)]
-use verity_core::RejectionReason;
+use verity_core::{transition_core, TaskEventCore, TaskModeKind, TaskStateCore};
+#[cfg(test)]
 use verity_core::{
-    transition, CheckerVerdict, CommitOid, HygieneReport, HygieneViolation,
-    RelPath, SpecDigest, SpecHandoff, TaskEvent, TaskMode, TaskState, TransitionError,
-    VerdictStatus, VerifierKind,
+    transition, CheckerVerdict, CommitOid, HygieneReport, HygieneViolation, RelPath, SpecHandoff,
+    TaskEvent, TaskMode, TaskState, TransitionError, VerifierKind,
 };
+#[cfg(test)]
+use verity_core::SpecDigest;
+use verity_core::VerdictStatus;
 
+#[cfg(test)]
 fn sample_oid(ch: char) -> CommitOid {
-    let hex: String = std::iter::repeat(ch).take(40).collect();
+    let hex: String = std::iter::repeat_n(ch, 40).collect();
     CommitOid::parse(&hex).expect("valid hex oid")
 }
 
+#[cfg(test)]
 fn sample_write_mode() -> TaskMode {
     TaskMode::write(
         sample_oid('a'),
@@ -21,6 +26,7 @@ fn sample_write_mode() -> TaskMode {
     .expect("non-empty write scope")
 }
 
+#[cfg(test)]
 fn sample_handoff(hygiene_ok: bool, pass_verdict: bool, spec_byte: u8) -> SpecHandoff {
     let hygiene = if hygiene_ok {
         HygieneReport::default()
@@ -69,12 +75,12 @@ pub fn prove_state_machine_safety() {
     kani::assume(max_attempts <= 3);
 
     let mode = if is_read_only {
-        TaskMode::read_only(vec![RelPath::parse("src").unwrap()])
+        TaskModeKind::ReadOnly
     } else {
-        sample_write_mode()
+        TaskModeKind::Write
     };
 
-    let mut state = TaskState::Queued;
+    let mut state: TaskStateCore<u8> = TaskStateCore::Queued;
     let mut approved_seen = false;
     let steps: u8 = kani::any();
     kani::assume(steps <= 4);
@@ -83,74 +89,74 @@ pub fn prove_state_machine_safety() {
         let ev_kind: u8 = kani::any();
         kani::assume(ev_kind <= 5);
         let event = match ev_kind {
-            0 => TaskEvent::StartAttempt,
-            1 => TaskEvent::FinishReadOnly {
-                summary: "ok".to_string(),
-            },
+            0 => TaskEventCore::StartAttempt,
+            1 => TaskEventCore::FinishReadOnly,
             2 => {
+                let scope_ok: bool = kani::any();
                 let hygiene_ok: bool = kani::any();
                 let pass_verdict: bool = kani::any();
-                TaskEvent::SubmitHandoff {
-                    handoff: sample_handoff(hygiene_ok, pass_verdict, 7),
+                TaskEventCore::SubmitHandoff {
+                    scope_ok,
+                    hygiene_violations: if hygiene_ok { 0 } else { 1 },
+                    verdict_status: if pass_verdict {
+                        VerdictStatus::Pass
+                    } else {
+                        VerdictStatus::Counterexample
+                    },
+                    spec_digest: 7u8,
                 }
             }
             3 => {
                 let digest_byte: u8 = kani::any();
                 kani::assume(digest_byte == 7 || digest_byte == 9);
-                TaskEvent::ApproveSpec {
-                    approved_digest: SpecDigest::from_bytes([digest_byte; 32]),
+                TaskEventCore::ApproveSpec {
+                    approved_digest: digest_byte,
                 }
             }
             4 => {
                 let digest_byte: u8 = kani::any();
                 kani::assume(digest_byte == 7 || digest_byte == 9);
-                TaskEvent::CompleteMerge {
-                    merged_commit: sample_oid('c'),
-                    verified_digest: SpecDigest::from_bytes([digest_byte; 32]),
+                TaskEventCore::CompleteMerge {
+                    verified_digest: digest_byte,
                 }
             }
-            _ => TaskEvent::Reject {
-                reason: RejectionReason::ReviewerRejected("no".to_string()),
-            },
+            _ => TaskEventCore::Reject,
         };
 
         let was_terminal = state.is_terminal();
-        match transition(&mode, state.clone(), event, max_attempts) {
-            Ok(next) => {
-                assert!(!was_terminal, "terminal state must never transition");
-                if let TaskState::Running { attempt } = &next {
-                    assert!(*attempt >= 1 && *attempt <= max_attempts);
-                }
-                if matches!(next, TaskState::ApprovedForMerge { .. }) {
-                    approved_seen = true;
-                }
-                if is_read_only {
-                    assert!(
-                        !matches!(
-                            next,
-                            TaskState::AwaitingSpecReview { .. }
-                                | TaskState::ApprovedForMerge { .. }
-                                | TaskState::Merged { .. }
-                        ),
-                        "read-only task entered write review/merge state"
-                    );
-                }
-                if matches!(next, TaskState::Merged { .. }) {
-                    assert!(approved_seen, "merged without prior approval");
-                }
-                state = next;
+        if let Ok(next) = transition_core(mode, state, event, max_attempts) {
+            assert!(!was_terminal, "terminal state must never transition");
+            if let TaskStateCore::Running { attempt } = next {
+                assert!(attempt >= 1 && attempt <= max_attempts);
             }
-            Err(_) => {}
+            if matches!(next, TaskStateCore::ApprovedForMerge { .. }) {
+                approved_seen = true;
+            }
+            if is_read_only {
+                assert!(
+                    !matches!(
+                        next,
+                        TaskStateCore::AwaitingSpecReview { .. }
+                            | TaskStateCore::ApprovedForMerge { .. }
+                            | TaskStateCore::Merged
+                    ),
+                    "read-only task entered write review/merge state"
+                );
+            }
+            if matches!(next, TaskStateCore::Merged) {
+                assert!(approved_seen, "merged without prior approval");
+            }
+            state = next;
         }
     }
 
     // Law 6: Non-vacuity reachability probes.
-    kani::cover!(matches!(state, TaskState::Merged { .. }), "reach_merged");
+    kani::cover!(matches!(state, TaskStateCore::Merged), "reach_merged");
     kani::cover!(
-        matches!(state, TaskState::CompletedReadOnly { .. }),
+        matches!(state, TaskStateCore::CompletedReadOnly),
         "reach_completed_read_only"
     );
-    kani::cover!(matches!(state, TaskState::Rejected { .. }), "reach_rejected");
+    kani::cover!(matches!(state, TaskStateCore::Rejected), "reach_rejected");
 }
 
 #[cfg(test)]
