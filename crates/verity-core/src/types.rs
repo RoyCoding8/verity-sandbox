@@ -113,6 +113,12 @@ fn is_windows_reserved(segment: &str) -> bool {
     )
 }
 
+impl AsRef<str> for RelPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 impl RelPath {
     pub fn parse(raw: &str) -> Result<Self, TypeError> {
         let trimmed = raw.trim_end_matches('/');
@@ -247,7 +253,7 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     ];
 
     let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut padded = Vec::with_capacity(((data.len() + 9 + 63) / 64) * 64);
+    let mut padded = Vec::with_capacity((data.len() + 9).div_ceil(64) * 64);
     padded.extend_from_slice(data);
     padded.push(0x80);
     while (padded.len() % 64) != 56 {
@@ -255,7 +261,7 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([

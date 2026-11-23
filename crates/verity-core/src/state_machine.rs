@@ -1,6 +1,9 @@
 use crate::scope::{check_scope, ScopeError};
 use crate::types::{CommitOid, RelPath, SpecDigest, TaskMode};
-use crate::verdict::{can_approve_gate, CheckerVerdict, GateError, HygieneReport};
+use crate::verdict::{
+    can_approve_gate, can_approve_gate_core, CheckerVerdict, GateError, HygieneReport,
+    VerdictStatus,
+};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,12 +53,27 @@ pub enum TaskState {
 
 impl TaskState {
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            TaskState::Merged { .. }
-                | TaskState::CompletedReadOnly { .. }
-                | TaskState::Rejected { .. }
-        )
+        self.to_core().is_terminal()
+    }
+
+    pub fn to_core(&self) -> TaskStateCore<SpecDigest> {
+        match self {
+            TaskState::Queued => TaskStateCore::Queued,
+            TaskState::Running { attempt } => TaskStateCore::Running { attempt: *attempt },
+            TaskState::AwaitingSpecReview { handoff } => TaskStateCore::AwaitingSpecReview {
+                spec_digest: handoff.spec_digest,
+                hygiene_violations: handoff.hygiene.violations.len(),
+                verdict_status: handoff.verdict.status,
+            },
+            TaskState::ApprovedForMerge {
+                approved_digest, ..
+            } => TaskStateCore::ApprovedForMerge {
+                approved_digest: *approved_digest,
+            },
+            TaskState::Merged { .. } => TaskStateCore::Merged,
+            TaskState::CompletedReadOnly { .. } => TaskStateCore::CompletedReadOnly,
+            TaskState::Rejected { .. } => TaskStateCore::Rejected,
+        }
     }
 }
 
@@ -107,8 +125,178 @@ impl fmt::Display for TransitionError {
 
 impl std::error::Error for TransitionError {}
 
+/// Allocation-free mode tag for core state-machine verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskModeKind {
+    ReadOnly,
+    Write,
+}
+
+impl TaskModeKind {
+    pub fn from_mode(mode: &TaskMode) -> Self {
+        if mode.is_read_only() {
+            Self::ReadOnly
+        } else {
+            Self::Write
+        }
+    }
+}
+
+/// Allocation-free core task state verified directly by Kani.
+/// Generic over the digest token `D` (instantiated with `SpecDigest` at runtime
+/// and compact `Copy + Eq` tokens in bounded model checking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStateCore<D = SpecDigest> {
+    Queued,
+    Running {
+        attempt: u8,
+    },
+    AwaitingSpecReview {
+        spec_digest: D,
+        hygiene_violations: usize,
+        verdict_status: VerdictStatus,
+    },
+    ApprovedForMerge {
+        approved_digest: D,
+    },
+    Merged,
+    CompletedReadOnly,
+    Rejected,
+}
+
+impl<D> TaskStateCore<D> {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStateCore::Merged | TaskStateCore::CompletedReadOnly | TaskStateCore::Rejected
+        )
+    }
+}
+
+/// Allocation-free core task event verified directly by Kani.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskEventCore<D = SpecDigest> {
+    StartAttempt,
+    FinishReadOnly,
+    SubmitHandoff {
+        scope_ok: bool,
+        hygiene_violations: usize,
+        verdict_status: VerdictStatus,
+        spec_digest: D,
+    },
+    ApproveSpec {
+        approved_digest: D,
+    },
+    CompleteMerge {
+        verified_digest: D,
+    },
+    Reject,
+}
+
+/// Allocation-free core transition error verified directly by Kani.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionErrorCore {
+    AlreadyTerminal,
+    InvalidStateForEvent,
+    ModeMismatch,
+    AttemptBudgetExhausted,
+    ScopeViolation,
+    GateFailed(GateError),
+    DigestMismatch,
+}
+
 pub fn can_approve(handoff: &SpecHandoff) -> Result<(), GateError> {
     can_approve_gate(&handoff.hygiene, &handoff.verdict)
+}
+
+/// Allocation-free core state transition function verified directly by Kani.
+pub fn transition_core<D: Copy + Eq>(
+    mode: TaskModeKind,
+    state: TaskStateCore<D>,
+    event: TaskEventCore<D>,
+    max_attempts: u8,
+) -> Result<TaskStateCore<D>, TransitionErrorCore> {
+    if state.is_terminal() {
+        return Err(TransitionErrorCore::AlreadyTerminal);
+    }
+
+    match (state, event) {
+        (TaskStateCore::Queued, TaskEventCore::StartAttempt) => {
+            if max_attempts == 0 {
+                return Err(TransitionErrorCore::AttemptBudgetExhausted);
+            }
+            Ok(TaskStateCore::Running { attempt: 1 })
+        }
+        (TaskStateCore::Running { attempt }, TaskEventCore::StartAttempt) => {
+            if attempt >= max_attempts {
+                return Err(TransitionErrorCore::AttemptBudgetExhausted);
+            }
+            Ok(TaskStateCore::Running {
+                attempt: attempt + 1,
+            })
+        }
+        (TaskStateCore::Running { .. }, TaskEventCore::FinishReadOnly) => {
+            if mode != TaskModeKind::ReadOnly {
+                return Err(TransitionErrorCore::ModeMismatch);
+            }
+            Ok(TaskStateCore::CompletedReadOnly)
+        }
+        (
+            TaskStateCore::Running { .. },
+            TaskEventCore::SubmitHandoff {
+                scope_ok,
+                hygiene_violations,
+                verdict_status,
+                spec_digest,
+            },
+        ) => {
+            if mode != TaskModeKind::Write {
+                return Err(TransitionErrorCore::ModeMismatch);
+            }
+            if !scope_ok {
+                return Err(TransitionErrorCore::ScopeViolation);
+            }
+            can_approve_gate_core(hygiene_violations, verdict_status)
+                .map_err(TransitionErrorCore::GateFailed)?;
+            Ok(TaskStateCore::AwaitingSpecReview {
+                spec_digest,
+                hygiene_violations,
+                verdict_status,
+            })
+        }
+        (
+            TaskStateCore::AwaitingSpecReview {
+                spec_digest,
+                hygiene_violations,
+                verdict_status,
+            },
+            TaskEventCore::ApproveSpec { approved_digest },
+        ) => {
+            if mode != TaskModeKind::Write {
+                return Err(TransitionErrorCore::ModeMismatch);
+            }
+            if spec_digest != approved_digest {
+                return Err(TransitionErrorCore::DigestMismatch);
+            }
+            can_approve_gate_core(hygiene_violations, verdict_status)
+                .map_err(TransitionErrorCore::GateFailed)?;
+            Ok(TaskStateCore::ApprovedForMerge { approved_digest })
+        }
+        (
+            TaskStateCore::ApprovedForMerge { approved_digest },
+            TaskEventCore::CompleteMerge { verified_digest },
+        ) => {
+            if mode != TaskModeKind::Write {
+                return Err(TransitionErrorCore::ModeMismatch);
+            }
+            if approved_digest != verified_digest {
+                return Err(TransitionErrorCore::DigestMismatch);
+            }
+            Ok(TaskStateCore::Merged)
+        }
+        (_, TaskEventCore::Reject) => Ok(TaskStateCore::Rejected),
+        _ => Err(TransitionErrorCore::InvalidStateForEvent),
+    }
 }
 
 pub fn transition(
@@ -117,81 +305,89 @@ pub fn transition(
     event: TaskEvent,
     max_attempts: u8,
 ) -> Result<TaskState, TransitionError> {
-    if state.is_terminal() {
-        return Err(TransitionError::AlreadyTerminal);
-    }
+    let mode_kind = TaskModeKind::from_mode(mode);
+    let state_core = state.to_core();
 
-    match (state, event) {
-        (TaskState::Queued, TaskEvent::StartAttempt) => {
-            if max_attempts == 0 {
-                return Err(TransitionError::AttemptBudgetExhausted);
-            }
-            Ok(TaskState::Running { attempt: 1 })
-        }
-        (TaskState::Running { attempt }, TaskEvent::StartAttempt) => {
-            if attempt >= max_attempts {
-                return Err(TransitionError::AttemptBudgetExhausted);
-            }
-            Ok(TaskState::Running {
-                attempt: attempt + 1,
-            })
-        }
-        (TaskState::Running { .. }, TaskEvent::FinishReadOnly { summary }) => {
-            if !mode.is_read_only() {
-                return Err(TransitionError::ModeMismatch);
-            }
-            Ok(TaskState::CompletedReadOnly { summary })
-        }
-        (TaskState::Running { .. }, TaskEvent::SubmitHandoff { handoff }) => {
-            let (write_scope, forbidden) = match mode {
+    let (event_core, scope_err) = match &event {
+        TaskEvent::StartAttempt => (TaskEventCore::StartAttempt, None),
+        TaskEvent::FinishReadOnly { .. } => (TaskEventCore::FinishReadOnly, None),
+        TaskEvent::SubmitHandoff { handoff } => {
+            let scope_res = match mode {
                 TaskMode::Write {
                     write_scope,
                     forbidden,
                     ..
-                } => (write_scope, forbidden),
-                TaskMode::ReadOnly { .. } => return Err(TransitionError::ModeMismatch),
+                } => check_scope(&handoff.changed_paths, write_scope, forbidden),
+                TaskMode::ReadOnly { .. } => Ok(()),
             };
-            check_scope(&handoff.changed_paths, write_scope, forbidden)
-                .map_err(TransitionError::ScopeViolation)?;
-            can_approve(&handoff).map_err(TransitionError::GateFailed)?;
+            let scope_ok = scope_res.is_ok();
+            (
+                TaskEventCore::SubmitHandoff {
+                    scope_ok,
+                    hygiene_violations: handoff.hygiene.violations.len(),
+                    verdict_status: handoff.verdict.status,
+                    spec_digest: handoff.spec_digest,
+                },
+                scope_res.err(),
+            )
+        }
+        TaskEvent::ApproveSpec { approved_digest } => (
+            TaskEventCore::ApproveSpec {
+                approved_digest: *approved_digest,
+            },
+            None,
+        ),
+        TaskEvent::CompleteMerge {
+            verified_digest, ..
+        } => (
+            TaskEventCore::CompleteMerge {
+                verified_digest: *verified_digest,
+            },
+            None,
+        ),
+        TaskEvent::Reject { .. } => (TaskEventCore::Reject, None),
+    };
+
+    let next_core = transition_core(mode_kind, state_core, event_core, max_attempts).map_err(
+        |err| match err {
+            TransitionErrorCore::AlreadyTerminal => TransitionError::AlreadyTerminal,
+            TransitionErrorCore::InvalidStateForEvent => TransitionError::InvalidStateForEvent,
+            TransitionErrorCore::ModeMismatch => TransitionError::ModeMismatch,
+            TransitionErrorCore::AttemptBudgetExhausted => TransitionError::AttemptBudgetExhausted,
+            TransitionErrorCore::ScopeViolation => {
+                TransitionError::ScopeViolation(scope_err.unwrap_or(ScopeError::EmptyDiff))
+            }
+            TransitionErrorCore::GateFailed(g) => TransitionError::GateFailed(g),
+            TransitionErrorCore::DigestMismatch => TransitionError::DigestMismatch,
+        },
+    )?;
+
+    match (next_core, state, event) {
+        (TaskStateCore::Running { attempt }, _, _) => Ok(TaskState::Running { attempt }),
+        (TaskStateCore::CompletedReadOnly, _, TaskEvent::FinishReadOnly { summary }) => {
+            Ok(TaskState::CompletedReadOnly { summary })
+        }
+        (TaskStateCore::AwaitingSpecReview { .. }, _, TaskEvent::SubmitHandoff { handoff }) => {
             Ok(TaskState::AwaitingSpecReview { handoff })
         }
         (
+            TaskStateCore::ApprovedForMerge { approved_digest },
             TaskState::AwaitingSpecReview { handoff },
-            TaskEvent::ApproveSpec { approved_digest },
-        ) => {
-            if mode.is_read_only() {
-                return Err(TransitionError::ModeMismatch);
-            }
-            if handoff.spec_digest != approved_digest {
-                return Err(TransitionError::DigestMismatch);
-            }
-            can_approve(&handoff).map_err(TransitionError::GateFailed)?;
-            Ok(TaskState::ApprovedForMerge {
-                handoff,
-                approved_digest,
-            })
-        }
+            TaskEvent::ApproveSpec { .. },
+        ) => Ok(TaskState::ApprovedForMerge {
+            handoff,
+            approved_digest,
+        }),
         (
-            TaskState::ApprovedForMerge {
-                approved_digest, ..
-            },
-            TaskEvent::CompleteMerge {
-                merged_commit,
-                verified_digest,
-            },
-        ) => {
-            if mode.is_read_only() {
-                return Err(TransitionError::ModeMismatch);
-            }
-            if approved_digest != verified_digest {
-                return Err(TransitionError::DigestMismatch);
-            }
-            Ok(TaskState::Merged {
-                commit: merged_commit,
-            })
+            TaskStateCore::Merged,
+            _,
+            TaskEvent::CompleteMerge { merged_commit, .. },
+        ) => Ok(TaskState::Merged {
+            commit: merged_commit,
+        }),
+        (TaskStateCore::Rejected, _, TaskEvent::Reject { reason }) => {
+            Ok(TaskState::Rejected { reason })
         }
-        (_, TaskEvent::Reject { reason }) => Ok(TaskState::Rejected { reason }),
-        _ => Err(TransitionError::InvalidStateForEvent),
+        _ => unreachable!("transition_core returned a state inconsistent with its input event"),
     }
 }
