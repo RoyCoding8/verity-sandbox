@@ -61,6 +61,10 @@ function isAllowedMime(mime: string): mime is PendingAttachment["mime_type"] {
   );
 }
 
+function modelOptionKey(model: Pick<ModelOption, "provider" | "modelId">): string {
+  return `${model.provider}::${model.modelId}`;
+}
+
 function isThinkingLevel(value: string): value is ThinkingLevel {
   return (
     value === "off" ||
@@ -160,23 +164,53 @@ export function Composer({
     ? Math.min(selectedCompletionIdx, completion.items.length - 1)
     : 0;
 
+  const effectiveModels = useMemo<readonly ModelOption[]>(() => {
+    const byKey = new Map<string, ModelOption>();
+    for (const model of models) {
+      const key = modelOptionKey(model);
+      if (!byKey.has(key)) {
+        byKey.set(key, model);
+      }
+    }
+    const selectedKey = modelOptionKey(selectedModel);
+    if (!byKey.has(selectedKey)) {
+      byKey.set(selectedKey, selectedModel);
+    }
+    return Array.from(byKey.values());
+  }, [models, selectedModel]);
+
   const modelOptions = useMemo<readonly Md3SelectOption[]>(
     () =>
-      models.map((m) => ({
-        value: `${m.provider}::${m.modelId}`,
+      effectiveModels.map((m) => ({
+        value: modelOptionKey(m),
         label: m.label,
         description: m.provider,
       })),
-    [models]
+    [effectiveModels]
   );
+
+  const effectiveThinkingLevels = useMemo<readonly ThinkingLevel[]>(() => {
+    const seen = new Set<ThinkingLevel>();
+    const list: ThinkingLevel[] = [];
+    for (const lvl of thinkingLevels) {
+      if (!seen.has(lvl)) {
+        seen.add(lvl);
+        list.push(lvl);
+      }
+    }
+    if (!seen.has(thinkingLevel)) {
+      list.push(thinkingLevel);
+    }
+    return list;
+  }, [thinkingLevels, thinkingLevel]);
 
   const thinkingOptions = useMemo<readonly Md3SelectOption[]>(
     () =>
-      thinkingLevels.map((lvl) => ({
+      effectiveThinkingLevels.map((lvl) => ({
         value: lvl,
         label: formatThinkingLevel(lvl),
       })),
-    [thinkingLevels]
+    [effectiveThinkingLevels]
   );
 
   useLayoutEffect(() => {
@@ -289,7 +323,7 @@ export function Composer({
   }
 
   const canSubmit = draft.trim().length > 0 || attachments.length > 0;
-  const selectedModelKey = `${selectedModel.provider}::${selectedModel.modelId}`;
+  const selectedModelKey = modelOptionKey(selectedModel);
 
   return (
     <div
@@ -427,9 +461,19 @@ export function Composer({
                   value={selectedModelKey}
                   options={modelOptions}
                   onChange={(nextValue) => {
-                    const [provider, modelId] = nextValue.split("::");
-                    if (provider && modelId) {
-                      onSelectModel(provider, modelId);
+                    const matched = effectiveModels.find(
+                      (m) => modelOptionKey(m) === nextValue
+                    );
+                    if (matched) {
+                      onSelectModel(matched.provider, matched.modelId);
+                      return;
+                    }
+                    const sepIdx = nextValue.indexOf("::");
+                    if (sepIdx > 0 && sepIdx + 2 < nextValue.length) {
+                      onSelectModel(
+                        nextValue.slice(0, sepIdx),
+                        nextValue.slice(sepIdx + 2)
+                      );
                     }
                   }}
                 />

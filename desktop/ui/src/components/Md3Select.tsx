@@ -134,7 +134,7 @@ export function Md3Select({
     if (!open) {
       return;
     }
-    const handlePointerDown = (event: MouseEvent) => {
+    const handlePointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (
         rootRef.current &&
@@ -151,10 +151,10 @@ export function Md3Select({
       }
     };
 
-    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("pointerdown", handlePointerDown);
     document.addEventListener("keydown", handleDocumentKeyDown);
     return () => {
-      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("pointerdown", handlePointerDown);
       document.removeEventListener("keydown", handleDocumentKeyDown);
     };
   }, [closeMenu, open]);
@@ -173,6 +173,20 @@ export function Md3Select({
       setHighlightedIndex(-1);
     }
   }, [disabled, open]);
+
+  useEffect(() => {
+    optionRefs.current.length = options.length;
+    if (!open) {
+      return;
+    }
+    if (highlightedIndex >= options.length || (highlightedIndex >= 0 && options[highlightedIndex]?.disabled)) {
+      const nextIndex =
+        selectedIndex >= 0 && !options[selectedIndex]?.disabled
+          ? selectedIndex
+          : findEdgeEnabledIndex(options, "first");
+      setHighlightedIndex(nextIndex);
+    }
+  }, [highlightedIndex, open, options, selectedIndex]);
 
   const handleTriggerKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     if (disabled) {
@@ -322,7 +336,14 @@ export function Md3Select({
           aria-label={ariaLabel}
           className={menuClasses}
         >
-          {options.map((option, index) => {
+          {options.length === 0 ? (
+            <div className="md3-select-option is-disabled" role="option" aria-disabled="true">
+              <span className="md3-select-option-text">
+                <span className="md3-select-option-label">No options available</span>
+              </span>
+            </div>
+          ) : (
+            options.map((option, index) => {
             const isSelected = option.value === value;
             const isHighlighted = index === highlightedIndex;
             const optionClasses = [
@@ -373,7 +394,8 @@ export function Md3Select({
                 ) : null}
               </button>
             );
-          })}
+            })
+          )}
         </div>
       ) : null}
     </div>

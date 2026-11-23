@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import {
   tauriApi,
   type DialogKind,
@@ -97,6 +97,92 @@ const FALLBACK_MODEL: ModelOption = {
   label: "Claude Sonnet 4.5",
 };
 
+const DEFAULT_THINKING_LEVELS: readonly ThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+];
+
+function modelKey(model: Pick<ModelOption, "provider" | "modelId">): string {
+  return `${model.provider}::${model.modelId}`;
+}
+
+function providerProfilesToModels(
+  providers: readonly PublicProviderProfile[]
+): ModelOption[] {
+  const result: ModelOption[] = [];
+  for (const provider of providers) {
+    const providerId = provider.id.trim();
+    if (!providerId) continue;
+    for (const rawModelId of provider.models) {
+      const modelId = rawModelId.trim();
+      if (!modelId) continue;
+      result.push({
+        provider: providerId,
+        modelId,
+        label: modelId,
+      });
+    }
+  }
+  return result;
+}
+
+export function normalizeModels(
+  models: readonly ModelOption[],
+  selectedModel: ModelOption,
+  providers: readonly PublicProviderProfile[] = []
+): readonly ModelOption[] {
+  const byKey = new Map<string, ModelOption>();
+
+  for (const model of models) {
+    const key = modelKey(model);
+    const existing = byKey.get(key);
+    if (!existing || (existing.label === existing.modelId && model.label !== model.modelId)) {
+      byKey.set(key, model);
+    }
+  }
+
+  for (const providerModel of providerProfilesToModels(providers)) {
+    const key = modelKey(providerModel);
+    if (!byKey.has(key)) {
+      byKey.set(key, providerModel);
+    }
+  }
+
+  const selectedKey = modelKey(selectedModel);
+  if (!byKey.has(selectedKey)) {
+    byKey.set(selectedKey, selectedModel);
+  }
+
+  return byKey.size > 0 ? Array.from(byKey.values()) : [selectedModel];
+}
+
+export function normalizeThinkingLevels(
+  levels: readonly ThinkingLevel[],
+  selectedLevel: ThinkingLevel
+): readonly ThinkingLevel[] {
+  const source = levels.length > 0 ? levels : DEFAULT_THINKING_LEVELS;
+  const seen = new Set<ThinkingLevel>();
+  const result: ThinkingLevel[] = [];
+  for (const level of source) {
+    if (!seen.has(level)) {
+      seen.add(level);
+      result.push(level);
+    }
+  }
+  if (!seen.has(selectedLevel)) {
+    result.push(selectedLevel);
+  }
+  return result;
+}
+
+function formatErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export function createInitialPiState(): PiWorkspaceState {
   return {
     theme: detectPreferredTheme(),
@@ -113,7 +199,7 @@ export function createInitialPiState(): PiWorkspaceState {
     pendingQueueCount: 0,
     models: [FALLBACK_MODEL],
     selectedModel: FALLBACK_MODEL,
-    thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+    thinkingLevels: DEFAULT_THINKING_LEVELS,
     thinkingLevel: "medium",
     commands: [],
     providers: [],
@@ -194,7 +280,12 @@ export type PiAction =
   | { readonly type: "model_selected"; readonly model: ModelOption }
   | { readonly type: "thinking_selected"; readonly level: ThinkingLevel }
   | { readonly type: "set_modal"; readonly modal: ActiveModal }
-  | { readonly type: "providers_updated"; readonly providers: readonly PublicProviderProfile[] }
+  | {
+      readonly type: "providers_updated";
+      readonly providers: readonly PublicProviderProfile[];
+      readonly refreshedModels?: readonly ModelOption[];
+      readonly deletedProviderId?: string;
+    }
   | { readonly type: "pi_event"; readonly event: PiUiEvent }
   | { readonly type: "shift_extension_dialog"; readonly dialogId: string }
   | { readonly type: "push_snackbar"; readonly snackbar: ExtensionSnackbar }
@@ -395,9 +486,16 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         activeProjectId: action.data.activeProjectId,
         activeSessionId: action.data.activeSessionId,
         messages: action.data.messages,
-        models: action.data.models,
+        models: normalizeModels(
+          action.data.models,
+          action.data.selectedModel,
+          action.data.providers
+        ),
         selectedModel: action.data.selectedModel,
-        thinkingLevels: action.data.thinkingLevels,
+        thinkingLevels: normalizeThinkingLevels(
+          action.data.thinkingLevels,
+          action.data.thinkingLevel
+        ),
         thinkingLevel: action.data.thinkingLevel,
         commands: action.data.commands,
         providers: action.data.providers,
@@ -493,16 +591,35 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
     }
 
     case "model_selected":
-      return { ...state, selectedModel: action.model };
+      return {
+        ...state,
+        selectedModel: action.model,
+        models: normalizeModels(state.models, action.model),
+      };
 
     case "thinking_selected":
-      return { ...state, thinkingLevel: action.level };
+      return {
+        ...state,
+        thinkingLevel: action.level,
+        thinkingLevels: normalizeThinkingLevels(state.thinkingLevels, action.level),
+      };
 
     case "set_modal":
       return { ...state, modal: action.modal };
 
-    case "providers_updated":
-      return { ...state, providers: action.providers };
+    case "providers_updated": {
+      const baseModels = action.refreshedModels ?? state.models;
+      const deletedId = action.deletedProviderId;
+      const filteredBase =
+        deletedId && !action.providers.some((p) => p.id === deletedId)
+          ? baseModels.filter((m) => m.provider !== deletedId)
+          : baseModels;
+      return {
+        ...state,
+        providers: action.providers,
+        models: normalizeModels(filteredBase, state.selectedModel, action.providers),
+      };
+    }
 
     case "pi_event":
       return applyPiEvent(state, action.event);
@@ -547,6 +664,8 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
 
 export function usePiWorkspace() {
   const [state, dispatch] = useReducer(piReducer, undefined, createInitialPiState);
+  const modelRequestIdRef = useRef(0);
+  const thinkingRequestIdRef = useRef(0);
 
   // Sync dynamic MD3 tokens whenever theme changes
   useEffect(() => {
@@ -753,21 +872,64 @@ export function usePiWorkspace() {
     await tauriApi.abortRetry();
   }, []);
 
-  const selectModel = useCallback(async (provider: string, modelId: string) => {
-    const model = await tauriApi.setModel(provider, modelId);
-    dispatch({ type: "model_selected", model });
-  }, []);
+  const selectModel = useCallback(
+    async (provider: string, modelId: string) => {
+      const previousModel = state.selectedModel;
+      const optimisticModel =
+        state.models.find((m) => m.provider === provider && m.modelId === modelId) ?? {
+          provider,
+          modelId,
+          label: modelId,
+        };
+      const reqId = ++modelRequestIdRef.current;
+      dispatch({ type: "model_selected", model: optimisticModel });
+      try {
+        const model = await tauriApi.setModel(provider, modelId);
+        if (reqId === modelRequestIdRef.current) {
+          dispatch({ type: "model_selected", model });
+        }
+      } catch (err: unknown) {
+        if (reqId === modelRequestIdRef.current) {
+          dispatch({ type: "model_selected", model: previousModel });
+          notify(`Failed to switch model: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [notify, state.models, state.selectedModel]
+  );
 
-  const selectThinkingLevel = useCallback(async (level: ThinkingLevel) => {
-    const next = await tauriApi.setThinkingLevel(level);
-    dispatch({ type: "thinking_selected", level: next });
-  }, []);
+  const selectThinkingLevel = useCallback(
+    async (level: ThinkingLevel) => {
+      const previousLevel = state.thinkingLevel;
+      const reqId = ++thinkingRequestIdRef.current;
+      dispatch({ type: "thinking_selected", level });
+      try {
+        const next = await tauriApi.setThinkingLevel(level);
+        if (reqId === thinkingRequestIdRef.current) {
+          dispatch({ type: "thinking_selected", level: next });
+        }
+      } catch (err: unknown) {
+        if (reqId === thinkingRequestIdRef.current) {
+          dispatch({ type: "thinking_selected", level: previousLevel });
+          notify(`Failed to update thinking level: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [notify, state.thinkingLevel]
+  );
 
   const upsertProvider = useCallback(
     async (input: ProviderProfileInput) => {
       await tauriApi.upsertProvider(input);
-      const list = await tauriApi.listProviders();
-      dispatch({ type: "providers_updated", providers: list });
+      const [list, refreshed] = await Promise.all([
+        tauriApi.listProviders(),
+        tauriApi.bootstrapPiWorkspace().catch(() => null),
+      ]);
+      dispatch({
+        type: "providers_updated",
+        providers: list,
+        refreshedModels: refreshed?.models,
+      });
       notify(`Saved provider "${input.name}"`);
     },
     [notify]
@@ -776,8 +938,16 @@ export function usePiWorkspace() {
   const deleteProvider = useCallback(
     async (id: string) => {
       await tauriApi.deleteProvider(id);
-      const list = await tauriApi.listProviders();
-      dispatch({ type: "providers_updated", providers: list });
+      const [list, refreshed] = await Promise.all([
+        tauriApi.listProviders(),
+        tauriApi.bootstrapPiWorkspace().catch(() => null),
+      ]);
+      dispatch({
+        type: "providers_updated",
+        providers: list,
+        refreshedModels: refreshed?.models,
+        deletedProviderId: id,
+      });
       notify(`Deleted provider "${id}"`);
     },
     [notify]
