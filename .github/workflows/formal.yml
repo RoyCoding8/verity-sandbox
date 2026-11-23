@@ -33,4 +33,4 @@ jobs:
           fi
 
       - name: Run Kani proofs on verity-formal
-        run: cargo kani -p verity-formal --enable-unstable
+        run: cargo kani -p verity-formal

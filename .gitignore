@@ -4,3 +4,4 @@
 /desktop/ui/dist/
 /.verity/
 *.log
+.worktrees/
