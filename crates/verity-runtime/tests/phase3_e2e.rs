@@ -9,10 +9,12 @@ use verity_core::{
 use verity_runtime::git::{read_ref, run_git};
 use verity_runtime::handoff::{build_spec_handoff, extract_spec_only, RunLog};
 use verity_runtime::orchestrator::{
-    approve_and_merge, handoff_path_for, load_handoff, spawn_write_task, worktree_path_for,
-    MergeResult, OrchestratorError, WriteTaskRequest,
+    approve_and_merge, handoff_path_for, load_handoff, spawn_write_task,
+    spawn_write_task_with_options, worktree_path_for, MergeResult, OrchestratorError,
+    WriteTaskOptions, WriteTaskRequest,
 };
 use verity_runtime::pi_rpc::{run_pi_prompt, PiRpcConfig, PiRpcError};
+use verity_runtime::verifiers::discover_kani_targets;
 
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("verity_p3_{}_{}", label, std::process::id()));
@@ -396,6 +398,188 @@ printf '{"type":"agent_settled"}\n'"#;
         merge_err,
         OrchestratorError::GateFailed(GateError::HygieneFailed(1))
     ));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn discover_kani_targets_and_live_verifier_fail_closed_in_spawn_write_task() {
+    // 1. Direct check on discover_kani_targets ignoring commented-out proofs/covers.
+    let files = vec![(
+        RelPath::parse("src/check.rs").unwrap(),
+        r#"
+// #[kani::proof]
+// fn ignored_proof() { kani::cover!(true, "ignored_probe"); }
+#[kani::proof]
+fn verify_clamped() {
+    kani::cover!(true, "nonzero_branch");
+}
+"#
+        .to_string(),
+    )];
+    let (harness, probes) = discover_kani_targets(&files);
+    assert_eq!(harness.as_deref(), Some("verify_clamped"));
+    assert_eq!(probes, vec!["nonzero_branch".to_string()]);
+
+    let repo = temp_dir("live_verifier");
+    init_git_repo(&repo);
+
+    // 2. Live Kani verifier when NO #[kani::proof] harness exists fails closed with InvalidReport.
+    let missing_proof_task = TaskId::parse("live-no-proof").unwrap();
+    let no_proof_script = r#"read line
+cat <<'EOF' > src/no_proof.rs
+// #[kani::proof]
+// fn commented_out() {}
+pub fn inc(x: u32) -> u32 { x.saturating_add(1) }
+EOF
+printf '{"type":"agent_settled"}\n'"#;
+    let no_proof_handoff = spawn_write_task_with_options(
+        WriteTaskRequest {
+            repo_dir: repo.clone(),
+            task_id: missing_proof_task.clone(),
+            base_ref: "refs/heads/main".to_string(),
+            write_scope: vec![RelPath::parse("src").unwrap()],
+            forbidden: vec![],
+            verifier: VerifierKind::RustKani,
+            goal: "implement inc".to_string(),
+            pi_config: Some(mock_pi_config(no_proof_script)),
+        },
+        WriteTaskOptions {
+            run_live_verifier: true,
+            lean_challenge_export: None,
+        },
+    )
+    .unwrap();
+    assert!(!worktree_path_for(&repo, &missing_proof_task).exists());
+    assert_eq!(
+        no_proof_handoff.handoff.verdict.status,
+        VerdictStatus::InvalidReport
+    );
+    assert!(no_proof_handoff
+        .handoff
+        .verdict
+        .reason
+        .contains("no #[kani::proof]"));
+    let merge_err = approve_and_merge(
+        &repo,
+        &missing_proof_task,
+        "refs/heads/main",
+        &no_proof_handoff.handoff.spec_digest.to_hex(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        merge_err,
+        OrchestratorError::GateFailed(GateError::VerdictNotPass(VerdictStatus::InvalidReport))
+    ));
+
+    // 3. Live Kani verifier when a #[kani::proof] harness IS discovered runs inside the
+    //    isolated worktree before teardown and returns a structured verdict (never panics).
+    let live_kani_task = TaskId::parse("live-kani-proof").unwrap();
+    let kani_script = r#"read line
+cat <<'EOF' > src/proved.rs
+pub fn safe_add(a: u32, b: u32) -> u32 { a.saturating_add(b) }
+
+#[kani::proof]
+fn verify_safe_add() {
+    let a: u32 = kani::any();
+    let b: u32 = kani::any();
+    assert!(safe_add(a, b) >= a);
+    kani::cover!(a > 0 && b > 0, "both_positive");
+}
+EOF
+printf '{"type":"agent_settled"}\n'"#;
+    let live_handoff = spawn_write_task_with_options(
+        WriteTaskRequest {
+            repo_dir: repo.clone(),
+            task_id: live_kani_task.clone(),
+            base_ref: "refs/heads/main".to_string(),
+            write_scope: vec![RelPath::parse("src").unwrap()],
+            forbidden: vec![],
+            verifier: VerifierKind::RustKani,
+            goal: "implement and prove safe_add".to_string(),
+            pi_config: Some(mock_pi_config(kani_script)),
+        },
+        WriteTaskOptions {
+            run_live_verifier: true,
+            lean_challenge_export: None,
+        },
+    )
+    .unwrap();
+    assert!(!worktree_path_for(&repo, &live_kani_task).exists());
+    assert!(handoff_path_for(&repo, &live_kani_task).exists());
+    assert!(matches!(
+        live_handoff.handoff.verdict.status,
+        VerdictStatus::Pass | VerdictStatus::Inconclusive
+    ));
+    assert!(!live_handoff.handoff.verdict.reason.is_empty());
+
+    // 4. Live Lean 4 verifier returns Inconclusive with actionable reason when export/lake is missing.
+    let lean_task = TaskId::parse("live-lean-proof").unwrap();
+    let lean_script = r#"read line
+cat <<'EOF' > src/Spec.lean
+theorem add_zero (n : Nat) : n + 0 = n := Nat.add_zero n
+EOF
+printf '{"type":"agent_settled"}\n'"#;
+    let lean_handoff = spawn_write_task_with_options(
+        WriteTaskRequest {
+            repo_dir: repo.clone(),
+            task_id: lean_task.clone(),
+            base_ref: "refs/heads/main".to_string(),
+            write_scope: vec![RelPath::parse("src").unwrap()],
+            forbidden: vec![],
+            verifier: VerifierKind::Lean4Comparator,
+            goal: "prove add_zero".to_string(),
+            pi_config: Some(mock_pi_config(lean_script)),
+        },
+        WriteTaskOptions {
+            run_live_verifier: true,
+            lean_challenge_export: None,
+        },
+    )
+    .unwrap();
+    assert!(!worktree_path_for(&repo, &lean_task).exists());
+    assert_eq!(
+        lean_handoff.handoff.verdict.status,
+        VerdictStatus::Inconclusive
+    );
+    assert!(lean_handoff
+        .handoff
+        .verdict
+        .reason
+        .contains("challenge.export"));
+
+    // 5. Pre-emitted .verity-kani-report.json is validated against discovered kani::cover! probes.
+    let report_task = TaskId::parse("report-with-probes").unwrap();
+    let report_script = r#"read line
+cat <<'EOF' > src/checked.rs
+#[kani::proof]
+fn verify_nonzero() {
+    kani::cover!(true, "reached_ok");
+}
+EOF
+cat <<'EOF' > .verity-kani-report.json
+{"harness":"verify_nonzero","should_panic":false,"solver_error":false,"checks":[{"property_class":"assertion","description":"ok","status":"SUCCESS"},{"property_class":"cover","description":"reached_ok","status":"SATISFIED"}]}
+EOF
+printf '{"type":"agent_settled"}\n'"#;
+    let report_handoff = spawn_write_task_with_options(
+        WriteTaskRequest {
+            repo_dir: repo.clone(),
+            task_id: report_task.clone(),
+            base_ref: "refs/heads/main".to_string(),
+            write_scope: vec![RelPath::parse("src").unwrap()],
+            forbidden: vec![],
+            verifier: VerifierKind::RustKani,
+            goal: "verify nonzero".to_string(),
+            pi_config: Some(mock_pi_config(report_script)),
+        },
+        WriteTaskOptions {
+            run_live_verifier: true,
+            lean_challenge_export: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(report_handoff.handoff.verdict.status, VerdictStatus::Pass);
+    assert_eq!(report_handoff.handoff.verdict.probes_satisfied, 1);
 
     let _ = fs::remove_dir_all(&repo);
 }
