@@ -29,6 +29,8 @@ fn main() {
             pi_ipc::pi_switch_session,
             pi_ipc::pi_new_session,
             pi_ipc::pi_set_session_name,
+            pi_ipc::pi_archive_session,
+            pi_ipc::pi_delete_session,
             pi_ipc::pi_get_tree,
             pi_ipc::pi_get_fork_messages,
             pi_ipc::pi_fork,

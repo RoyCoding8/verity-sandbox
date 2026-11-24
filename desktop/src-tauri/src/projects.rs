@@ -11,6 +11,7 @@ use verity_core::json::{parse_json, JsonValue};
 
 static PROJECTS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PROJECTS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static SESSION_META_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +32,15 @@ pub struct PiSessionSummary {
     pub message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMetaStore {
+    #[serde(default)]
+    pub archived_session_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -67,6 +77,162 @@ pub fn default_verity_home() -> PathBuf {
 /// Default path for the persistent project registry (`~/.verity/projects.json` or `$VERITY_HOME/projects.json`).
 pub fn default_projects_store_path() -> PathBuf {
     default_verity_home().join("projects.json")
+}
+
+/// Default path for persistent session archive metadata (`~/.verity/session-meta.json` or `$VERITY_HOME/session-meta.json`).
+pub fn default_session_meta_path() -> PathBuf {
+    default_verity_home().join("session-meta.json")
+}
+
+/// Loads archived session IDs from an explicit `session-meta.json` path.
+pub fn load_archived_session_ids_from(meta_path: &Path) -> HashSet<String> {
+    if !meta_path.exists() {
+        return HashSet::new();
+    }
+    let Ok(raw) = fs::read_to_string(meta_path) else {
+        return HashSet::new();
+    };
+    if raw.trim().is_empty() {
+        return HashSet::new();
+    }
+    serde_json::from_str::<SessionMetaStore>(&raw)
+        .map(|store| {
+            store
+                .archived_session_ids
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Loads archived session IDs from `~/.verity/session-meta.json` (respecting `VERITY_HOME`).
+pub fn load_archived_session_ids() -> HashSet<String> {
+    load_archived_session_ids_from(&default_session_meta_path())
+}
+
+/// Atomically updates the archived flag for `session_id` at an explicit `session-meta.json` path.
+pub fn set_session_archived_at(
+    meta_path: &Path,
+    session_id: &str,
+    archived: bool,
+) -> Result<HashSet<String>, String> {
+    let sid = session_id.trim();
+    if sid.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    let _guard = SESSION_META_WRITE_LOCK
+        .lock()
+        .expect("session meta write lock poisoned");
+
+    let mut set = load_archived_session_ids_from(meta_path);
+    if archived {
+        set.insert(sid.to_string());
+    } else {
+        set.remove(sid);
+    }
+
+    let mut sorted: Vec<String> = set.iter().cloned().collect();
+    sorted.sort();
+    let store = SessionMetaStore {
+        archived_session_ids: sorted,
+    };
+
+    if let Some(parent) = meta_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create session meta dir: {}", e))?;
+    }
+    let json = serde_json::to_string_pretty(&store)
+        .map_err(|e| format!("failed to serialize session meta: {}", e))?;
+    let n = PROJECTS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        ".{}.tmp.{}.{}",
+        meta_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session-meta.json"),
+        std::process::id(),
+        n
+    );
+    let tmp_path = meta_path.with_file_name(tmp_name);
+    fs::write(&tmp_path, json.as_bytes())
+        .map_err(|e| format!("failed to write temporary session meta: {}", e))?;
+    fs::rename(&tmp_path, meta_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("failed to commit session meta: {}", e)
+    })?;
+    Ok(set)
+}
+
+/// Persists the archived flag for `session_id` in `~/.verity/session-meta.json` (respecting `VERITY_HOME`).
+pub fn set_session_archived(session_id: &str, archived: bool) -> Result<(), String> {
+    set_session_archived_at(&default_session_meta_path(), session_id, archived).map(|_| ())
+}
+
+fn is_in_project_local_pi_sessions(canon_file: &Path) -> bool {
+    let Some(parent) = canon_file.parent() else {
+        return false;
+    };
+    let Some(grandparent) = parent.parent() else {
+        return false;
+    };
+    parent.file_name().and_then(|n| n.to_str()) == Some("sessions")
+        && grandparent.file_name().and_then(|n| n.to_str()) == Some(".pi")
+}
+
+/// Safely deletes a Pi `.jsonl` session file after verifying it resides inside Pi's sessions
+/// directory or a project-local `.pi/sessions/` directory. Returns `Ok(true)` if deleted,
+/// `Ok(false)` if the file did not exist or `session_path` was empty.
+pub fn delete_session_file_with_root(
+    session_path: &str,
+    pi_sessions_root: Option<&Path>,
+) -> Result<bool, String> {
+    let trimmed = session_path.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    let path = Path::new(trimmed);
+    let is_jsonl = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
+    if !is_jsonl {
+        return Err(format!(
+            "refusing to delete non-jsonl session file: {}",
+            trimmed
+        ));
+    }
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !path.is_file() {
+        return Err(format!("session path is not a regular file: {}", trimmed));
+    }
+    let canon_file = fs::canonicalize(path)
+        .map_err(|e| format!("failed to canonicalize session file path: {}", e))?;
+
+    let in_global_root = pi_sessions_root
+        .and_then(|root| fs::canonicalize(root).ok())
+        .is_some_and(|canon_root| canon_file.starts_with(&canon_root));
+    let in_project_local = is_in_project_local_pi_sessions(&canon_file);
+
+    if !in_global_root && !in_project_local {
+        return Err(format!(
+            "refusing to delete file outside Pi sessions directory: {}",
+            canon_file.display()
+        ));
+    }
+
+    fs::remove_file(&canon_file)
+        .map_err(|e| format!("failed to delete session file: {}", e))?;
+    Ok(true)
+}
+
+/// Safely deletes a Pi `.jsonl` session file using the default Pi sessions root.
+pub fn delete_session_file(session_path: &str) -> Result<bool, String> {
+    let global_root = default_pi_sessions_root();
+    delete_session_file_with_root(session_path, global_root.as_deref())
 }
 
 /// Canonicalizes a path if possible, falling back to the original path if it cannot be canonicalized.
@@ -345,10 +511,31 @@ pub fn default_pi_sessions_root() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".pi").join("agent").join("sessions"))
 }
 
-/// Scans Pi `.jsonl` session files on disk for a specific project `cwd`.
+/// Scans Pi `.jsonl` session files on disk for a specific project `cwd`, tagging archived state.
 pub fn scan_project_sessions(project_id: &str, project_cwd: &Path) -> Vec<PiSessionSummary> {
     let global_root = default_pi_sessions_root();
-    scan_project_sessions_with_root(project_id, project_cwd, global_root.as_deref())
+    let archived_ids = load_archived_session_ids();
+    scan_project_sessions_with_root_and_archived(
+        project_id,
+        project_cwd,
+        global_root.as_deref(),
+        &archived_ids,
+    )
+}
+
+/// Scans Pi `.jsonl` session files on disk for a specific project `cwd` with an explicit archived set.
+pub fn scan_project_sessions_with_archived(
+    project_id: &str,
+    project_cwd: &Path,
+    archived_ids: &HashSet<String>,
+) -> Vec<PiSessionSummary> {
+    let global_root = default_pi_sessions_root();
+    scan_project_sessions_with_root_and_archived(
+        project_id,
+        project_cwd,
+        global_root.as_deref(),
+        archived_ids,
+    )
 }
 
 /// Scans Pi `.jsonl` session files from `<project>/.pi/sessions/` and `<pi_sessions_root>/<encoded-cwd>/`
@@ -357,6 +544,22 @@ pub fn scan_project_sessions_with_root(
     project_id: &str,
     project_cwd: &Path,
     pi_sessions_root: Option<&Path>,
+) -> Vec<PiSessionSummary> {
+    let archived_ids = load_archived_session_ids();
+    scan_project_sessions_with_root_and_archived(
+        project_id,
+        project_cwd,
+        pi_sessions_root,
+        &archived_ids,
+    )
+}
+
+/// Scans Pi `.jsonl` session files with explicit global sessions root and archived session IDs.
+pub fn scan_project_sessions_with_root_and_archived(
+    project_id: &str,
+    project_cwd: &Path,
+    pi_sessions_root: Option<&Path>,
+    archived_ids: &HashSet<String>,
 ) -> Vec<PiSessionSummary> {
     let canonical_cwd = normalize_project_path(project_cwd);
     let mut candidate_dirs: Vec<(PathBuf, bool)> = Vec::new();
@@ -403,12 +606,13 @@ pub fn scan_project_sessions_with_root(
             if !seen_files.insert(norm_file) {
                 continue;
             }
-            if let Some(summary) = parse_jsonl_session_file(
+            if let Some(mut summary) = parse_jsonl_session_file(
                 &file_path,
                 project_id,
                 &canonical_cwd,
                 require_cwd_match,
             ) {
+                summary.archived = archived_ids.contains(&summary.id);
                 sessions.push(summary);
             }
         }
@@ -521,6 +725,7 @@ pub fn parse_jsonl_session_file(
         updated_at,
         message_count,
         parent_session_id,
+        archived: false,
     })
 }
 
@@ -723,12 +928,129 @@ mod tests {
             updated_at: "Just now".to_string(),
             message_count: 3,
             parent_session_id: None,
+            archived: false,
         };
         let merged = merge_live_and_disk_sessions(scanned, Some(live));
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, "sess-1");
         assert_eq!(merged[0].name, "Auth Refactor (Live)");
         assert_eq!(merged[1].id, "sess-2");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persists_archived_session_ids_and_tags_scanned_sessions() {
+        let root = unique_temp_dir("archive-meta");
+        let meta_path = root.join("session-meta.json");
+        let proj = root.join("repo");
+        let local_sessions = proj.join(".pi").join("sessions");
+        fs::create_dir_all(&local_sessions).unwrap();
+
+        let canon_proj = fs::canonicalize(&proj).unwrap();
+        let s1 = local_sessions.join("s1.jsonl");
+        let s2 = local_sessions.join("s2.jsonl");
+        fs::write(
+            &s1,
+            format!(
+                r#"{{"type":"session","id":"sess-a","name":"Alpha","timestamp":"2026-11-20T10:00:00Z","cwd":"{}"}}"#,
+                canon_proj.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &s2,
+            format!(
+                r#"{{"type":"session","id":"sess-b","name":"Beta","timestamp":"2026-11-21T10:00:00Z","cwd":"{}"}}"#,
+                canon_proj.display()
+            ),
+        )
+        .unwrap();
+
+        assert!(load_archived_session_ids_from(&meta_path).is_empty());
+
+        let archived = set_session_archived_at(&meta_path, "sess-a", true).unwrap();
+        assert!(archived.contains("sess-a"));
+        assert!(meta_path.is_file());
+
+        // Reload from disk and verify scanned sessions get tagged properly.
+        let reloaded = load_archived_session_ids_from(&meta_path);
+        assert!(reloaded.contains("sess-a"));
+        assert!(!reloaded.contains("sess-b"));
+
+        let scanned =
+            scan_project_sessions_with_root_and_archived("proj-x", &canon_proj, None, &reloaded);
+        assert_eq!(scanned.len(), 2);
+        let a = scanned.iter().find(|s| s.id == "sess-a").unwrap();
+        let b = scanned.iter().find(|s| s.id == "sess-b").unwrap();
+        assert_eq!(a.project_id, "proj-x");
+        assert!(a.archived);
+        assert_eq!(b.project_id, "proj-x");
+        assert!(!b.archived);
+
+        // Unarchive persists cleanly.
+        let unarchived = set_session_archived_at(&meta_path, "sess-a", false).unwrap();
+        assert!(!unarchived.contains("sess-a"));
+        assert!(load_archived_session_ids_from(&meta_path).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safely_deletes_only_jsonl_files_inside_pi_sessions_directories() {
+        let root = unique_temp_dir("safe-delete");
+        let pi_root = root.join("pi-sessions");
+        let proj = root.join("my-app");
+        let global_dir = pi_root.join("--my-app--");
+        let local_dir = proj.join(".pi").join("sessions");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::create_dir_all(&local_dir).unwrap();
+
+        let global_sess = global_dir.join("g1.jsonl");
+        let local_sess = local_dir.join("l1.jsonl");
+        let outside_jsonl = proj.join("important.jsonl");
+        let non_jsonl = local_dir.join("notes.txt");
+        fs::write(&global_sess, "{}
+").unwrap();
+        fs::write(&local_sess, "{}
+").unwrap();
+        fs::write(&outside_jsonl, "{}
+").unwrap();
+        fs::write(&non_jsonl, "keep
+").unwrap();
+
+        // Rejects non-jsonl files even inside .pi/sessions/
+        assert!(delete_session_file_with_root(
+            &non_jsonl.to_string_lossy(),
+            Some(&pi_root)
+        )
+        .is_err());
+        assert!(non_jsonl.exists());
+
+        // Rejects .jsonl files outside Pi sessions directories
+        assert!(delete_session_file_with_root(
+            &outside_jsonl.to_string_lossy(),
+            Some(&pi_root)
+        )
+        .is_err());
+        assert!(outside_jsonl.exists());
+
+        // Allows deleting .jsonl inside global Pi sessions root
+        assert!(
+            delete_session_file_with_root(&global_sess.to_string_lossy(), Some(&pi_root)).unwrap()
+        );
+        assert!(!global_sess.exists());
+
+        // Allows deleting .jsonl inside project-local .pi/sessions/
+        assert!(
+            delete_session_file_with_root(&local_sess.to_string_lossy(), Some(&pi_root)).unwrap()
+        );
+        assert!(!local_sess.exists());
+
+        // Deleting an already-deleted file is idempotent Ok(false)
+        assert!(
+            !delete_session_file_with_root(&local_sess.to_string_lossy(), Some(&pi_root)).unwrap()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

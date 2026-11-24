@@ -620,7 +620,7 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
             role: opt_str_or_nested(val, "message", &["role"]),
             raw_json,
         }),
-        "message_update" => {
+        "message_update" | "content_block_delta" => {
             let (delta, thinking_delta) = parse_message_update_deltas(val);
             Some(PiUiEvent::MessageUpdate {
                 message_id: opt_str_or_nested(val, "message", &["messageId", "message_id", "id"]),
@@ -791,22 +791,129 @@ fn opt_str_or_nested(val: &JsonValue, nested_key: &str, keys: &[&str]) -> Option
     opt_str(val, keys).or_else(|| val.get(nested_key).and_then(|obj| opt_str(obj, keys)))
 }
 
+fn opt_non_empty_str(val: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| {
+            val.get(k)
+                .and_then(JsonValue::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .map(ToString::to_string)
+}
+
+fn serde_value_to_json_value(v: serde_json::Value) -> JsonValue {
+    match v {
+        serde_json::Value::Null => JsonValue::Null,
+        serde_json::Value::Bool(b) => JsonValue::Bool(b),
+        serde_json::Value::Number(n) => JsonValue::Number(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => JsonValue::String(s),
+        serde_json::Value::Array(arr) => {
+            JsonValue::Array(arr.into_iter().map(serde_value_to_json_value).collect())
+        }
+        serde_json::Value::Object(map) => JsonValue::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, serde_value_to_json_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Parses a single JSONL line using `verity_core::json::parse_json`, falling back to
+/// `serde_json` so no valid Pi streaming event is ever silently dropped.
+pub fn parse_jsonl_line(raw: &str) -> Option<JsonValue> {
+    let trimmed = raw.trim().trim_start_matches('\u{feff}');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(v) = parse_json(trimmed) {
+        return Some(v);
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .map(serde_value_to_json_value)
+}
+
+fn parse_nested_delta_object(delta_obj: &JsonValue) -> (Option<String>, Option<String>) {
+    match delta_obj.get("type").and_then(JsonValue::as_str) {
+        Some("text_delta") => (opt_non_empty_str(delta_obj, &["text", "delta"]), None),
+        Some("thinking_delta") | Some("reasoning_delta") => (
+            None,
+            opt_non_empty_str(delta_obj, &["thinking", "text", "delta"]),
+        ),
+        _ => (
+            opt_non_empty_str(delta_obj, &["text", "delta"]),
+            opt_non_empty_str(delta_obj, &["thinking"]),
+        ),
+    }
+}
+
 fn parse_message_update_deltas(val: &JsonValue) -> (Option<String>, Option<String>) {
-    if let Some(ame) = val.get("assistantMessageEvent") {
+    if let Some(ame) = val
+        .get("assistantMessageEvent")
+        .or_else(|| val.get("assistant_message_event"))
+    {
         if let Some(ame_type) = ame.get("type").and_then(JsonValue::as_str) {
             return match ame_type {
-                "text_delta" => (opt_str(ame, &["delta", "text"]), None),
+                "text_delta" => (opt_non_empty_str(ame, &["delta", "text"]), None),
                 "thinking_delta" | "reasoning_delta" => {
-                    (None, opt_str(ame, &["delta", "thinking", "text"]))
+                    (None, opt_non_empty_str(ame, &["delta", "thinking", "text"]))
+                }
+                "content_block_delta" => {
+                    if let Some(delta_obj) = ame.get("delta").filter(|d| d.as_object().is_some()) {
+                        parse_nested_delta_object(delta_obj)
+                    } else {
+                        (
+                            opt_non_empty_str(ame, &["delta", "text"]),
+                            opt_non_empty_str(
+                                ame,
+                                &["thinking", "thinking_delta", "thinkingDelta"],
+                            ),
+                        )
+                    }
                 }
                 _ => (None, None),
             };
         }
     }
-    (
-        opt_str(val, &["delta", "text"]),
-        opt_str(val, &["thinking_delta", "thinkingDelta"]),
-    )
+
+    if let Some(delta_obj) = val.get("delta").filter(|d| d.as_object().is_some()) {
+        return parse_nested_delta_object(delta_obj);
+    }
+
+    let flat_delta = opt_non_empty_str(val, &["delta", "text"]);
+    let flat_thinking = opt_non_empty_str(
+        val,
+        &[
+            "thinking_delta",
+            "thinkingDelta",
+            "reasoning_delta",
+            "reasoningDelta",
+        ],
+    );
+    if flat_delta.is_some() || flat_thinking.is_some() {
+        return (flat_delta, flat_thinking);
+    }
+
+    if let Some(msg) = val.get("message") {
+        if let Some(delta_obj) = msg.get("delta").filter(|d| d.as_object().is_some()) {
+            return parse_nested_delta_object(delta_obj);
+        }
+        let msg_delta = opt_non_empty_str(msg, &["delta", "text"]);
+        let msg_thinking = opt_non_empty_str(
+            msg,
+            &[
+                "thinking_delta",
+                "thinkingDelta",
+                "reasoning_delta",
+                "reasoningDelta",
+            ],
+        );
+        if msg_delta.is_some() || msg_thinking.is_some() {
+            return (msg_delta, msg_thinking);
+        }
+    }
+
+    (None, None)
 }
 
 fn extract_message_end_content(val: &JsonValue) -> (Option<String>, Option<String>) {
@@ -1114,19 +1221,20 @@ impl PiSessionSupervisor {
         let reader_handle = match std::thread::Builder::new()
             .name("pi-rpc-stdout".to_string())
             .spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line_res in reader.lines() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(_) => break,
-                    };
-                    let trimmed = line.trim();
+                let mut reader = BufReader::with_capacity(4096, stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let trimmed = line.trim().trim_start_matches('\u{feff}');
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let val = match parse_json(trimmed) {
-                        Ok(v) => v,
-                        Err(_) => continue,
+                    let Some(val) = parse_jsonl_line(trimmed) else {
+                        continue;
                     };
 
                     if let Some(resp) = parse_rpc_response(&val) {
@@ -2677,5 +2785,159 @@ done
                 raw
             );
         }
+    }
+
+    #[test]
+    fn parses_snake_case_content_block_delta_whitespace_and_serde_fallback() {
+        // 1. Snake-case assistant_message_event with whitespace-only deltas (" " and "\n")
+        let space_raw = r#"{"type":"message_update","message":{"id":"m1"},"assistant_message_event":{"type":"text_delta","delta":" "}}"#;
+        let space_ev = parse_pi_ui_event(&parse_jsonl_line(space_raw).unwrap(), space_raw).unwrap();
+        assert_eq!(
+            space_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("m1".to_string()),
+                delta: Some(" ".to_string()),
+                thinking_delta: None,
+                raw_json: space_raw.to_string(),
+            }
+        );
+
+        let nl_raw = r#"{"type":"message_update","message":{"id":"m1"},"assistantMessageEvent":{"type":"text_delta","delta":"\n"}}"#;
+        let nl_ev = parse_pi_ui_event(&parse_jsonl_line(nl_raw).unwrap(), nl_raw).unwrap();
+        assert_eq!(
+            nl_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("m1".to_string()),
+                delta: Some("\n".to_string()),
+                thinking_delta: None,
+                raw_json: nl_raw.to_string(),
+            }
+        );
+
+        // 2. Anthropic-style content_block_delta (both top-level and inside assistantMessageEvent)
+        let anthropic_text_raw = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"chunk-a"}}"#;
+        let anthropic_text_ev =
+            parse_pi_ui_event(&parse_jsonl_line(anthropic_text_raw).unwrap(), anthropic_text_raw)
+                .unwrap();
+        assert_eq!(
+            anthropic_text_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: None,
+                delta: Some("chunk-a".to_string()),
+                thinking_delta: None,
+                raw_json: anthropic_text_raw.to_string(),
+            }
+        );
+
+        let anthropic_think_raw = r#"{"type":"message_update","message":{"id":"m2"},"assistantMessageEvent":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"deep thought"}}}"#;
+        let anthropic_think_ev = parse_pi_ui_event(
+            &parse_jsonl_line(anthropic_think_raw).unwrap(),
+            anthropic_think_raw,
+        )
+        .unwrap();
+        assert_eq!(
+            anthropic_think_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("m2".to_string()),
+                delta: None,
+                thinking_delta: Some("deep thought".to_string()),
+                raw_json: anthropic_think_raw.to_string(),
+            }
+        );
+
+        // 3. Nested incremental delta inside message when assistantMessageEvent is absent
+        let msg_delta_raw = r#"{"type":"message_update","message":{"id":"m3","delta":"inc"}}"#;
+        let msg_delta_ev =
+            parse_pi_ui_event(&parse_jsonl_line(msg_delta_raw).unwrap(), msg_delta_raw).unwrap();
+        assert_eq!(
+            msg_delta_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("m3".to_string()),
+                delta: Some("inc".to_string()),
+                thinking_delta: None,
+                raw_json: msg_delta_raw.to_string(),
+            }
+        );
+
+        // 4. BOM-prefixed line and serde_json conversion fallback
+        let bom_line = "\u{feff}{\"type\":\"message_update\",\"delta\":\"ok\"}";
+        let bom_val = parse_jsonl_line(bom_line).expect("must strip BOM and parse");
+        assert_eq!(bom_val.get("delta").and_then(JsonValue::as_str), Some("ok"));
+
+        let converted = serde_value_to_json_value(serde_json::json!({
+            "type": "message_update",
+            "delta": "fallback",
+            "count": 42,
+            "ok": true,
+            "tags": ["a", null]
+        }));
+        assert_eq!(
+            converted.get("delta").and_then(JsonValue::as_str),
+            Some("fallback")
+        );
+    }
+
+    #[test]
+    fn streams_message_update_chunks_incrementally_before_next_chunk_is_written() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    prompt)
+      printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+      printf '{"type":"message_start","message":{"id":"ms-1","role":"assistant","content":[]}}\n'
+      printf '{"type":"message_update","message":{"id":"ms-1"},"assistantMessageEvent":{"type":"text_delta","delta":"first "}}\n'
+      sleep 0.25
+      printf '{"type":"message_update","message":{"id":"ms-1"},"assistantMessageEvent":{"type":"text_delta","delta":"second"}}\n'
+      printf '{"type":"message_end","message":{"id":"ms-1","role":"assistant","stopReason":"stop","content":[{"type":"text","text":"first second"}]}}\n'
+      printf '{"type":"agent_end","messages":[]}\n'
+      ;;
+    *)
+      printf '{"type":"response","id":"%s","command":"%s","success":true}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#;
+
+        let (chunk_tx, chunk_rx) = mpsc::channel::<(String, Instant)>();
+        let (settled_tx, settled_rx) = mpsc::channel::<()>();
+        let sink: EventSink = Arc::new(move |ev| match ev {
+            PiUiEvent::MessageUpdate {
+                delta: Some(d), ..
+            } => {
+                let _ = chunk_tx.send((d, Instant::now()));
+            }
+            PiUiEvent::AgentSettled { .. } => {
+                let _ = settled_tx.send(());
+            }
+            _ => {}
+        });
+
+        let sup = PiSessionSupervisor::spawn(mock_sh_config(script), sink, Arc::new(|| {}))
+            .expect("spawn streaming mock");
+        sup.prompt("stream test", vec![]).expect("prompt");
+
+        let (chunk1, t1) = chunk_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("must receive chunk 1");
+        let (chunk2, t2) = chunk_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("must receive chunk 2");
+        settled_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("must receive agent_settled");
+
+        assert_eq!(chunk1, "first ");
+        assert_eq!(chunk2, "second");
+        // Chunk 1 must arrive significantly before chunk 2 (proving line-by-line streaming with zero EOF buffering).
+        let gap = t2.saturating_duration_since(t1);
+        assert!(
+            gap >= Duration::from_millis(120),
+            "expected incremental arrival gap >= 120ms between chunk 1 and chunk 2, got {:?}",
+            gap
+        );
+
+        sup.shutdown();
     }
 }
