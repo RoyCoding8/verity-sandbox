@@ -18,6 +18,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Verity",
         "width": 1280,
         "height": 840,
