@@ -230,6 +230,11 @@
   color: var(--md-sys-color-on-surface);
 }
 
+.verity-session-item:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
+}
+
 :root[data-theme="light"] .verity-session-item:hover {
   background: var(--md-sys-color-surface-container-high);
 }

@@ -1404,6 +1404,7 @@ pre,
   gap: 12px;
   padding: 20px 24px 16px;
   border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  flex-shrink: 0;
 }
 
 .md3-dialog-title {
@@ -1420,6 +1421,8 @@ pre,
 }
 
 .md3-dialog-body {
+  flex: 1;
+  min-height: 0;
   padding: 18px 24px 22px;
   overflow-y: auto;
   display: flex;
@@ -1435,6 +1438,7 @@ pre,
   padding: 14px 24px 18px;
   border-top: 1px solid var(--md-sys-color-outline-variant);
   background: var(--md-sys-color-surface-container-low);
+  flex-shrink: 0;
 }
 
 .md3-field {
@@ -1568,7 +1572,7 @@ pre,
 
 .pi-extension-widgets {
   position: fixed;
-  top: 16px;
+  top: 68px;
   right: 20px;
   display: flex;
   flex-direction: column;

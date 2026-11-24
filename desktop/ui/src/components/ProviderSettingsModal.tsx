@@ -1,4 +1,11 @@
-import { useEffect, useState, type FormEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import {
   validateExternalSignInUrl,
   validateProviderBaseUrl,
@@ -8,6 +15,7 @@ import {
 } from "../api/tauri";
 import {
   AlertIcon,
+  CheckIcon,
   CloseIcon,
   EditIcon,
   PlusIcon,
@@ -31,7 +39,7 @@ interface ProviderFormState {
   readonly api: ProviderApiKind;
   readonly baseUrl: string;
   readonly signInUrl: string;
-  readonly modelsCsv: string;
+  readonly models: readonly string[];
   readonly apiKey: string;
   readonly clearApiKey: boolean;
   readonly isEditing: boolean;
@@ -43,7 +51,7 @@ const EMPTY_FORM: ProviderFormState = {
   api: "openai-completions",
   baseUrl: "",
   signInUrl: "",
-  modelsCsv: "",
+  models: [],
   apiKey: "",
   clearApiKey: false,
   isEditing: false,
@@ -77,6 +85,19 @@ function isProviderApiKind(value: string): value is ProviderApiKind {
   );
 }
 
+function deduplicateModels(raw: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of raw) {
+    const trimmed = item.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      result.push(trimmed);
+    }
+  }
+  return result;
+}
+
 export function ProviderSettingsModal({
   open,
   providers,
@@ -85,15 +106,51 @@ export function ProviderSettingsModal({
   onClose,
 }: ProviderSettingsModalProps) {
   const [form, setForm] = useState<ProviderFormState>(EMPTY_FORM);
+  const [addingModel, setAddingModel] = useState(false);
+  const [draftModelId, setDraftModelId] = useState("");
+  const [selectedModelId, setSelectedModelId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
+  const draftModelInputRef = useRef<HTMLInputElement>(null);
+
+  const isBusy = submitting || deletingId !== null;
+
+  const editingProvider = useMemo(
+    () =>
+      form.isEditing
+        ? providers.find((provider) => provider.id === form.id) ?? null
+        : null,
+    [form.id, form.isEditing, providers]
+  );
+  const hasStoredApiKey = Boolean(editingProvider?.has_api_key);
+
+  const modelOptions = useMemo<readonly Md3SelectOption[]>(
+    () =>
+      form.models.map((modelId) => ({
+        value: modelId,
+        label: modelId,
+      })),
+    [form.models]
+  );
+
+  function resetFormState() {
+    setForm(EMPTY_FORM);
+    setAddingModel(false);
+    setDraftModelId("");
+    setSelectedModelId("");
+    setError(null);
+  }
+
   // Reset form edits, error banner, and pending delete confirmation on close/reopen
   useEffect(() => {
     if (!open) {
       setForm(EMPTY_FORM);
+      setAddingModel(false);
+      setDraftModelId("");
+      setSelectedModelId("");
       setError(null);
       setSubmitting(false);
       setPendingDeleteId(null);
@@ -101,36 +158,91 @@ export function ProviderSettingsModal({
       return;
     }
     function onKeyDown(e: KeyboardEvent) {
+      if (e.defaultPrevented) return;
       if (e.key === "Escape") onClose();
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [open, onClose]);
 
+  useEffect(() => {
+    if (addingModel) {
+      draftModelInputRef.current?.focus();
+    }
+  }, [addingModel]);
+
   if (!open) return null;
 
   function loadForEdit(profile: PublicProviderProfile) {
+    const uniqueModels = deduplicateModels(profile.models);
     setError(null);
     setPendingDeleteId(null);
+    setAddingModel(false);
+    setDraftModelId("");
+    setSelectedModelId(uniqueModels[0] ?? "");
     setForm({
       id: profile.id,
       name: profile.name,
       api: profile.api,
       baseUrl: profile.base_url,
       signInUrl: profile.sign_in_url ?? "",
-      modelsCsv: profile.models.join(", "),
+      models: uniqueModels,
       apiKey: "",
       clearApiKey: false,
       isEditing: true,
     });
   }
 
+  function handleSaveModel() {
+    const trimmed = draftModelId.trim();
+    if (!trimmed) return;
+    setForm((prev) => {
+      if (prev.models.includes(trimmed)) {
+        return prev;
+      }
+      return { ...prev, models: [...prev.models, trimmed] };
+    });
+    setSelectedModelId(trimmed);
+    setDraftModelId("");
+    setAddingModel(false);
+  }
+
+  function handleRemoveSelectedModel() {
+    if (!selectedModelId) return;
+    const nextModels = form.models.filter((m) => m !== selectedModelId);
+    setForm((prev) => ({
+      ...prev,
+      models: prev.models.filter((m) => m !== selectedModelId),
+    }));
+    setSelectedModelId(nextModels[0] ?? "");
+  }
+
+  function handleDraftModelKeyDown(e: ReactKeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      handleSaveModel();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      setAddingModel(false);
+      setDraftModelId("");
+    }
+  }
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
+    if (isBusy) return;
+
     const id = form.id.trim();
     const name = form.name.trim();
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
       setError("Provider ID must be 1–64 ASCII letters, digits, '-' or '_'.");
+      return;
+    }
+    if (!form.isEditing && providers.some((p) => p.id === id)) {
+      setError(
+        `Provider ID "${id}" already exists. Choose a different ID or edit the existing provider.`
+      );
       return;
     }
     if (!name) {
@@ -148,17 +260,15 @@ export function ProviderSettingsModal({
       return;
     }
 
-    const models = form.modelsCsv
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const models = deduplicateModels(form.models);
 
     // Tri-state api_key: "" clears key, non-empty replaces key, undefined preserves existing key
-    const apiKeyPayload = form.clearApiKey
-      ? ""
-      : form.apiKey.trim().length > 0
-        ? form.apiKey.trim()
-        : undefined;
+    const apiKeyPayload =
+      hasStoredApiKey && form.clearApiKey
+        ? ""
+        : form.apiKey.trim().length > 0
+          ? form.apiKey.trim()
+          : undefined;
 
     setSubmitting(true);
     setError(null);
@@ -172,7 +282,7 @@ export function ProviderSettingsModal({
         models,
         api_key: apiKeyPayload,
       });
-      setForm(EMPTY_FORM);
+      resetFormState();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -181,11 +291,14 @@ export function ProviderSettingsModal({
   }
 
   async function handleConfirmDelete(id: string) {
+    if (isBusy) return;
     setDeletingId(id);
     setError(null);
     try {
       await onDelete(id);
-      if (form.id === id) setForm(EMPTY_FORM);
+      if (form.id === id) {
+        resetFormState();
+      }
       setPendingDeleteId(null);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -246,6 +359,11 @@ export function ProviderSettingsModal({
                 const isConfirmingDelete = pendingDeleteId === provider.id;
                 const isDeleting = deletingId === provider.id;
                 const isBeingEdited = form.isEditing && form.id === provider.id;
+                const safeSignInUrl =
+                  provider.sign_in_url &&
+                  validateExternalSignInUrl(provider.sign_in_url) === null
+                    ? provider.sign_in_url
+                    : null;
                 const cardClass = isConfirmingDelete
                   ? "vo-provider-card vo-provider-card--confirm-delete"
                   : isBeingEdited
@@ -290,12 +408,22 @@ export function ProviderSettingsModal({
                     </div>
 
                     <div className="vo-provider-actions">
+                      {safeSignInUrl && !isConfirmingDelete && (
+                        <a
+                          href={safeSignInUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="md3-btn-outlined vo-provider-signin-link"
+                        >
+                          Sign in
+                        </a>
+                      )}
                       {isConfirmingDelete ? (
                         <div className="vo-confirm-delete-group">
                           <button
                             type="button"
                             className="md3-btn-danger"
-                            disabled={isDeleting}
+                            disabled={isBusy}
                             onClick={() => void handleConfirmDelete(provider.id)}
                           >
                             <TrashIcon size={14} />
@@ -304,7 +432,7 @@ export function ProviderSettingsModal({
                           <button
                             type="button"
                             className="md3-btn-text"
-                            disabled={isDeleting}
+                            disabled={isBusy}
                             onClick={() => setPendingDeleteId(null)}
                           >
                             Cancel
@@ -315,7 +443,7 @@ export function ProviderSettingsModal({
                           <button
                             type="button"
                             className="md3-btn-tonal"
-                            disabled={deletingId !== null}
+                            disabled={isBusy}
                             onClick={() => loadForEdit(provider)}
                           >
                             <EditIcon size={14} />
@@ -324,7 +452,7 @@ export function ProviderSettingsModal({
                           <button
                             type="button"
                             className="md3-btn-danger"
-                            disabled={deletingId !== null}
+                            disabled={isBusy}
                             onClick={() => {
                               setError(null);
                               setPendingDeleteId(provider.id);
@@ -360,10 +488,8 @@ export function ProviderSettingsModal({
                 <button
                   type="button"
                   className="md3-btn-text"
-                  onClick={() => {
-                    setForm(EMPTY_FORM);
-                    setError(null);
-                  }}
+                  disabled={isBusy}
+                  onClick={resetFormState}
                 >
                   Reset form
                 </button>
@@ -384,7 +510,7 @@ export function ProviderSettingsModal({
                   className="md3-input"
                   placeholder="e.g. openrouter"
                   value={form.id}
-                  disabled={form.isEditing}
+                  disabled={form.isEditing || isBusy}
                   onChange={(e) => setForm({ ...form, id: e.target.value })}
                 />
               </label>
@@ -395,6 +521,7 @@ export function ProviderSettingsModal({
                   className="md3-input"
                   placeholder="e.g. OpenRouter"
                   value={form.name}
+                  disabled={isBusy}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
                 />
               </label>
@@ -406,6 +533,7 @@ export function ProviderSettingsModal({
                   placement="bottom"
                   align="start"
                   ariaLabel="API Protocol"
+                  disabled={isBusy}
                   value={form.api}
                   options={API_PROTOCOL_OPTIONS}
                   onChange={(nextValue) => {
@@ -422,27 +550,94 @@ export function ProviderSettingsModal({
                   className="md3-input"
                   placeholder="https://api.example.com/v1"
                   value={form.baseUrl}
+                  disabled={isBusy}
                   onChange={(e) =>
                     setForm({ ...form, baseUrl: e.target.value })
                   }
                 />
               </label>
 
-              <label className="md3-field">
-                <span className="md3-field-label">
-                  Models (comma-separated)
-                </span>
-                <input
-                  className="md3-input"
-                  placeholder="claude-sonnet-4-5, gpt-5"
-                  value={form.modelsCsv}
-                  onChange={(e) =>
-                    setForm({ ...form, modelsCsv: e.target.value })
-                  }
-                />
-              </label>
+              <div className="md3-field vo-models-field">
+                <div className="vo-models-field-header">
+                  <span className="md3-field-label">
+                    Models ({form.models.length})
+                  </span>
+                  <button
+                    type="button"
+                    className="md3-btn-tonal vo-add-model-btn"
+                    disabled={isBusy}
+                    onClick={() => {
+                      setAddingModel(true);
+                      setDraftModelId("");
+                    }}
+                  >
+                    <PlusIcon size={14} />
+                    Add model
+                  </button>
+                </div>
 
-              <label className="md3-field">
+                {addingModel && (
+                  <div className="vo-model-add-row">
+                    <input
+                      ref={draftModelInputRef}
+                      className="md3-input"
+                      aria-label="New model ID"
+                      placeholder="e.g. claude-sonnet-4-5"
+                      value={draftModelId}
+                      disabled={isBusy}
+                      onChange={(e) => setDraftModelId(e.target.value)}
+                      onKeyDown={handleDraftModelKeyDown}
+                    />
+                    <button
+                      type="button"
+                      className="md3-btn-filled"
+                      disabled={isBusy || draftModelId.trim().length === 0}
+                      onClick={handleSaveModel}
+                    >
+                      <CheckIcon size={14} />
+                      Save model
+                    </button>
+                    <button
+                      type="button"
+                      className="md3-btn-text"
+                      disabled={isBusy}
+                      onClick={() => {
+                        setAddingModel(false);
+                        setDraftModelId("");
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+
+                <div className="vo-model-select-row">
+                  <div className="vo-model-select-wrap">
+                    <Md3Select
+                      variant="field"
+                      placement="bottom"
+                      align="start"
+                      ariaLabel="Saved models"
+                      placeholder="No models added yet"
+                      disabled={form.models.length === 0 || isBusy}
+                      value={selectedModelId}
+                      options={modelOptions}
+                      onChange={setSelectedModelId}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    className="md3-btn-danger"
+                    disabled={!selectedModelId || isBusy}
+                    onClick={handleRemoveSelectedModel}
+                  >
+                    <TrashIcon size={14} />
+                    Remove
+                  </button>
+                </div>
+              </div>
+
+              <label className="md3-field vo-models-field">
                 <span className="md3-field-label">
                   External Sign-in URL (optional, https://)
                 </span>
@@ -450,6 +645,7 @@ export function ProviderSettingsModal({
                   className="md3-input"
                   placeholder="https://console.example.com"
                   value={form.signInUrl}
+                  disabled={isBusy}
                   onChange={(e) =>
                     setForm({ ...form, signInUrl: e.target.value })
                   }
@@ -460,7 +656,7 @@ export function ProviderSettingsModal({
             <label className="md3-field">
               <span className="md3-field-label">
                 API Key{" "}
-                {form.isEditing
+                {hasStoredApiKey
                   ? "(leave blank to keep existing key)"
                   : "(optional)"}
               </span>
@@ -470,16 +666,17 @@ export function ProviderSettingsModal({
                 autoComplete="off"
                 placeholder="sk-..."
                 value={form.apiKey}
-                disabled={form.clearApiKey}
+                disabled={form.clearApiKey || isBusy}
                 onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
               />
             </label>
 
-            {form.isEditing && (
+            {hasStoredApiKey && (
               <label className="vo-checkbox-row">
                 <input
                   type="checkbox"
                   checked={form.clearApiKey}
+                  disabled={isBusy}
                   onChange={(e) =>
                     setForm({
                       ...form,
@@ -502,7 +699,7 @@ export function ProviderSettingsModal({
             type="submit"
             form={FORM_ID}
             className="md3-btn-filled"
-            disabled={submitting}
+            disabled={isBusy}
           >
             {form.isEditing ? <EditIcon size={14} /> : <PlusIcon size={14} />}
             {submitting

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { HistoryTreeNode } from "../api/tauri";
 import {
+  AlertIcon,
   ClockIcon,
   CloseIcon,
   GitBranchIcon,
@@ -12,7 +13,7 @@ import "./ModalsOverlay.css";
 export interface HistoryTreeModalProps {
   readonly open: boolean;
   readonly nodes: readonly HistoryTreeNode[];
-  readonly onForkFromNode: (entryId: string) => void;
+  readonly onForkFromNode: (entryId: string) => void | Promise<void>;
   readonly onClose: () => void;
 }
 
@@ -76,20 +77,19 @@ function buildTreeRows(
   }
 
   const rows: TreeDisplayRow[] = visibleNodes.map((node, index) => {
-    const clampedDepth = Math.min(Math.max(node.depth, 0), MAX_GUIDE_DEPTH);
+    const rawDepth = Math.max(node.depth, 0);
+    const clampedDepth = Math.min(rawDepth, MAX_GUIDE_DEPTH);
     const guides: ("line" | "elbow" | "elbow-continues" | "empty")[] = [];
 
     for (let level = 1; level <= clampedDepth; level++) {
+      const compareLevel = level === clampedDepth ? rawDepth : level;
       let hasFollowingAtLevel = false;
       for (let j = index + 1; j < visibleNodes.length; j++) {
-        const nextDepth = Math.min(
-          Math.max(visibleNodes[j].depth, 0),
-          MAX_GUIDE_DEPTH
-        );
-        if (nextDepth < level) {
+        const nextRawDepth = Math.max(visibleNodes[j].depth, 0);
+        if (nextRawDepth < compareLevel) {
           break;
         }
-        if (nextDepth === level) {
+        if (nextRawDepth === compareLevel) {
           hasFollowingAtLevel = true;
           break;
         }
@@ -130,13 +130,18 @@ export function HistoryTreeModal({
   onClose,
 }: HistoryTreeModalProps) {
   const [query, setQuery] = useState("");
+  const [forkingId, setForkingId] = useState<string | null>(null);
+  const [forkError, setForkError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) {
       setQuery("");
+      setForkingId(null);
+      setForkError(null);
       return;
     }
     function onKeyDown(e: KeyboardEvent) {
+      if (e.defaultPrevented) return;
       if (e.key === "Escape") onClose();
     }
     window.addEventListener("keydown", onKeyDown);
@@ -151,6 +156,19 @@ export function HistoryTreeModal({
   );
 
   if (!open) return null;
+
+  async function handleFork(entryId: string) {
+    if (forkingId !== null) return;
+    setForkingId(entryId);
+    setForkError(null);
+    try {
+      await onForkFromNode(entryId);
+    } catch (err: unknown) {
+      setForkError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setForkingId(null);
+    }
+  }
 
   return (
     <div className="md3-scrim" onClick={onClose}>
@@ -187,6 +205,13 @@ export function HistoryTreeModal({
         </header>
 
         <div className="md3-dialog-body">
+          {forkError && (
+            <div className="md3-error-banner vo-error-banner" role="alert">
+              <AlertIcon size={15} className="vo-error-banner-icon" />
+              <span>{forkError}</span>
+            </div>
+          )}
+
           <div className="vo-search-row">
             <div className="vo-search-wrap">
               <span className="vo-search-icon" aria-hidden="true">
@@ -245,6 +270,7 @@ export function HistoryTreeModal({
           ) : (
             <div className="vo-tree-list">
               {rows.map(({ node, isContextOnly, parentPreview, guides }) => {
+                const isForkingNode = forkingId === node.id;
                 const nodeCardClass = [
                   "vo-tree-node-card",
                   node.isActiveBranch ? "vo-tree-node-card--active" : "",
@@ -319,10 +345,11 @@ export function HistoryTreeModal({
                         <button
                           type="button"
                           className="md3-btn-tonal"
-                          onClick={() => onForkFromNode(node.id)}
+                          disabled={forkingId !== null}
+                          onClick={() => void handleFork(node.id)}
                         >
                           <GitForkIcon size={14} />
-                          Fork
+                          {isForkingNode ? "Forking..." : "Fork"}
                         </button>
                       </div>
                     </div>

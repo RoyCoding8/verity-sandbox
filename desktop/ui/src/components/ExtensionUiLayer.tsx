@@ -41,6 +41,8 @@ export function ExtensionUiLayer({
   const [remainingMs, setRemainingMs] = useState<number | null>(null);
 
   const snackbarTimersRef = useRef<Map<string, number>>(new Map());
+  const onRespondRef = useRef(onRespond);
+  onRespondRef.current = onRespond;
   const onDismissSnackbarRef = useRef(onDismissSnackbar);
   onDismissSnackbarRef.current = onDismissSnackbar;
 
@@ -59,27 +61,28 @@ export function ExtensionUiLayer({
       const left = deadline - Date.now();
       if (left <= 0) {
         window.clearInterval(interval);
-        onRespond(activeDialogId, { kind: "cancelled" });
+        onRespondRef.current(activeDialogId, { kind: "cancelled" });
       } else {
         setRemainingMs(left);
       }
     }, 250);
     return () => window.clearInterval(interval);
-  }, [activeDialogId, activeDialogTimeoutMs, onRespond]);
+  }, [activeDialogId, activeDialogTimeoutMs]);
 
   // Escape key cancels the active FIFO dialog
   useEffect(() => {
     if (!activeDialogId) return;
     const dialogId = activeDialogId;
     function handleKeyDown(e: KeyboardEvent) {
+      if (e.defaultPrevented) return;
       if (e.key === "Escape") {
         e.preventDefault();
-        onRespond(dialogId, { kind: "cancelled" });
+        onRespondRef.current(dialogId, { kind: "cancelled" });
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [activeDialogId, onRespond]);
+  }, [activeDialogId]);
 
   // Track per-snackbar timers so adding a new snackbar never resets existing timers
   useEffect(() => {
@@ -158,7 +161,7 @@ export function ExtensionUiLayer({
 
       {activeDialog && (
         <div
-          className="md3-scrim"
+          className="md3-scrim vo-ext-scrim"
           onClick={() => onRespond(activeDialog.id, { kind: "cancelled" })}
         >
           <div
@@ -214,33 +217,45 @@ export function ExtensionUiLayer({
                 </p>
               )}
 
-              {activeDialog.kind === "select" && (
-                <div
-                  className="pi-option-list"
-                  role="radiogroup"
-                  aria-label={activeDialog.title}
-                >
-                  {activeDialog.options.map((option) => {
-                    const isSelected = selectedOption === option;
-                    return (
-                      <button
-                        key={option}
-                        type="button"
-                        role="radio"
-                        aria-checked={isSelected}
-                        className={`pi-option-btn vo-option-btn ${isSelected ? "selected" : ""}`}
-                        onClick={() => setSelectedOption(option)}
-                      >
-                        <span className="vo-option-label">
-                          <span className="vo-radio-dot" aria-hidden="true" />
-                          <span>{option}</span>
-                        </span>
-                        {isSelected && <CheckIcon size={15} />}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
+              {activeDialog.kind === "select" &&
+                (activeDialog.options.length === 0 ? (
+                  <div className="vo-empty-state">
+                    <span className="vo-empty-state-icon" aria-hidden="true">
+                      <InfoIcon size={18} />
+                    </span>
+                    <p className="vo-empty-state-title">No options available</p>
+                    <p className="vo-empty-state-desc">
+                      This extension request did not provide any choices to
+                      select. Cancel to continue.
+                    </p>
+                  </div>
+                ) : (
+                  <div
+                    className="pi-option-list"
+                    role="radiogroup"
+                    aria-label={activeDialog.title}
+                  >
+                    {activeDialog.options.map((option) => {
+                      const isSelected = selectedOption === option;
+                      return (
+                        <button
+                          key={option}
+                          type="button"
+                          role="radio"
+                          aria-checked={isSelected}
+                          className={`pi-option-btn vo-option-btn ${isSelected ? "selected" : ""}`}
+                          onClick={() => setSelectedOption(option)}
+                        >
+                          <span className="vo-option-label">
+                            <span className="vo-radio-dot" aria-hidden="true" />
+                            <span>{option}</span>
+                          </span>
+                          {isSelected && <CheckIcon size={15} />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
 
               {activeDialog.kind === "input" && (
                 <input

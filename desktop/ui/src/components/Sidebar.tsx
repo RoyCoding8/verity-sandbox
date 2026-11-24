@@ -233,13 +233,22 @@ export function Sidebar({
                   <div
                     key={session.id}
                     role="listitem"
+                    tabIndex={isEditing ? -1 : 0}
+                    aria-current={isActive ? "page" : undefined}
                     className={
                       isActive
                         ? "verity-session-item active"
                         : "verity-session-item"
                     }
                     onClick={() => {
-                      if (!isEditing) onSelectSession(session);
+                      if (!isEditing && !isActive) onSelectSession(session);
+                    }}
+                    onKeyDown={(e) => {
+                      if (isEditing || e.target !== e.currentTarget) return;
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        if (!isActive) onSelectSession(session);
+                      }
                     }}
                     onDoubleClick={() => beginRename(session)}
                   >
