@@ -1,13 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for Verity main desktop window allowing core Tauri v2 APIs and pi:event listeners.",
+  "description": "Default capability for Verity main desktop window allowing core Tauri v2 APIs, dialog folder picker, and pi:event listeners.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:event:default",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "core:event:allow-emit"
+    "core:event:allow-emit",
+    "dialog:allow-open"
   ]
 }

@@ -8,6 +8,7 @@ use verity_desktop::providers;
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(PiAppState::new_default())
         .invoke_handler(tauri::generate_handler![
             providers::list_providers,
@@ -21,6 +22,10 @@ fn main() {
             verity_bridge::get_handoff,
             verity_bridge::approve_and_merge_handoff,
             pi_ipc::pi_bootstrap,
+            pi_ipc::pi_pick_project_folder,
+            pi_ipc::pi_add_project,
+            pi_ipc::pi_remove_project,
+            pi_ipc::pi_switch_project,
             pi_ipc::pi_switch_session,
             pi_ipc::pi_new_session,
             pi_ipc::pi_set_session_name,
@@ -40,6 +45,17 @@ fn main() {
             pi_ipc::pi_abort_retry,
             pi_ipc::pi_extension_ui_response,
             pi_ipc::pi_open_external_url,
+            pi_ipc::pi_bash,
+            pi_ipc::pi_abort_bash,
+            pi_ipc::pi_get_session_stats,
+            pi_ipc::pi_get_last_assistant_text,
+            pi_ipc::pi_set_auto_compaction,
+            pi_ipc::pi_set_auto_retry,
+            pi_ipc::pi_set_steering_mode,
+            pi_ipc::pi_set_follow_up_mode,
+            pi_ipc::pi_cycle_model,
+            pi_ipc::pi_cycle_thinking_level,
+            pi_ipc::pi_get_commands,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Verity desktop");

@@ -1,7 +1,7 @@
 use crate::attachments::PendingAttachment;
 use crate::extension_ui::{
-    parse_extension_ui_request, DialogId, DialogKind, ExtensionUiAnswer, ExtensionUiError,
-    ExtensionUiResponse, ExtensionUiTracker,
+    parse_extension_ui_effect, parse_extension_ui_request, DialogId, DialogKind,
+    ExtensionUiAnswer, ExtensionUiError, ExtensionUiResponse, ExtensionUiTracker,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -55,6 +55,7 @@ pub struct PiSessionConfig {
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
     pub command_timeout: Duration,
+    pub no_session: bool,
 }
 
 /// Resolves the Pi CLI executable name across platforms.
@@ -90,19 +91,22 @@ pub fn resolve_pi_program(program: &str) -> String {
 }
 
 impl PiSessionConfig {
-    /// Standard long-lived Pi RPC configuration (`pi --mode rpc --no-session`).
+    /// Standard long-lived Pi RPC configuration (`pi --mode rpc`), persisting sessions per project `cwd`.
     pub fn default_pi(cwd: PathBuf) -> Self {
         Self {
             program: resolve_pi_program("pi"),
-            args: vec![
-                "--mode".to_string(),
-                "rpc".to_string(),
-                "--no-session".to_string(),
-            ],
+            args: vec!["--mode".to_string(), "rpc".to_string()],
             cwd,
             env: Vec::new(),
             command_timeout: Duration::from_secs(30),
+            no_session: false,
         }
+    }
+
+    /// Enables or disables ephemeral `--no-session` mode (useful for isolated unit tests).
+    pub fn with_no_session(mut self, no_session: bool) -> Self {
+        self.no_session = no_session;
+        self
     }
 
     /// Appends `--extension <path>` to the Pi CLI arguments.
@@ -204,7 +208,7 @@ pub struct PiRpcResponse {
     pub error: Option<String>,
 }
 
-/// All 24 typed Pi JSONL RPC stdin commands.
+/// All 34 typed Pi JSONL RPC stdin commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PiRpcCommand {
     GetState,
@@ -258,6 +262,26 @@ pub enum PiRpcCommand {
     ClearQueue,
     Abort,
     AbortRetry,
+    Bash {
+        command: String,
+    },
+    AbortBash,
+    SetAutoCompaction {
+        enabled: bool,
+    },
+    SetAutoRetry {
+        enabled: bool,
+    },
+    SetSteeringMode {
+        mode: String,
+    },
+    SetFollowUpMode {
+        mode: String,
+    },
+    CycleModel,
+    CycleThinkingLevel,
+    GetLastAssistantText,
+    GetEntries,
     ExtensionUiResponse(ExtensionUiResponse),
 }
 
@@ -288,6 +312,16 @@ impl PiRpcCommand {
             Self::ClearQueue => "clear_queue",
             Self::Abort => "abort",
             Self::AbortRetry => "abort_retry",
+            Self::Bash { .. } => "bash",
+            Self::AbortBash => "abort_bash",
+            Self::SetAutoCompaction { .. } => "set_auto_compaction",
+            Self::SetAutoRetry { .. } => "set_auto_retry",
+            Self::SetSteeringMode { .. } => "set_steering_mode",
+            Self::SetFollowUpMode { .. } => "set_follow_up_mode",
+            Self::CycleModel => "cycle_model",
+            Self::CycleThinkingLevel => "cycle_thinking_level",
+            Self::GetLastAssistantText => "get_last_assistant_text",
+            Self::GetEntries => "get_entries",
             Self::ExtensionUiResponse(_) => "extension_ui_response",
         }
     }
@@ -316,7 +350,12 @@ impl PiRpcCommand {
             | Self::GetForkMessages
             | Self::ClearQueue
             | Self::Abort
-            | Self::AbortRetry => {}
+            | Self::AbortRetry
+            | Self::AbortBash
+            | Self::CycleModel
+            | Self::CycleThinkingLevel
+            | Self::GetLastAssistantText
+            | Self::GetEntries => {}
 
             Self::SetModel { provider, model_id } => {
                 map.insert("provider".to_string(), JsonValue::String(provider.clone()));
@@ -372,6 +411,15 @@ impl PiRpcCommand {
                         JsonValue::String(instr.clone()),
                     );
                 }
+            }
+            Self::Bash { command } => {
+                map.insert("command".to_string(), JsonValue::String(command.clone()));
+            }
+            Self::SetAutoCompaction { enabled } | Self::SetAutoRetry { enabled } => {
+                map.insert("enabled".to_string(), JsonValue::Bool(*enabled));
+            }
+            Self::SetSteeringMode { mode } | Self::SetFollowUpMode { mode } => {
+                map.insert("mode".to_string(), JsonValue::String(mode.clone()));
             }
             Self::ExtensionUiResponse(_) => unreachable!("handled above"),
         }
@@ -442,10 +490,60 @@ pub enum PiUiEvent {
         tool_name: Option<String>,
         raw_json: String,
     },
+    ToolExecutionUpdate {
+        tool_call_id: Option<String>,
+        tool_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partial_result: Option<String>,
+        raw_json: String,
+    },
     ToolExecutionEnd {
         tool_call_id: Option<String>,
         tool_name: Option<String>,
         is_error: bool,
+        raw_json: String,
+    },
+    CompactionStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        raw_json: String,
+    },
+    CompactionEnd {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        aborted: bool,
+        will_retry: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+        raw_json: String,
+    },
+    BashExecutionUpdate {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        is_error: bool,
+        raw_json: String,
+    },
+    SessionInfoChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        raw_json: String,
+    },
+    ThinkingLevelChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<String>,
+        raw_json: String,
+    },
+    TurnStart {
+        raw_json: String,
+    },
+    TurnEnd {
+        raw_json: String,
+    },
+    AgentStart {
         raw_json: String,
     },
     QueueUpdate {
@@ -473,6 +571,27 @@ pub enum PiUiEvent {
         title: Option<String>,
         options: Vec<String>,
         timeout_ms: Option<u64>,
+        raw_json: String,
+    },
+    #[serde(rename = "extension_ui_effect")]
+    ExtensionUiEffect {
+        method: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notify_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status_key: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status_text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        widget_key: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        widget_lines: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
         raw_json: String,
     },
     Error {
@@ -531,6 +650,15 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
             tool_name: opt_str(val, &["toolName", "tool_name", "name"]),
             raw_json,
         }),
+        "tool_execution_update" => Some(PiUiEvent::ToolExecutionUpdate {
+            tool_call_id: opt_str(val, &["toolCallId", "tool_call_id", "id"]),
+            tool_name: opt_str(val, &["toolName", "tool_name", "name"]),
+            partial_result: opt_str_or_json(
+                val,
+                &["partialResult", "partial_result", "output", "delta"],
+            ),
+            raw_json,
+        }),
         "tool_execution_end" => Some(PiUiEvent::ToolExecutionEnd {
             tool_call_id: opt_str(val, &["toolCallId", "tool_call_id", "id"]),
             tool_name: opt_str(val, &["toolName", "tool_name", "name"]),
@@ -541,6 +669,46 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
                 .unwrap_or(false),
             raw_json,
         }),
+        "compaction_start" => Some(PiUiEvent::CompactionStart {
+            reason: opt_str(val, &["reason"]),
+            raw_json,
+        }),
+        "compaction_end" => Some(PiUiEvent::CompactionEnd {
+            result: opt_str_or_json(val, &["result", "summary"]),
+            aborted: val
+                .get("aborted")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            will_retry: val
+                .get("willRetry")
+                .or_else(|| val.get("will_retry"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            error_message: opt_str(val, &["errorMessage", "error_message", "error"]),
+            raw_json,
+        }),
+        "bash_execution_update" => Some(PiUiEvent::BashExecutionUpdate {
+            command: opt_str(val, &["command"]),
+            output: opt_str(val, &["output", "chunk", "delta", "text"]),
+            is_error: val
+                .get("isError")
+                .or_else(|| val.get("is_error"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            raw_json,
+        }),
+        "session_info_changed" => Some(PiUiEvent::SessionInfoChanged {
+            name: opt_str(val, &["name", "sessionName", "session_name"]),
+            session_id: opt_str(val, &["sessionId", "session_id", "id"]),
+            raw_json,
+        }),
+        "thinking_level_changed" => Some(PiUiEvent::ThinkingLevelChanged {
+            level: opt_str(val, &["level", "thinkingLevel", "thinking_level"]),
+            raw_json,
+        }),
+        "turn_start" => Some(PiUiEvent::TurnStart { raw_json }),
+        "turn_end" => Some(PiUiEvent::TurnEnd { raw_json }),
+        "agent_start" => Some(PiUiEvent::AgentStart { raw_json }),
         "queue_update" => Some(PiUiEvent::QueueUpdate {
             pending_count: opt_u64(val, &["pendingCount", "pending_count", "count"]),
             raw_json,
@@ -568,14 +736,28 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
             raw_json,
         }),
         "extension_ui_request" => {
-            let parsed = parse_extension_ui_request(val, Instant::now()).ok()?;
-            let timeout_ms = opt_u64(val, &["timeout_ms", "timeoutMs", "timeout"]);
-            Some(PiUiEvent::ExtensionUiRequest {
-                id: parsed.id.as_str().to_string(),
-                kind: parsed.kind,
-                title: parsed.title,
-                options: parsed.options,
-                timeout_ms,
+            if let Ok(parsed) = parse_extension_ui_request(val, Instant::now()) {
+                let timeout_ms = opt_u64(val, &["timeout_ms", "timeoutMs", "timeout"]);
+                return Some(PiUiEvent::ExtensionUiRequest {
+                    id: parsed.id.as_str().to_string(),
+                    kind: parsed.kind,
+                    title: parsed.title,
+                    options: parsed.options,
+                    timeout_ms,
+                    raw_json,
+                });
+            }
+            let effect = parse_extension_ui_effect(val)?;
+            Some(PiUiEvent::ExtensionUiEffect {
+                method: effect.method,
+                message: effect.message,
+                notify_type: effect.notify_type,
+                status_key: effect.status_key,
+                status_text: effect.status_text,
+                widget_key: effect.widget_key,
+                widget_lines: effect.widget_lines,
+                title: effect.title,
+                text: effect.text,
                 raw_json,
             })
         }
@@ -595,6 +777,14 @@ fn opt_str(val: &JsonValue, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|k| val.get(k).and_then(JsonValue::as_str))
         .map(ToString::to_string)
+}
+
+fn opt_str_or_json(val: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| match val.get(k) {
+        Some(JsonValue::String(s)) => Some(s.clone()),
+        Some(JsonValue::Null) | None => None,
+        Some(other) => Some(to_json_string(other)),
+    })
 }
 
 fn opt_str_or_nested(val: &JsonValue, nested_key: &str, keys: &[&str]) -> Option<String> {
@@ -850,8 +1040,11 @@ impl PiSessionSupervisor {
     ) -> Result<Self, PiSessionError> {
         let resolved_program = resolve_pi_program(&config.program);
         let mut cmd = Command::new(&resolved_program);
-        cmd.args(&config.args)
-            .current_dir(&config.cwd)
+        cmd.args(&config.args);
+        if config.no_session && !config.args.iter().any(|a| a == "--no-session") {
+            cmd.arg("--no-session");
+        }
+        cmd.current_dir(&config.cwd)
             .envs(config.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1281,7 +1474,7 @@ impl PiSessionSupervisor {
         }
 
         let timeout = match &cmd {
-            PiRpcCommand::Abort | PiRpcCommand::AbortRetry => {
+            PiRpcCommand::Abort | PiRpcCommand::AbortRetry | PiRpcCommand::AbortBash => {
                 self.config.command_timeout.min(ABORT_COMMAND_TIMEOUT)
             }
             _ => self.config.command_timeout,
@@ -1546,6 +1739,54 @@ impl PiSessionSupervisor {
         self.send_expect_response(PiRpcCommand::AbortRetry)
     }
 
+    pub fn bash(&self, command: impl Into<String>) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::Bash {
+            command: command.into(),
+        })
+    }
+
+    pub fn abort_bash(&self) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::AbortBash)
+    }
+
+    pub fn set_auto_compaction(&self, enabled: bool) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::SetAutoCompaction { enabled })
+    }
+
+    pub fn set_auto_retry(&self, enabled: bool) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::SetAutoRetry { enabled })
+    }
+
+    pub fn set_steering_mode(
+        &self,
+        mode: impl Into<String>,
+    ) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::SetSteeringMode { mode: mode.into() })
+    }
+
+    pub fn set_follow_up_mode(
+        &self,
+        mode: impl Into<String>,
+    ) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::SetFollowUpMode { mode: mode.into() })
+    }
+
+    pub fn cycle_model(&self) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::CycleModel)
+    }
+
+    pub fn cycle_thinking_level(&self) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::CycleThinkingLevel)
+    }
+
+    pub fn get_last_assistant_text(&self) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::GetLastAssistantText)
+    }
+
+    pub fn get_entries(&self) -> Result<PiRpcResponse, PiSessionError> {
+        self.send_expect_response(PiRpcCommand::GetEntries)
+    }
+
     /// Validates an answer against the tracked Extension UI dialog and writes
     /// `extension_ui_response` to Pi stdin.
     pub fn extension_ui_response(
@@ -1658,6 +1899,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             env: Vec::new(),
             command_timeout: Duration::from_secs(5),
+            no_session: false,
         }
     }
 
@@ -2271,15 +2513,169 @@ done
     fn default_pi_with_extension_appends_extension_cli_flag() {
         let cfg = PiSessionConfig::default_pi(PathBuf::from("/tmp/repo"))
             .with_extension(Path::new("/Users/alice/.verity/extensions/verity-providers.js"));
+        assert!(!cfg.no_session);
         assert_eq!(
             cfg.args,
             vec![
                 "--mode",
                 "rpc",
-                "--no-session",
                 "--extension",
                 "/Users/alice/.verity/extensions/verity-providers.js",
             ]
         );
+        let ephemeral = cfg.with_no_session(true);
+        assert!(ephemeral.no_session);
+    }
+
+    #[test]
+    fn serializes_all_10_new_rpc_commands_with_exact_wire_types() {
+        let req_id = RequestId::parse("req-99").unwrap();
+        let new_cmds: Vec<(PiRpcCommand, &str)> = vec![
+            (
+                PiRpcCommand::Bash {
+                    command: "ls -la".to_string(),
+                },
+                "bash",
+            ),
+            (PiRpcCommand::AbortBash, "abort_bash"),
+            (
+                PiRpcCommand::SetAutoCompaction { enabled: true },
+                "set_auto_compaction",
+            ),
+            (
+                PiRpcCommand::SetAutoRetry { enabled: false },
+                "set_auto_retry",
+            ),
+            (
+                PiRpcCommand::SetSteeringMode {
+                    mode: "one-at-a-time".to_string(),
+                },
+                "set_steering_mode",
+            ),
+            (
+                PiRpcCommand::SetFollowUpMode {
+                    mode: "all".to_string(),
+                },
+                "set_follow_up_mode",
+            ),
+            (PiRpcCommand::CycleModel, "cycle_model"),
+            (PiRpcCommand::CycleThinkingLevel, "cycle_thinking_level"),
+            (
+                PiRpcCommand::GetLastAssistantText,
+                "get_last_assistant_text",
+            ),
+            (PiRpcCommand::GetEntries, "get_entries"),
+        ];
+
+        assert_eq!(new_cmds.len(), 10);
+        for (cmd, expected_type) in new_cmds {
+            assert_eq!(cmd.command_type(), expected_type);
+            let parsed = parse_json(&cmd.to_jsonl(&req_id)).expect("valid jsonl");
+            assert_eq!(
+                parsed.get("type").and_then(JsonValue::as_str),
+                Some(expected_type)
+            );
+            assert_eq!(
+                parsed.get("id").and_then(JsonValue::as_str),
+                Some("req-99")
+            );
+        }
+
+        let bash_json = parse_json(
+            &PiRpcCommand::Bash {
+                command: "echo hi".to_string(),
+            }
+            .to_jsonl(&req_id),
+        )
+        .unwrap();
+        assert_eq!(
+            bash_json.get("command").and_then(JsonValue::as_str),
+            Some("echo hi")
+        );
+
+        let compact_json =
+            parse_json(&PiRpcCommand::SetAutoCompaction { enabled: true }.to_jsonl(&req_id))
+                .unwrap();
+        assert_eq!(
+            compact_json.get("enabled").and_then(JsonValue::as_bool),
+            Some(true)
+        );
+
+        let steer_mode_json = parse_json(
+            &PiRpcCommand::SetSteeringMode {
+                mode: "one-at-a-time".to_string(),
+            }
+            .to_jsonl(&req_id),
+        )
+        .unwrap();
+        assert_eq!(
+            steer_mode_json.get("mode").and_then(JsonValue::as_str),
+            Some("one-at-a-time")
+        );
+    }
+
+    #[test]
+    fn parses_all_newly_forwarded_rpc_events_and_extension_ui_effects() {
+        let cases = [
+            (
+                r#"{"type":"tool_execution_update","toolCallId":"tc1","toolName":"bash","partialResult":"line 1"}"#,
+                "tool_execution_update",
+            ),
+            (
+                r#"{"type":"compaction_start","reason":"threshold"}"#,
+                "compaction_start",
+            ),
+            (
+                r#"{"type":"compaction_end","result":"summarized","aborted":false,"willRetry":false}"#,
+                "compaction_end",
+            ),
+            (
+                r#"{"type":"bash_execution_update","command":"cargo test","output":"ok","isError":false}"#,
+                "bash_execution_update",
+            ),
+            (
+                r#"{"type":"session_info_changed","name":"Sprint 4","sessionId":"s-42"}"#,
+                "session_info_changed",
+            ),
+            (
+                r#"{"type":"thinking_level_changed","level":"high"}"#,
+                "thinking_level_changed",
+            ),
+            (r#"{"type":"turn_start"}"#, "turn_start"),
+            (r#"{"type":"turn_end"}"#, "turn_end"),
+            (r#"{"type":"agent_start"}"#, "agent_start"),
+            (
+                r#"{"type":"extension_ui_request","id":"fx-1","method":"notify","message":"Done","notifyType":"info"}"#,
+                "extension_ui_effect",
+            ),
+            (
+                r#"{"type":"extension_ui_request","id":"fx-2","method":"setStatus","statusKey":"branch","statusText":"main"}"#,
+                "extension_ui_effect",
+            ),
+            (
+                r#"{"type":"extension_ui_request","id":"fx-3","method":"setWidget","widgetKey":"ci","widgetLines":["green"]}"#,
+                "extension_ui_effect",
+            ),
+            (
+                r#"{"type":"extension_ui_request","id":"fx-4","method":"setTitle","title":"Verity"}"#,
+                "extension_ui_effect",
+            ),
+            (
+                r#"{"type":"extension_ui_request","id":"fx-5","method":"set_editor_text","text":"/help"}"#,
+                "extension_ui_effect",
+            ),
+        ];
+
+        for (raw, expected_tag) in cases {
+            let val = parse_json(raw).unwrap();
+            let ev = parse_pi_ui_event(&val, raw).expect("must parse forwarded event");
+            let serialized = serde_json::to_value(&ev).expect("must serialize PiUiEvent");
+            assert_eq!(
+                serialized.get("type").and_then(|v| v.as_str()),
+                Some(expected_tag),
+                "unexpected serialized tag for {}",
+                raw
+            );
+        }
     }
 }
