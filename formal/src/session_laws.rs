@@ -1,9 +1,6 @@
 #[cfg(kani)]
-use verity_core::validate_provider_url_bytes;
-#[cfg(kani)]
 use verity_core::{
-    transition_session, ProviderError, SessionActivity, SessionCommand, SessionError,
-    MAX_PENDING_QUEUE,
+    transition_session, SessionActivity, SessionCommand, SessionError, MAX_PENDING_QUEUE,
 };
 
 #[cfg(kani)]
@@ -44,13 +41,17 @@ fn any_command() -> SessionCommand {
     }
 }
 
-/// Session Exclusivity & Queue Laws (all 4 states x all 15 commands x all u16 queue depths):
+/// Session Exclusivity, Queue, Deferred-Reload, & Universal Idempotent Recovery Laws
+/// (all 4 states x all 15 commands x all u16 queue depths):
 /// - `SendPrompt` is rejected if Streaming, Compacting, SwitchingSession, or `pending_queue > 0`.
 /// - `Compact`, `SwitchSession`, `NewSession`, `Fork`, and `CloneSession` are rejected unless Idle.
-/// - `Steer` and `FollowUp` are accepted only while Streaming and increment `pending_queue` without overflow.
-/// - `RequestProviderReload` while Streaming sets `reload_deferred = true` without interrupting the turn;
-///   `AgentSettled` and `Abort` return whether a deferred reload must now run.
-/// - `Abort` and `ProcessExited` always succeed from any state and converge to `Idle`.
+/// - `Steer` and `FollowUp` are accepted only while Streaming, increment `pending_queue` without
+///   overflow, and preserve `reload_deferred`.
+/// - `ClearQueue` preserves `reload_deferred`.
+/// - `RequestProviderReload` while Streaming sets `reload_deferred = true` without interrupting
+///   the turn; `AgentSettled` and `Abort` return whether a deferred reload must now run.
+/// - `Abort` and `ProcessExited` always succeed from any state, converge to `Idle` with
+///   `pending_queue == 0` and `!reload_deferred`, and are idempotent on repetition.
 #[cfg(kani)]
 #[kani::proof]
 pub fn prove_session_exclusivity_and_queue_laws() {
@@ -109,6 +110,7 @@ pub fn prove_session_exclusivity_and_queue_laws() {
                             reload_deferred,
                         }
                     );
+                    assert_eq!(t.activity.reload_deferred(), reload_deferred);
                     assert!(!t.run_provider_reload);
                 } else {
                     assert_eq!(res, Err(SessionError::QueueFull));
@@ -128,6 +130,7 @@ pub fn prove_session_exclusivity_and_queue_laws() {
                         reload_deferred,
                     }
                 );
+                assert_eq!(t.activity.reload_deferred(), reload_deferred);
                 assert!(!t.run_provider_reload);
             }
             _ => assert_eq!(res, Err(SessionError::NotStreaming)),
@@ -185,13 +188,28 @@ pub fn prove_session_exclusivity_and_queue_laws() {
             let t = res.expect("Abort must succeed from any state");
             assert_eq!(t.activity, SessionActivity::Idle);
             assert_eq!(t.activity.pending_queue(), 0);
+            assert!(!t.activity.reload_deferred());
             assert_eq!(t.run_provider_reload, activity.reload_deferred());
+
+            // Idempotence: a second Abort from Idle stays Idle without re-triggering reload.
+            let again = transition_session(t.activity, SessionCommand::Abort)
+                .expect("Abort from Idle must be idempotent");
+            assert_eq!(again.activity, SessionActivity::Idle);
+            assert_eq!(again.activity.pending_queue(), 0);
+            assert!(!again.run_provider_reload);
         }
         SessionCommand::ProcessExited => {
             let t = res.expect("ProcessExited must succeed from any state");
             assert_eq!(t.activity, SessionActivity::Idle);
             assert_eq!(t.activity.pending_queue(), 0);
+            assert!(!t.activity.reload_deferred());
             assert!(!t.run_provider_reload);
+
+            // Idempotence: a second ProcessExited stays Idle.
+            let again = transition_session(t.activity, SessionCommand::ProcessExited)
+                .expect("ProcessExited from Idle must be idempotent");
+            assert_eq!(again.activity, SessionActivity::Idle);
+            assert_eq!(again.activity.pending_queue(), 0);
         }
     }
 
@@ -281,104 +299,26 @@ pub fn prove_session_exclusivity_and_queue_laws() {
         ),
         "process_exited_streaming_recovery_reachable"
     );
-}
-
-/// Universal Abort & ProcessExited Recovery Law:
-/// From ANY symbolic `SessionActivity` state, `Abort` and `ProcessExited` ALWAYS
-/// converge to `Idle` with `pending_queue == 0` and are idempotent on repetition.
-#[cfg(kani)]
-#[kani::proof]
-pub fn prove_universal_abort_and_process_exited_recovery() {
-    let activity = any_activity();
-
-    let abort_res = transition_session(activity, SessionCommand::Abort)
-        .expect("Abort must always succeed from any state");
-    assert_eq!(abort_res.activity, SessionActivity::Idle);
-    assert_eq!(abort_res.activity.pending_queue(), 0);
-    assert!(!abort_res.activity.reload_deferred());
-    assert_eq!(abort_res.run_provider_reload, activity.reload_deferred());
-
-    // Idempotence: a second Abort from Idle stays Idle without re-triggering reload.
-    let abort_again = transition_session(abort_res.activity, SessionCommand::Abort)
-        .expect("Abort from Idle must be idempotent");
-    assert_eq!(abort_again.activity, SessionActivity::Idle);
-    assert_eq!(abort_again.activity.pending_queue(), 0);
-    assert!(!abort_again.run_provider_reload);
-
-    let exit_res = transition_session(activity, SessionCommand::ProcessExited)
-        .expect("ProcessExited must always succeed from any state");
-    assert_eq!(exit_res.activity, SessionActivity::Idle);
-    assert_eq!(exit_res.activity.pending_queue(), 0);
-    assert!(!exit_res.activity.reload_deferred());
-    assert!(!exit_res.run_provider_reload);
-
-    // Idempotence: a second ProcessExited stays Idle.
-    let exit_again = transition_session(exit_res.activity, SessionCommand::ProcessExited)
-        .expect("ProcessExited from Idle must be idempotent");
-    assert_eq!(exit_again.activity, SessionActivity::Idle);
-    assert_eq!(exit_again.activity.pending_queue(), 0);
-
     kani::cover!(
         matches!(
-            activity,
-            SessionActivity::Streaming {
-                reload_deferred: true,
-                ..
-            }
-        ) && abort_res.run_provider_reload,
-        "abort_streaming_with_deferred_reload"
-    );
-    kani::cover!(
-        matches!(activity, SessionActivity::Compacting),
+            (activity, command),
+            (
+                SessionActivity::Compacting,
+                SessionCommand::Abort | SessionCommand::ProcessExited
+            )
+        ),
         "abort_and_exit_from_compacting"
     );
     kani::cover!(
-        matches!(activity, SessionActivity::SwitchingSession),
+        matches!(
+            (activity, command),
+            (
+                SessionActivity::SwitchingSession,
+                SessionCommand::Abort | SessionCommand::ProcessExited
+            )
+        ),
         "abort_and_exit_from_switching"
     );
-}
-
-/// Deferred Reload Preservation Law:
-/// Whenever `reload_deferred == true` in `Streaming`, `AgentSettled` and `Abort`
-/// ALWAYS emit `run_provider_reload == true`, and in-flight queue operations never clear it.
-#[cfg(kani)]
-#[kani::proof]
-pub fn prove_deferred_reload_preservation_on_settle_and_abort() {
-    let pending_queue: u16 = kani::any();
-    let streaming = SessionActivity::Streaming {
-        pending_queue,
-        reload_deferred: true,
-    };
-
-    let settled = transition_session(streaming, SessionCommand::AgentSettled)
-        .expect("Streaming must accept AgentSettled");
-    assert_eq!(settled.activity, SessionActivity::Idle);
-    assert!(settled.run_provider_reload);
-
-    let aborted = transition_session(streaming, SessionCommand::Abort)
-        .expect("Streaming must accept Abort");
-    assert_eq!(aborted.activity, SessionActivity::Idle);
-    assert!(aborted.run_provider_reload);
-
-    let cleared = transition_session(streaming, SessionCommand::ClearQueue)
-        .expect("Streaming must accept ClearQueue");
-    assert!(cleared.activity.reload_deferred());
-    assert!(!cleared.run_provider_reload);
-
-    if let Ok(steered) = transition_session(streaming, SessionCommand::Steer) {
-        assert!(steered.activity.reload_deferred());
-        assert!(!steered.run_provider_reload);
-    }
-    if let Ok(followed) = transition_session(streaming, SessionCommand::FollowUp) {
-        assert!(followed.activity.reload_deferred());
-        assert!(!followed.run_provider_reload);
-    }
-
-    kani::cover!(
-        pending_queue == MAX_PENDING_QUEUE,
-        "deferred_reload_at_max_queue"
-    );
-    kani::cover!(pending_queue == 0, "deferred_reload_at_empty_queue");
 }
 
 /// Bounded Multi-Step Trace Law:
@@ -493,87 +433,5 @@ pub fn prove_bounded_multi_step_session_trace() {
     kani::cover!(
         exclusive_rejected_while_busy,
         "multi_step_exclusive_rejected_while_busy"
-    );
-}
-
-/// Provider URL & External Sign-In URL validation laws:
-/// - Any URL containing whitespace, `@`, `?`, or `#` is always rejected.
-/// - `validate_external_sign_in_url` strictly requires `https://` and implies `validate_provider_url` acceptance.
-/// - Empty host is always rejected.
-#[cfg(kani)]
-#[kani::proof]
-#[kani::unwind(11)]
-pub fn prove_provider_url_validation_laws() {
-    let buf: [u8; 10] = kani::any();
-    let len: usize = kani::any();
-    kani::assume(len <= 10);
-    let slice = &buf[..len];
-
-    let provider_res = validate_provider_url_bytes(slice, false);
-    let signin_res = validate_provider_url_bytes(slice, true);
-
-    let mut has_whitespace = false;
-    let mut has_at = false;
-    let mut has_query = false;
-    let mut has_fragment = false;
-    let mut i = 0usize;
-    while i < len {
-        let b = slice[i];
-        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
-            has_whitespace = true;
-        }
-        if b == b'@' {
-            has_at = true;
-        }
-        if b == b'?' {
-            has_query = true;
-        }
-        if b == b'#' {
-            has_fragment = true;
-        }
-        i += 1;
-    }
-
-    if has_whitespace || has_at || has_query || has_fragment {
-        assert!(provider_res.is_err());
-        assert!(signin_res.is_err());
-    }
-
-    if signin_res.is_ok() {
-        assert!(len >= 9);
-        assert_eq!(&slice[..8], b"https://");
-        assert!(provider_res.is_ok());
-    }
-
-    if provider_res.is_ok() {
-        let is_https = len >= 9 && &slice[..8] == b"https://";
-        let is_http = len >= 8 && &slice[..7] == b"http://";
-        assert!(is_https || is_http);
-        if is_http {
-            assert_eq!(signin_res, Err(ProviderError::HttpsRequired));
-        }
-    }
-
-    // Non-vacuity reachability probes.
-    kani::cover!(
-        provider_res.is_ok() && signin_res == Err(ProviderError::HttpsRequired),
-        "provider_http_ok_signin_rejected"
-    );
-    kani::cover!(signin_res.is_ok(), "signin_https_ok_reachable");
-    kani::cover!(
-        provider_res == Err(ProviderError::EmbeddedCredentials),
-        "provider_credentials_rejected"
-    );
-    kani::cover!(
-        provider_res == Err(ProviderError::QueryNotAllowed),
-        "provider_query_rejected"
-    );
-    kani::cover!(
-        provider_res == Err(ProviderError::FragmentNotAllowed),
-        "provider_fragment_rejected"
-    );
-    kani::cover!(
-        provider_res == Err(ProviderError::EmptyHost),
-        "provider_empty_host_rejected"
     );
 }

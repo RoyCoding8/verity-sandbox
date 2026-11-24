@@ -730,3 +730,320 @@ pub fn prove_extended_pi_rpc_command_framing_laws() {
         "frame_cmd_get_entries"
     );
 }
+
+// ============================================================================
+// Proof B — Session Archive, Delete & Project-Grouping Partition Laws
+// ============================================================================
+
+/// Bounded number of projects in the session-grouping workspace model (`P <= 2`).
+pub const MAX_WORKSPACE_PROJECTS: usize = 2;
+
+/// Bounded number of sessions in the session-grouping workspace model (`S <= 4`).
+pub const MAX_WORKSPACE_SESSIONS: usize = 4;
+
+/// Single session tagged with its owning `project_id` and `archived` state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceSession {
+    pub project_id: u8,
+    pub archived: bool,
+}
+
+/// Bucket of session indices belonging to a single project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectBucket {
+    pub session_indices: [usize; MAX_WORKSPACE_SESSIONS],
+    pub len: usize,
+}
+
+impl ProjectBucket {
+    pub const fn empty() -> Self {
+        Self {
+            session_indices: [0; MAX_WORKSPACE_SESSIONS],
+            len: 0,
+        }
+    }
+}
+
+/// Bounded workspace of `P <= 2` projects and `S <= 4` sessions with active selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionWorkspace {
+    pub project_count: usize,
+    pub sessions: [WorkspaceSession; MAX_WORKSPACE_SESSIONS],
+    pub len: usize,
+    pub active_session: Option<usize>,
+}
+
+impl SessionWorkspace {
+    /// Returns whether session `idx` is visible under the `show_archived` filter.
+    pub fn is_visible(&self, idx: usize, show_archived: bool) -> bool {
+        idx < self.len && (show_archived || !self.sessions[idx].archived)
+    }
+
+    /// Archives session `idx` without deleting it.
+    pub fn archive(&mut self, idx: usize) -> bool {
+        if idx >= self.len {
+            return false;
+        }
+        self.sessions[idx].archived = true;
+        true
+    }
+
+    /// Unarchives session `idx`.
+    pub fn unarchive(&mut self, idx: usize) -> bool {
+        if idx >= self.len {
+            return false;
+        }
+        self.sessions[idx].archived = false;
+        true
+    }
+
+    /// Deletes session `idx` and maintains a safe non-dangling `active_session`.
+    ///
+    /// If `idx` was the active session, falls back to the first remaining
+    /// non-archived session in the same project if one exists, or `None` if none remain.
+    pub fn delete(&mut self, idx: usize) -> bool {
+        if idx >= self.len {
+            return false;
+        }
+        let deleted_project = self.sessions[idx].project_id;
+        let was_active = self.active_session == Some(idx);
+
+        let mut i = idx;
+        while i + 1 < self.len {
+            self.sessions[i] = self.sessions[i + 1];
+            i += 1;
+        }
+        self.len -= 1;
+        self.sessions[self.len] = WorkspaceSession {
+            project_id: 0,
+            archived: false,
+        };
+
+        if was_active {
+            let mut fallback = None;
+            let mut k = 0usize;
+            while k < self.len {
+                if self.sessions[k].project_id == deleted_project && !self.sessions[k].archived {
+                    fallback = Some(k);
+                    break;
+                }
+                k += 1;
+            }
+            self.active_session = fallback;
+        } else if let Some(a) = self.active_session {
+            if a > idx {
+                self.active_session = Some(a - 1);
+            }
+        }
+        true
+    }
+
+    /// Partitions all sessions into per-project buckets.
+    pub fn group_by_project(&self) -> [ProjectBucket; MAX_WORKSPACE_PROJECTS] {
+        let mut buckets = [ProjectBucket::empty(); MAX_WORKSPACE_PROJECTS];
+        let mut i = 0usize;
+        while i < self.len {
+            let p = self.sessions[i].project_id as usize;
+            if p < MAX_WORKSPACE_PROJECTS {
+                let slot = buckets[p].len;
+                buckets[p].session_indices[slot] = i;
+                buckets[p].len += 1;
+            }
+            i += 1;
+        }
+        buckets
+    }
+}
+
+/// Harness 4 — Session Archive, Delete & Project-Grouping Partition Laws.
+///
+/// Proves on a bounded workspace (`P <= 2` projects, `S <= 4` sessions) over
+/// symbolic `archive`, `unarchive`, `delete`, and `group_by_project` operations:
+/// 1. Disjoint Project Partition: sum of bucket counts equals total sessions,
+///    and every session in bucket `p` has `session.project_id == p`.
+/// 2. Archive Reversibility: `archive(id)` never deletes the session, excludes
+///    it from default active view (`show_archived == false`), and
+///    `unarchive(archive(id))` restores exact original state.
+/// 3. Safe Active-Session Fallback on Delete: deleting the active session always
+///    falls back to a valid non-archived session in the same project if one
+///    exists, or `None` if none remain — never leaving a dangling `active_session`.
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(6)]
+pub fn prove_session_archive_delete_and_project_grouping_laws() {
+    let project_count: usize = kani::any();
+    kani::assume(project_count >= 1 && project_count <= MAX_WORKSPACE_PROJECTS);
+
+    let init_len: usize = kani::any();
+    kani::assume(init_len <= MAX_WORKSPACE_SESSIONS);
+
+    let mut sessions = [WorkspaceSession {
+        project_id: 0,
+        archived: false,
+    }; MAX_WORKSPACE_SESSIONS];
+    let mut i = 0usize;
+    while i < init_len {
+        let project_id: u8 = kani::any();
+        kani::assume((project_id as usize) < project_count);
+        sessions[i] = WorkspaceSession {
+            project_id,
+            archived: kani::any(),
+        };
+        i += 1;
+    }
+
+    let has_active: bool = kani::any();
+    let active_session = if has_active && init_len > 0 {
+        let a: usize = kani::any();
+        kani::assume(a < init_len);
+        Some(a)
+    } else {
+        None
+    };
+
+    let mut ws = SessionWorkspace {
+        project_count,
+        sessions,
+        len: init_len,
+        active_session,
+    };
+
+    let mut saw_two_project_partition = false;
+    let mut saw_archive_round_trip = false;
+    let mut saw_delete_active_same_project_fallback = false;
+    let mut saw_delete_active_none_fallback = false;
+
+    for _ in 0..3 {
+        // Law 1: Disjoint Project Partition holds before every operation.
+        let buckets = ws.group_by_project();
+        let mut total_bucketed = 0usize;
+        let mut p = 0usize;
+        while p < MAX_WORKSPACE_PROJECTS {
+            total_bucketed += buckets[p].len;
+            let mut k = 0usize;
+            while k < buckets[p].len {
+                let s_idx = buckets[p].session_indices[k];
+                assert!(s_idx < ws.len, "bucketed session index must be in bounds");
+                assert_eq!(
+                    ws.sessions[s_idx].project_id as usize, p,
+                    "every session in bucket p must have project_id == p"
+                );
+                k += 1;
+            }
+            p += 1;
+        }
+        assert_eq!(
+            total_bucketed, ws.len,
+            "sum of session counts across project buckets must equal total sessions"
+        );
+        if buckets[0].len > 0 && buckets[1].len > 0 {
+            saw_two_project_partition = true;
+        }
+
+        let op: u8 = kani::any();
+        kani::assume(op <= 2);
+        let target: usize = kani::any();
+        kani::assume(target <= MAX_WORKSPACE_SESSIONS);
+
+        let before = ws;
+        match op {
+            0 => {
+                // archive + Law 2: Archive Reversibility.
+                let ok = ws.archive(target);
+                if target < before.len {
+                    assert!(ok);
+                    assert_eq!(ws.len, before.len, "archive must never delete a session");
+                    assert!(
+                        !ws.is_visible(target, false),
+                        "archived session must be excluded from default active view"
+                    );
+                    assert!(
+                        ws.is_visible(target, true),
+                        "archived session must remain visible when show_archived == true"
+                    );
+                    if !before.sessions[target].archived {
+                        let mut restored = ws;
+                        assert!(restored.unarchive(target));
+                        assert_eq!(
+                            restored, before,
+                            "unarchive(archive(id)) must restore exact original state"
+                        );
+                        saw_archive_round_trip = true;
+                    }
+                } else {
+                    assert!(!ok);
+                    assert_eq!(ws, before);
+                }
+            }
+            1 => {
+                // unarchive
+                let ok = ws.unarchive(target);
+                if target < before.len {
+                    assert!(ok);
+                    assert_eq!(ws.len, before.len);
+                    assert!(ws.is_visible(target, false));
+                } else {
+                    assert!(!ok);
+                    assert_eq!(ws, before);
+                }
+            }
+            _ => {
+                // delete + Law 3: Safe Active-Session Fallback on Delete.
+                let ok = ws.delete(target);
+                if target < before.len {
+                    assert!(ok);
+                    assert_eq!(ws.len, before.len - 1);
+
+                    // Active session index must NEVER dangle.
+                    if let Some(a) = ws.active_session {
+                        assert!(a < ws.len, "active_session must never dangle after delete");
+                    }
+
+                    if before.active_session == Some(target) {
+                        let deleted_project = before.sessions[target].project_id;
+                        let mut has_remaining_active_in_project = false;
+                        let mut r = 0usize;
+                        while r < ws.len {
+                            if ws.sessions[r].project_id == deleted_project
+                                && !ws.sessions[r].archived
+                            {
+                                has_remaining_active_in_project = true;
+                            }
+                            r += 1;
+                        }
+
+                        if has_remaining_active_in_project {
+                            let fallback = ws.active_session.expect(
+                                "deleting active session must fall back when non-archived peer exists",
+                            );
+                            assert!(fallback < ws.len);
+                            assert_eq!(ws.sessions[fallback].project_id, deleted_project);
+                            assert!(!ws.sessions[fallback].archived);
+                            saw_delete_active_same_project_fallback = true;
+                        } else {
+                            assert_eq!(
+                                ws.active_session, None,
+                                "deleting active session must yield None when no non-archived peer remains"
+                            );
+                            saw_delete_active_none_fallback = true;
+                        }
+                    }
+                } else {
+                    assert!(!ok);
+                    assert_eq!(ws, before);
+                }
+            }
+        }
+    }
+
+    kani::cover!(saw_two_project_partition, "partition_across_two_projects");
+    kani::cover!(saw_archive_round_trip, "archive_unarchive_round_trip");
+    kani::cover!(
+        saw_delete_active_same_project_fallback,
+        "delete_active_falls_back_same_project"
+    );
+    kani::cover!(
+        saw_delete_active_none_fallback,
+        "delete_active_falls_back_to_none"
+    );
+}
