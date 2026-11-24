@@ -1,10 +1,13 @@
 import {
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
   type KeyboardEvent,
 } from "react";
 import type {
@@ -100,14 +103,18 @@ function formatThinkingLevel(level: ThinkingLevel): string {
 interface CompletionMatch {
   readonly trigger: "/" | "$";
   readonly triggerStart: number;
+  readonly triggerEnd: number;
   readonly items: readonly SlashOrSkillCommand[];
 }
 
 function resolveCompletions(
   draft: string,
+  caretPos: number,
   commands: readonly SlashOrSkillCommand[]
 ): CompletionMatch | null {
-  const tokenMatch = /(^|\s)([/$][^\s]*)$/.exec(draft);
+  const clampedCaret = Math.max(0, Math.min(caretPos, draft.length));
+  const beforeCaret = draft.slice(0, clampedCaret);
+  const tokenMatch = /(^|\s)([/$][^\s]*)$/.exec(beforeCaret);
   if (!tokenMatch) return null;
   const rawToken = tokenMatch[2];
   const trigger = rawToken[0];
@@ -120,8 +127,29 @@ function resolveCompletions(
         cmd.description.toLowerCase().includes(query.slice(1)))
   );
   if (items.length === 0) return null;
-  const triggerStart = draft.length - rawToken.length;
-  return { trigger, triggerStart, items };
+  if (
+    items.length === 1 &&
+    items[0].name.toLowerCase() === query &&
+    items[0].insertText === items[0].name
+  ) {
+    return null;
+  }
+  const triggerStart = beforeCaret.length - rawToken.length;
+  return { trigger, triggerStart, triggerEnd: clampedCaret, items };
+}
+
+function resolveAttachmentFilename(
+  file: File,
+  mimeType: PendingAttachment["mime_type"],
+  index: number
+): string {
+  const trimmed = file.name.trim();
+  if (trimmed.length > 0) {
+    return trimmed;
+  }
+  const ext = mimeType.slice("image/".length);
+  const suffix = index > 0 ? `-${index + 1}` : "";
+  return `pasted-image-${Date.now()}${suffix}.${ext}`;
 }
 
 export function Composer({
@@ -148,21 +176,32 @@ export function Composer({
   onClearQueue,
   onAbort,
 }: ComposerProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const completionListRef = useRef<HTMLDivElement | null>(null);
+  const activeReadersRef = useRef<Set<FileReader>>(new Set());
+  const isMountedRef = useRef(true);
+  const lastTextareaWidthRef = useRef<number>(-1);
+  const pendingCaretRef = useRef<number | null>(null);
+
+  const [caretPos, setCaretPos] = useState(draft.length);
   const [selectedCompletionIdx, setSelectedCompletionIdx] = useState(0);
   const [completionDismissed, setCompletionDismissed] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
 
   const completion = useMemo(() => {
     if (completionDismissed) return null;
-    return resolveCompletions(draft, commands);
-  }, [draft, commands, completionDismissed]);
+    return resolveCompletions(draft, caretPos, commands);
+  }, [draft, caretPos, commands, completionDismissed]);
 
   const activeCompletionIdx = completion
     ? Math.min(selectedCompletionIdx, completion.items.length - 1)
     : 0;
+
+  const canSubmit = draft.trim().length > 0 || attachments.length > 0;
+  const selectedModelKey = modelOptionKey(selectedModel);
 
   const effectiveModels = useMemo<readonly ModelOption[]>(() => {
     const byKey = new Map<string, ModelOption>();
@@ -213,14 +252,57 @@ export function Composer({
     [effectiveThinkingLevels]
   );
 
-  useLayoutEffect(() => {
+  const syncTextareaHeight = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
     const nextHeight = Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT_PX);
     el.style.height = `${nextHeight}px`;
     el.style.overflowY = el.scrollHeight > MAX_TEXTAREA_HEIGHT_PX ? "auto" : "hidden";
-  }, [draft]);
+  }, []);
+
+  useLayoutEffect(() => {
+    syncTextareaHeight();
+    if (pendingCaretRef.current !== null && textareaRef.current) {
+      const pos = Math.min(pendingCaretRef.current, draft.length);
+      pendingCaretRef.current = null;
+      textareaRef.current.setSelectionRange(pos, pos);
+    }
+  }, [draft, syncTextareaHeight]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const width = entry.contentRect.width;
+      if (width !== lastTextareaWidthRef.current) {
+        lastTextareaWidthRef.current = width;
+        syncTextareaHeight();
+      }
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+    };
+  }, [syncTextareaHeight]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    const readers = activeReadersRef.current;
+    return () => {
+      isMountedRef.current = false;
+      for (const reader of readers) {
+        if (reader.readyState === FileReader.LOADING) {
+          reader.abort();
+        }
+      }
+      readers.clear();
+    };
+  }, []);
 
   useEffect(() => {
     if (!completion || !completionListRef.current) return;
@@ -230,15 +312,148 @@ export function Composer({
     }
   }, [completion, activeCompletionIdx]);
 
+  useEffect(() => {
+    if (!completion) {
+      return;
+    }
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (
+        containerRef.current &&
+        target instanceof Node &&
+        !containerRef.current.contains(target)
+      ) {
+        setCompletionDismissed(true);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, [completion]);
+
+  useEffect(() => {
+    if (!isStreaming) {
+      return;
+    }
+    const handleWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) {
+        return;
+      }
+      if (event.isComposing || event.keyCode === 229) {
+        return;
+      }
+      if (completion) {
+        return;
+      }
+      if (
+        document.querySelector(
+          ".md3-scrim, .md3-select-menu, .pi-completion-popover"
+        )
+      ) {
+        return;
+      }
+      event.preventDefault();
+      onAbort();
+    };
+    window.addEventListener("keydown", handleWindowKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleWindowKeyDown);
+    };
+  }, [completion, isStreaming, onAbort]);
+
+  const processImageFiles = useCallback(
+    (files: readonly File[]) => {
+      if (files.length === 0) return;
+
+      let firstError: string | null = null;
+      const validFiles: Array<{
+        readonly file: File;
+        readonly mimeType: PendingAttachment["mime_type"];
+        readonly filename: string;
+      }> = [];
+
+      files.forEach((file, index) => {
+        const rawMime = file.type;
+        if (!isAllowedMime(rawMime)) {
+          firstError ??= "Only PNG, JPEG, WebP, and GIF images are supported.";
+          return;
+        }
+        if (file.size === 0) {
+          firstError ??= `Image "${file.name || "clipboard"}" is empty.`;
+          return;
+        }
+        if (file.size > MAX_IMAGE_BYTES) {
+          firstError ??= "Image exceeds the 10 MiB attachment limit.";
+          return;
+        }
+        validFiles.push({
+          file,
+          mimeType: rawMime,
+          filename: resolveAttachmentFilename(file, rawMime, index),
+        });
+      });
+
+      setAttachError(firstError);
+
+      for (const { file, mimeType, filename } of validFiles) {
+        const reader = new FileReader();
+        activeReadersRef.current.add(reader);
+
+        reader.onload = () => {
+          activeReadersRef.current.delete(reader);
+          if (!isMountedRef.current) return;
+          const result = typeof reader.result === "string" ? reader.result : "";
+          const comma = result.indexOf(",");
+          const base64 = (comma >= 0 ? result.slice(comma + 1) : result).trim();
+          if (!base64) {
+            setAttachError(`Failed to read image "${filename}".`);
+            return;
+          }
+          onAddAttachment({
+            filename,
+            mime_type: mimeType,
+            base64_data: base64,
+            size_bytes: file.size,
+          });
+        };
+
+        reader.onerror = () => {
+          activeReadersRef.current.delete(reader);
+          if (!isMountedRef.current) return;
+          setAttachError(`Failed to read image "${filename}".`);
+        };
+
+        reader.onabort = () => {
+          activeReadersRef.current.delete(reader);
+        };
+
+        reader.readAsDataURL(file);
+      }
+    },
+    [onAddAttachment]
+  );
+
   function applyCompletion(cmd: SlashOrSkillCommand) {
     if (!completion) return;
-    const next = draft.slice(0, completion.triggerStart) + cmd.insertText;
-    onDraftChange(next);
+    const next =
+      draft.slice(0, completion.triggerStart) +
+      cmd.insertText +
+      draft.slice(completion.triggerEnd);
+    const nextCaret = completion.triggerStart + cmd.insertText.length;
+    pendingCaretRef.current = nextCaret;
+    setCaretPos(nextCaret);
+    setCompletionDismissed(true);
     setSelectedCompletionIdx(0);
+    onDraftChange(next);
     textareaRef.current?.focus();
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) {
+      return;
+    }
+
     if (completion) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -254,14 +469,22 @@ export function Composer({
       }
       if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
         e.preventDefault();
-        applyCompletion(completion.items[activeCompletionIdx]);
+        if (!e.repeat) {
+          applyCompletion(completion.items[activeCompletionIdx]);
+        }
         return;
       }
       if (e.key === "Escape") {
         e.preventDefault();
+        e.stopPropagation();
         setCompletionDismissed(true);
         return;
       }
+    } else if (e.key === "Escape" && isStreaming) {
+      e.preventDefault();
+      e.stopPropagation();
+      onAbort();
+      return;
     }
 
     const el = e.currentTarget;
@@ -282,48 +505,80 @@ export function Composer({
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      if (e.repeat) {
+        return;
+      }
       if (isStreaming) {
-        if (draft.trim()) onFollowUp();
-      } else {
+        if (canSubmit) {
+          if (e.ctrlKey || e.metaKey) {
+            onSteer();
+          } else {
+            onFollowUp();
+          }
+        }
+      } else if (canSubmit) {
         onSend();
       }
     }
   }
 
   function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
+    const files = e.target.files ? Array.from(e.target.files) : [];
     e.target.value = "";
-    if (!file) return;
-
-    const rawMime = file.type;
-    if (!isAllowedMime(rawMime)) {
-      setAttachError("Only PNG, JPEG, WebP, and GIF images are supported.");
-      return;
-    }
-    const mimeType = rawMime;
-    if (file.size > MAX_IMAGE_BYTES) {
-      setAttachError("Image exceeds the 10 MiB attachment limit.");
-      return;
-    }
-
-    setAttachError(null);
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = typeof reader.result === "string" ? reader.result : "";
-      const comma = result.indexOf(",");
-      const base64 = comma >= 0 ? result.slice(comma + 1) : result;
-      onAddAttachment({
-        filename: file.name,
-        mime_type: mimeType,
-        base64_data: base64,
-        size_bytes: file.size,
-      });
-    };
-    reader.readAsDataURL(file);
+    processImageFiles(files);
   }
 
-  const canSubmit = draft.trim().length > 0 || attachments.length > 0;
-  const selectedModelKey = modelOptionKey(selectedModel);
+  function handlePaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData?.items;
+    if (!items || items.length === 0) return;
+
+    const imageFiles: File[] = [];
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      if (item && item.kind === "file" && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          imageFiles.push(file);
+        }
+      }
+    }
+
+    if (imageFiles.length > 0) {
+      e.preventDefault();
+      processImageFiles(imageFiles);
+    }
+  }
+
+  function handleDragOver(e: DragEvent<HTMLDivElement>) {
+    if (!Array.from(e.dataTransfer.types).includes("Files")) {
+      return;
+    }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    if (!isDragOver) {
+      setIsDragOver(true);
+    }
+  }
+
+  function handleDragLeave(e: DragEvent<HTMLDivElement>) {
+    const related = e.relatedTarget;
+    if (related instanceof Node && e.currentTarget.contains(related)) {
+      return;
+    }
+    setIsDragOver(false);
+  }
+
+  function handleDrop(e: DragEvent<HTMLDivElement>) {
+    if (!Array.from(e.dataTransfer.types).includes("Files")) {
+      return;
+    }
+    e.preventDefault();
+    setIsDragOver(false);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length > 0) {
+      processImageFiles(files);
+    }
+  }
 
   return (
     <div
@@ -333,7 +588,13 @@ export function Composer({
           : "pi-composer-shell"
       }
     >
-      <div className="pi-composer-container">
+      <div
+        ref={containerRef}
+        className={`pi-composer-container${isDragOver ? " is-drag-over" : ""}`}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
         {completion && (
           <div
             className="pi-completion-popover"
@@ -405,8 +666,17 @@ export function Composer({
         )}
 
         {attachError && (
-          <div className="md3-error-banner" style={{ marginBottom: 8 }}>
-            {attachError}
+          <div className="md3-error-banner pi-composer-error" role="alert">
+            <span className="pi-composer-error-text">{attachError}</span>
+            <button
+              type="button"
+              className="pi-composer-error-dismiss"
+              aria-label="Dismiss attachment error"
+              title="Dismiss"
+              onClick={() => setAttachError(null)}
+            >
+              <CloseIcon size={12} />
+            </button>
           </div>
         )}
 
@@ -414,6 +684,7 @@ export function Composer({
           <input
             ref={fileInputRef}
             type="file"
+            multiple
             accept="image/png,image/jpeg,image/webp,image/gif"
             style={{ display: "none" }}
             onChange={handleFileChange}
@@ -434,16 +705,27 @@ export function Composer({
             aria-label="Ask Verity"
             placeholder={
               isStreaming
-                ? "Send a steering note or follow-up..."
+                ? "Follow-up (Enter) or steer (Ctrl+Enter)..."
                 : "Ask Verity or type / for commands"
             }
             value={draft}
             rows={1}
             onChange={(e) => {
+              setCaretPos(e.target.selectionStart ?? e.target.value.length);
               setCompletionDismissed(false);
               setSelectedCompletionIdx(0);
               onDraftChange(e.target.value);
             }}
+            onSelect={(e) => {
+              setCaretPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
+            }}
+            onClick={(e) => {
+              setCaretPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
+            }}
+            onKeyUp={(e) => {
+              setCaretPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
+            }}
+            onPaste={handlePaste}
             onKeyDown={handleKeyDown}
           />
 
@@ -501,24 +783,30 @@ export function Composer({
                 <button
                   type="button"
                   className="pi-composer-stream-pill"
-                  disabled={!draft.trim()}
+                  disabled={!canSubmit}
+                  title="Steer current turn (Ctrl+Enter)"
+                  aria-label="Steer current turn (Ctrl+Enter)"
                   onClick={onSteer}
                 >
-                  Steer
+                  <span>Steer</span>
+                  <kbd className="pi-composer-kbd">Ctrl+↵</kbd>
                 </button>
                 <button
                   type="button"
                   className="pi-composer-stream-pill"
-                  disabled={!draft.trim()}
+                  disabled={!canSubmit}
+                  title="Queue follow-up (Enter)"
+                  aria-label="Queue follow-up (Enter)"
                   onClick={onFollowUp}
                 >
-                  Follow-up
+                  <span>Follow-up</span>
+                  <kbd className="pi-composer-kbd">↵</kbd>
                 </button>
                 <button
                   type="button"
                   className="pi-composer-stop-circle"
-                  title="Stop generation"
-                  aria-label="Stop generation"
+                  title="Stop (Esc)"
+                  aria-label="Stop generation (Esc)"
                   onClick={onAbort}
                 >
                   <StopIcon size={14} />
