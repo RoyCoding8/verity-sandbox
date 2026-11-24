@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ForkCandidate } from "../api/tauri";
-import { ClockIcon, CloseIcon, GitForkIcon, SearchIcon } from "./Icons";
+import {
+  AlertIcon,
+  ClockIcon,
+  CloseIcon,
+  GitForkIcon,
+  SearchIcon,
+} from "./Icons";
 import "./ModalsOverlay.css";
 
 export interface ForkModalProps {
   readonly open: boolean;
   readonly candidates: readonly ForkCandidate[];
-  readonly onFork: (entryId: string) => void;
+  readonly onFork: (entryId: string) => void | Promise<void>;
   readonly onClose: () => void;
 }
 
@@ -17,13 +23,18 @@ export function ForkModal({
   onClose,
 }: ForkModalProps) {
   const [query, setQuery] = useState("");
+  const [forkingId, setForkingId] = useState<string | null>(null);
+  const [forkError, setForkError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) {
       setQuery("");
+      setForkingId(null);
+      setForkError(null);
       return;
     }
     function onKeyDown(e: KeyboardEvent) {
+      if (e.defaultPrevented) return;
       if (e.key === "Escape") onClose();
     }
     window.addEventListener("keydown", onKeyDown);
@@ -44,6 +55,19 @@ export function ForkModal({
   }, [candidates, trimmedQuery]);
 
   if (!open) return null;
+
+  async function handleFork(entryId: string) {
+    if (forkingId !== null) return;
+    setForkingId(entryId);
+    setForkError(null);
+    try {
+      await onFork(entryId);
+    } catch (err: unknown) {
+      setForkError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setForkingId(null);
+    }
+  }
 
   return (
     <div className="md3-scrim" onClick={onClose}>
@@ -80,6 +104,13 @@ export function ForkModal({
         </header>
 
         <div className="md3-dialog-body">
+          {forkError && (
+            <div className="md3-error-banner vo-error-banner" role="alert">
+              <AlertIcon size={15} className="vo-error-banner-icon" />
+              <span>{forkError}</span>
+            </div>
+          )}
+
           <div className="vo-search-row">
             <div className="vo-search-wrap">
               <span className="vo-search-icon" aria-hidden="true">
@@ -137,37 +168,41 @@ export function ForkModal({
             </div>
           ) : (
             <div className="pi-fork-list">
-              {filtered.map((candidate) => (
-                <div key={candidate.entryId} className="pi-fork-card">
-                  <div className="vo-fork-card-body">
-                    <div className="vo-meta-row">
-                      <span
-                        className={`verity-badge ${
-                          candidate.role === "user"
-                            ? "verity-badge--info"
-                            : "verity-badge--neutral"
-                        }`}
-                      >
-                        {candidate.role}
-                      </span>
-                      <code className="vo-entry-id">{candidate.entryId}</code>
-                      <span className="vo-timestamp">
-                        <ClockIcon size={12} />
-                        {candidate.timestamp}
-                      </span>
+              {filtered.map((candidate) => {
+                const isForkingCandidate = forkingId === candidate.entryId;
+                return (
+                  <div key={candidate.entryId} className="pi-fork-card">
+                    <div className="vo-fork-card-body">
+                      <div className="vo-meta-row">
+                        <span
+                          className={`verity-badge ${
+                            candidate.role === "user"
+                              ? "verity-badge--info"
+                              : "verity-badge--neutral"
+                          }`}
+                        >
+                          {candidate.role}
+                        </span>
+                        <code className="vo-entry-id">{candidate.entryId}</code>
+                        <span className="vo-timestamp">
+                          <ClockIcon size={12} />
+                          {candidate.timestamp}
+                        </span>
+                      </div>
+                      <div className="vo-preview-text">{candidate.preview}</div>
                     </div>
-                    <div className="vo-preview-text">{candidate.preview}</div>
+                    <button
+                      type="button"
+                      className="md3-btn-filled"
+                      disabled={forkingId !== null}
+                      onClick={() => void handleFork(candidate.entryId)}
+                    >
+                      <GitForkIcon size={14} />
+                      {isForkingCandidate ? "Forking..." : "Fork here"}
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    className="md3-btn-filled"
-                    onClick={() => onFork(candidate.entryId)}
-                  >
-                    <GitForkIcon size={14} />
-                    Fork here
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

@@ -14,6 +14,10 @@
   -webkit-backdrop-filter: blur(8px);
 }
 
+.md3-scrim.vo-ext-scrim {
+  z-index: 65;
+}
+
 .md3-dialog {
   background: var(--md-sys-color-surface-container);
   border-radius: 24px;
@@ -527,6 +531,40 @@
   font-size: var(--text-base);
   font-weight: 600;
   color: var(--md-sys-color-on-surface);
+}
+
+.vo-provider-signin-link {
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.vo-models-field {
+  grid-column: 1 / -1;
+}
+
+.vo-models-field-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vo-add-model-btn {
+  padding: 5px 12px;
+  font-size: var(--text-xs);
+}
+
+.vo-model-add-row,
+.vo-model-select-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vo-model-add-row .md3-input,
+.vo-model-select-wrap {
+  flex: 1;
+  min-width: 0;
 }
 
 .vo-checkbox-row {

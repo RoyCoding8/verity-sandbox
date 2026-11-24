@@ -1,7 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import "./md3-tokens.css";
 import "./components/AppShell.css";
-import { isTauriRuntime, tauriApi } from "./api/tauri";
+import {
+  isTauriRuntime,
+  tauriApi,
+  type ExtensionUiAnswer,
+} from "./api/tauri";
 import { ChatTranscript, STARTER_SUGGESTIONS } from "./components/ChatTranscript";
 import { Composer } from "./components/Composer";
 import { ExtensionUiLayer } from "./components/ExtensionUiLayer";
@@ -9,6 +13,7 @@ import { ForkModal } from "./components/ForkModal";
 import { HistoryTreeModal } from "./components/HistoryTreeModal";
 import {
   AlertIcon,
+  CloseIcon,
   GitMergeIcon,
   ShieldCheckIcon,
   TerminalIcon,
@@ -20,7 +25,6 @@ import { Sidebar } from "./components/Sidebar";
 import { SpecReviewDrawer } from "./components/SpecReviewDrawer";
 import { SubagentRail } from "./components/SubagentRail";
 import { usePiWorkspace } from "./state/piStore";
-import { applyMd3Theme } from "./theme/md3";
 import type {
   HandoffView,
   VerdictStatus,
@@ -51,22 +55,35 @@ export function App() {
   const [mergeEntries, setMergeEntries] = useState<MergeQueueEntry[]>([]);
   const [rawLogLines, setRawLogLines] = useState<string[]>([]);
   const [spawning, setSpawning] = useState(false);
+  const [shellError, setShellError] = useState<string | null>(null);
+  const [dismissedStoreError, setDismissedStoreError] = useState<string | null>(
+    null
+  );
 
   useEffect(() => {
-    applyMd3Theme(state.theme);
-  }, [state.theme]);
+    if (state.error === null) {
+      setDismissedStoreError(null);
+    }
+  }, [state.error]);
 
   const activeProject = useMemo(
     () => state.projects.find((p) => p.id === state.activeProjectId) ?? null,
     [state.projects, state.activeProjectId]
   );
+  const activeProjectId = activeProject?.id ?? null;
+  const activeProjectPath = activeProject?.path ?? null;
 
   useEffect(() => {
-    if (!desktopRuntime || !activeProject) return;
+    setMergeEntries([]);
+    setApprovedIds({});
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!desktopRuntime || !activeProjectPath) return;
     let cancelled = false;
     Promise.all([
-      tauriApi.listHandoffs(activeProject.path).catch(() => []),
-      tauriApi.listRunLog(activeProject.path).catch(() => []),
+      tauriApi.listHandoffs(activeProjectPath).catch(() => []),
+      tauriApi.listRunLog(activeProjectPath).catch(() => []),
     ]).then(([handoffs, logs]) => {
       if (cancelled) return;
       const mapped: SubagentTaskItem[] = handoffs.map((h) => ({
@@ -98,7 +115,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [desktopRuntime, activeProject]);
+  }, [desktopRuntime, activeProjectId, activeProjectPath]);
 
   const selectedTask = useMemo(
     () => subagents.find((t) => t.taskId === selectedTaskId) ?? null,
@@ -110,14 +127,22 @@ export function App() {
     [subagents]
   );
 
+  const handleRespondExtensionDialog = useCallback(
+    (id: string, ans: ExtensionUiAnswer) => {
+      void actions.respondExtensionDialog(id, ans);
+    },
+    [actions.respondExtensionDialog]
+  );
+
   function handleToggleRunLog() {
     setRunLogOpen((open) => !open);
   }
 
   async function handleSpawnSubagent(req: SpawnSubagentRequest) {
     setSpawning(true);
+    setShellError(null);
     try {
-      const repoPath = activeProject?.path ?? ".";
+      const repoPath = activeProjectPath ?? ".";
       if (req.mode === "readonly") {
         const res = await tauriApi.runReadonlySubagent(repoPath, req.goal);
         const taskId = `ro-${Date.now().toString(36)}`;
@@ -187,6 +212,9 @@ export function App() {
           ...prev,
         ]);
       }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setShellError(`Failed to spawn subagent: ${message}`);
     } finally {
       setSpawning(false);
     }
@@ -204,11 +232,11 @@ export function App() {
       return [
         {
           taskId: handoff.task_id,
-          targetRef: "refs/heads/master",
+          targetRef: "refs/heads/main",
           worktreePath: `.verity/worktrees/${handoff.task_id}`,
           handoff,
           approvedDigest: handoff.spec_digest,
-          mergeTree: { kind: "clean" },
+          mergeTree: { kind: "unchecked" },
           mergeState: "ready",
         },
         ...prev,
@@ -234,48 +262,76 @@ export function App() {
   }
 
   async function handleTriggerMerge(entry: MergeQueueEntry) {
-    const repoPath = activeProject?.path ?? ".";
-    setMergeEntries((prev) =>
-      prev.map((e) =>
-        e.taskId === entry.taskId ? { ...e, mergeState: "merging" } : e
-      )
-    );
-    const res = await tauriApi.approveAndMergeHandoff({
-      repoPath,
-      taskId: entry.taskId,
-      targetRef: entry.targetRef,
-      approvedDigest: entry.approvedDigest,
-    });
+    const repoPath = activeProjectPath ?? ".";
     setMergeEntries((prev) =>
       prev.map((e) =>
         e.taskId === entry.taskId
-          ? {
-              ...e,
-              mergeState: res.status === "merged" ? "merged" : "conflict",
-              mergedCommit: res.commit ?? undefined,
-              alreadyMerged: res.already_merged,
-              mergeTree:
-                res.conflicts.length > 0
-                  ? { kind: "conflict", conflictedPaths: [...res.conflicts] }
-                  : { kind: "clean" },
-            }
+          ? { ...e, mergeState: "merging", errorMessage: undefined }
           : e
       )
     );
-    if (res.status === "merged") {
-      setSubagents((prev) =>
-        prev.map((t) =>
-          t.taskId === entry.taskId ? { ...t, status: "merged" } : t
+    try {
+      const res = await tauriApi.approveAndMergeHandoff({
+        repoPath,
+        taskId: entry.taskId,
+        targetRef: entry.targetRef,
+        approvedDigest: entry.approvedDigest,
+      });
+      setMergeEntries((prev) =>
+        prev.map((e) =>
+          e.taskId === entry.taskId
+            ? {
+                ...e,
+                mergeState: res.status === "merged" ? "merged" : "conflict",
+                mergedCommit: res.commit ?? undefined,
+                alreadyMerged: res.already_merged,
+                errorMessage: undefined,
+                mergeTree:
+                  res.conflicts.length > 0
+                    ? { kind: "conflict", conflictedPaths: [...res.conflicts] }
+                    : { kind: "clean" },
+              }
+            : e
         )
       );
-      setRawLogLines((prev) => [
-        JSON.stringify({
-          task_id: entry.taskId,
-          kind: "merged",
-          detail: res.commit ?? entry.approvedDigest,
-        }),
-        ...prev,
-      ]);
+      if (res.status === "merged") {
+        setSubagents((prev) =>
+          prev.map((t) =>
+            t.taskId === entry.taskId ? { ...t, status: "merged" } : t
+          )
+        );
+        setRawLogLines((prev) => [
+          JSON.stringify({
+            task_id: entry.taskId,
+            kind: "merged",
+            detail: res.commit ?? entry.approvedDigest,
+          }),
+          ...prev,
+        ]);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setMergeEntries((prev) =>
+        prev.map((e) =>
+          e.taskId === entry.taskId
+            ? { ...e, mergeState: "error", errorMessage: message }
+            : e
+        )
+      );
+    }
+  }
+
+  const visibleError =
+    shellError ??
+    (state.error !== null && state.error !== dismissedStoreError
+      ? state.error
+      : null);
+
+  function handleDismissError() {
+    if (shellError !== null) {
+      setShellError(null);
+    } else if (state.error !== null) {
+      setDismissedStoreError(state.error);
     }
   }
 
@@ -420,7 +476,31 @@ export function App() {
           </div>
         </header>
 
-        {isHeroEmpty ? (
+        {visibleError && (
+          <div className="verity-error-banner" role="alert">
+            <span className="verity-error-banner-content">
+              <AlertIcon size={15} className="verity-error-banner-icon" />
+              <span>{visibleError}</span>
+            </span>
+            <button
+              type="button"
+              className="md3-icon-btn md3-icon-btn-sm"
+              aria-label="Dismiss error"
+              onClick={handleDismissError}
+            >
+              <CloseIcon size={14} />
+            </button>
+          </div>
+        )}
+
+        {state.loading ? (
+          <div className="verity-loading-stage" role="status" aria-live="polite">
+            <div className="verity-loading-indicator">
+              <span className="verity-loading-dot" aria-hidden="true" />
+              <span>Loading workspace...</span>
+            </div>
+          </div>
+        ) : isHeroEmpty ? (
           <div className="verity-hero-stage">
             <div className="verity-hero-content">
               <h1 className="verity-hero-headline">Where should we start?</h1>
@@ -525,13 +605,13 @@ export function App() {
       <HistoryTreeModal
         open={state.modal.kind === "history_tree"}
         nodes={state.modal.kind === "history_tree" ? state.modal.nodes : []}
-        onForkFromNode={(id) => void actions.forkAtEntry(id)}
+        onForkFromNode={actions.forkAtEntry}
         onClose={actions.closeModal}
       />
       <ForkModal
         open={state.modal.kind === "fork"}
         candidates={state.modal.kind === "fork" ? state.modal.candidates : []}
-        onFork={(id) => void actions.forkAtEntry(id)}
+        onFork={actions.forkAtEntry}
         onClose={actions.closeModal}
       />
       <ProviderSettingsModal
@@ -556,7 +636,7 @@ export function App() {
         dialogs={state.extensionDialogs}
         snackbars={state.extensionSnackbars}
         widgets={state.extensionWidgets}
-        onRespond={(id, ans) => void actions.respondExtensionDialog(id, ans)}
+        onRespond={handleRespondExtensionDialog}
         onDismissSnackbar={actions.dismissSnackbar}
         onDismissWidget={actions.dismissWidget}
       />
