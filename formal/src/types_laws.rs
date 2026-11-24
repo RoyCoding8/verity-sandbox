@@ -121,6 +121,16 @@ mod tests {
         assert_eq!(validate_task_id_bytes(b"a/b"), Err(TypeError::InvalidTaskIdChar));
         assert!(validate_task_id_bytes(b"task-1.v2").is_ok());
 
+        assert!(validate_commit_oid_bytes(&[b'a'; 40]).is_ok());
+        assert_eq!(
+            validate_commit_oid_bytes(&[b'A'; 40]),
+            Err(TypeError::InvalidCommitOid)
+        );
+        assert_eq!(
+            validate_commit_oid_bytes(b"abc"),
+            Err(TypeError::InvalidCommitOid)
+        );
+
         assert_eq!(validate_rel_path_bytes(b"C:foo"), Err(TypeError::AbsolutePath));
         assert_eq!(
             validate_rel_path_bytes(b"c:/Windows/System32"),
