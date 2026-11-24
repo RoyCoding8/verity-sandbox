@@ -274,9 +274,13 @@ fn extract_host_from_http_url(slice: &[u8]) -> &[u8] {
     auth
 }
 
-/// Law 5: Provider and external sign-in URL byte validators are panic-free and
-/// never accept embedded credentials (`@`), whitespace/CRLF/control bytes,
-/// `javascript:`/`file:`/`data:` schemes, or non-loopback `http://` URLs.
+/// Law 5: Canonical Provider & External Sign-In URL validation laws (len <= 16).
+///
+/// Proves that byte validators are panic-free and never accept:
+/// - embedded credentials (`@`), query (`?`), fragment (`#`), whitespace/CRLF/control bytes,
+/// - `javascript:`/`file:`/`data:` schemes, empty hosts, or non-loopback `http://` URLs.
+/// Also proves `validate_external_sign_in_url_bytes` strictly requires `https://` and implies
+/// `validate_provider_url_bytes` acceptance.
 #[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(18)]
@@ -292,6 +296,8 @@ pub fn prove_provider_url_injection_and_loopback_laws() {
     let mut has_at = false;
     let mut has_ws = false;
     let mut has_ctrl = false;
+    let mut has_query = false;
+    let mut has_fragment = false;
     let mut i = 0usize;
     while i < len {
         let b = slice[i];
@@ -304,6 +310,12 @@ pub fn prove_provider_url_injection_and_loopback_laws() {
         if b < 0x20 || b == 0x7f {
             has_ctrl = true;
         }
+        if b == b'?' {
+            has_query = true;
+        }
+        if b == b'#' {
+            has_fragment = true;
+        }
         i += 1;
     }
 
@@ -313,12 +325,13 @@ pub fn prove_provider_url_injection_and_loopback_laws() {
     let is_https = starts_with(slice, b"https://");
     let is_http = starts_with(slice, b"http://");
 
-    if has_at || has_ws || has_ctrl || is_js || is_file || is_data {
+    if has_at || has_ws || has_ctrl || has_query || has_fragment || is_js || is_file || is_data {
         assert!(provider_res.is_err());
         assert!(signin_res.is_err());
     }
 
     if signin_res.is_ok() {
+        assert!(len >= 9);
         assert!(is_https);
         assert!(provider_res.is_ok());
     }
@@ -352,6 +365,18 @@ pub fn prove_provider_url_injection_and_loopback_laws() {
     kani::cover!(
         provider_res == Err(ProviderError::EmbeddedCredentials),
         "userinfo_reject_reachable"
+    );
+    kani::cover!(
+        provider_res == Err(ProviderError::QueryNotAllowed),
+        "query_reject_reachable"
+    );
+    kani::cover!(
+        provider_res == Err(ProviderError::FragmentNotAllowed),
+        "fragment_reject_reachable"
+    );
+    kani::cover!(
+        provider_res == Err(ProviderError::EmptyHost),
+        "empty_host_reject_reachable"
     );
     kani::cover!(
         provider_res == Err(ProviderError::ControlCharNotAllowed),
