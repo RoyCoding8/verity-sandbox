@@ -277,6 +277,7 @@ export type PiAction =
   | { readonly type: "add_attachment"; readonly attachment: PendingAttachment }
   | { readonly type: "remove_attachment"; readonly filename: string }
   | { readonly type: "prompt_submitted"; readonly message: PiChatMessage }
+  | { readonly type: "prompt_failed" }
   | { readonly type: "model_selected"; readonly model: ModelOption }
   | { readonly type: "thinking_selected"; readonly level: ThinkingLevel }
   | { readonly type: "set_modal"; readonly modal: ActiveModal }
@@ -292,80 +293,156 @@ export type PiAction =
   | { readonly type: "dismiss_snackbar"; readonly id: string }
   | { readonly type: "dismiss_widget"; readonly id: string };
 
+function nowTimeLabel(): string {
+  return new Date().toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+type AssistantTarget =
+  | { readonly kind: "found"; readonly index: number }
+  | { readonly kind: "user_message" }
+  | { readonly kind: "none" };
+
+function resolveAssistantTarget(
+  messages: readonly PiChatMessage[],
+  targetId: string | null
+): AssistantTarget {
+  if (targetId) {
+    const exactIdx = messages.findIndex((m) => m.id === targetId);
+    if (exactIdx >= 0) {
+      return messages[exactIdx].role === "user"
+        ? { kind: "user_message" }
+        : { kind: "found", index: exactIdx };
+    }
+  }
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (msg.role === "assistant" && msg.streaming) {
+      return { kind: "found", index: i };
+    }
+    if (msg.role === "user") {
+      break;
+    }
+  }
+  const lastIdx = messages.length - 1;
+  if (lastIdx >= 0 && messages[lastIdx].role === "assistant") {
+    return { kind: "found", index: lastIdx };
+  }
+  return { kind: "none" };
+}
+
 function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceState {
   switch (event.type) {
     case "message_start": {
+      if (event.role === "user") {
+        // Optimistic user message was already appended on prompt_submitted.
+        return state.isStreaming ? state : { ...state, isStreaming: true };
+      }
       const id = event.message_id ?? `stream-${Date.now()}`;
-      const exists = state.messages.some((m) => m.id === id);
-      const role =
-        event.role === "user" || event.role === "system" ? event.role : "assistant";
-      const nextMessages: readonly PiChatMessage[] = exists
-        ? state.messages
-        : [
-            ...state.messages,
-            {
-              id,
-              role,
-              content: "",
-              timestamp: new Date().toLocaleTimeString([], {
-                hour: "numeric",
-                minute: "2-digit",
-              }),
-              streaming: true,
-              toolCalls: [],
-            },
-          ];
+      const existingIdx = state.messages.findIndex((m) => m.id === id);
+      if (existingIdx >= 0) {
+        const messages = state.messages.map((m, idx) =>
+          idx === existingIdx ? { ...m, streaming: true } : m
+        );
+        return { ...state, isStreaming: true, messages };
+      }
+      const role: PiChatMessage["role"] = event.role === "system" ? "system" : "assistant";
+      const nextMessage: PiChatMessage = {
+        id,
+        role,
+        content: "",
+        timestamp: nowTimeLabel(),
+        streaming: true,
+        toolCalls: [],
+      };
       return {
         ...state,
         isStreaming: true,
-        messages: nextMessages,
+        messages: [...state.messages, nextMessage],
       };
     }
 
     case "message_update": {
       const delta = event.delta ?? "";
-      if (!delta) return state;
-      const targetId = event.message_id;
-      let updated = false;
-      const messages = state.messages.map((m, idx) => {
-        const isTarget = targetId ? m.id === targetId : idx === state.messages.length - 1;
-        if (!isTarget) return m;
-        updated = true;
-        return { ...m, content: m.content + delta, streaming: true };
-      });
-      if (!updated) {
-        return {
-          ...state,
-          isStreaming: true,
-          messages: [
-            ...state.messages,
-            {
-              id: targetId ?? `stream-${Date.now()}`,
-              role: "assistant",
-              content: delta,
-              timestamp: new Date().toLocaleTimeString([], {
-                hour: "numeric",
-                minute: "2-digit",
-              }),
-              streaming: true,
-            },
-          ],
-        };
+      const thinkingDelta = event.thinking_delta ?? "";
+      if (!delta && !thinkingDelta) {
+        return state.isStreaming ? state : { ...state, isStreaming: true };
       }
-      return { ...state, isStreaming: true, messages };
+      const target = resolveAssistantTarget(state.messages, event.message_id);
+      if (target.kind === "user_message") {
+        return state;
+      }
+      if (target.kind === "found") {
+        const messages = state.messages.map((m, idx) => {
+          if (idx !== target.index) return m;
+          return {
+            ...m,
+            content: delta ? m.content + delta : m.content,
+            thinking: thinkingDelta ? (m.thinking ?? "") + thinkingDelta : m.thinking,
+            streaming: true,
+          };
+        });
+        return { ...state, isStreaming: true, messages };
+      }
+      const created: PiChatMessage = {
+        id: event.message_id ?? `stream-${Date.now()}`,
+        role: "assistant",
+        content: delta,
+        thinking: thinkingDelta || undefined,
+        timestamp: nowTimeLabel(),
+        streaming: true,
+        toolCalls: [],
+      };
+      return {
+        ...state,
+        isStreaming: true,
+        messages: [...state.messages, created],
+      };
     }
 
     case "message_end": {
-      const messages = state.messages.map((m) =>
-        !event.message_id || m.id === event.message_id
-          ? {
-              ...m,
-              streaming: false,
-              toolCalls: state.liveTools.length > 0 ? state.liveTools : m.toolCalls,
-            }
-          : m
-      );
-      return { ...state, messages };
+      const finalText = event.text ?? null;
+      const finalThinking = event.thinking ?? null;
+      const target = resolveAssistantTarget(state.messages, event.message_id);
+      if (target.kind === "user_message") {
+        return state;
+      }
+      if (target.kind === "found") {
+        const messages = state.messages.map((m, idx) => {
+          if (idx !== target.index) return m;
+          const hydratedContent = m.content.length === 0 && finalText ? finalText : m.content;
+          const hydratedThinking =
+            (!m.thinking || m.thinking.length === 0) && finalThinking
+              ? finalThinking
+              : m.thinking;
+          return {
+            ...m,
+            content: hydratedContent,
+            thinking: hydratedThinking,
+            streaming: false,
+            toolCalls: state.liveTools.length > 0 ? state.liveTools : m.toolCalls,
+          };
+        });
+        return { ...state, messages };
+      }
+      if (!finalText && !finalThinking) {
+        return state;
+      }
+      const completed: PiChatMessage = {
+        id: event.message_id ?? `stream-${Date.now()}`,
+        role: "assistant",
+        content: finalText ?? "",
+        thinking: finalThinking ?? undefined,
+        timestamp: nowTimeLabel(),
+        streaming: false,
+        toolCalls: state.liveTools.length > 0 ? state.liveTools : undefined,
+      };
+      return {
+        ...state,
+        messages: [...state.messages, completed],
+      };
     }
 
     case "tool_execution_start": {
@@ -409,16 +486,35 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
     case "auto_retry_end":
       return { ...state, retryBanner: null };
 
-    case "agent_settled":
+    case "agent_settled": {
+      const finalized = state.messages
+        .map((m) =>
+          m.streaming
+            ? {
+                ...m,
+                streaming: false,
+                toolCalls:
+                  state.liveTools.length > 0 && (!m.toolCalls || m.toolCalls.length === 0)
+                    ? state.liveTools
+                    : m.toolCalls,
+              }
+            : m
+        )
+        .filter((m) => {
+          if (m.role !== "assistant") return true;
+          const hasText = m.content.trim().length > 0;
+          const hasThinking = Boolean(m.thinking && m.thinking.trim().length > 0);
+          const hasTools = Boolean(m.toolCalls && m.toolCalls.length > 0);
+          return hasText || hasThinking || hasTools;
+        });
       return {
         ...state,
         isStreaming: false,
         liveTools: [],
         retryBanner: null,
-        messages: state.messages.map((m) =>
-          m.streaming ? { ...m, streaming: false } : m
-        ),
+        messages: finalized,
       };
+    }
 
     case "extension_ui_request": {
       if (state.extensionDialogs.some((d) => d.id === event.id)) {
@@ -584,11 +680,22 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
       return {
         ...state,
         messages: [...state.messages, action.message],
+        isStreaming: true,
         draft: "",
         attachments: [],
         recall: { history: nextHistory, index: null, draftSnapshot: "" },
       };
     }
+
+    case "prompt_failed":
+      return {
+        ...state,
+        isStreaming: false,
+        liveTools: [],
+        messages: state.messages.map((m) =>
+          m.streaming ? { ...m, streaming: false } : m
+        ),
+      };
 
     case "model_selected":
       return {
@@ -841,8 +948,13 @@ export function usePiWorkspace() {
       attachments: attachments.length > 0 ? attachments : undefined,
     };
     dispatch({ type: "prompt_submitted", message: optimisticMsg });
-    await tauriApi.sendPrompt(text, attachments);
-  }, [state.draft, state.attachments, openHistoryTree, openForkModal, exportSessionHtml]);
+    try {
+      await tauriApi.sendPrompt(text, attachments);
+    } catch (err: unknown) {
+      dispatch({ type: "prompt_failed" });
+      notify(`Failed to send prompt: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [state.draft, state.attachments, openHistoryTree, openForkModal, exportSessionHtml, notify]);
 
   const steerPrompt = useCallback(async () => {
     const text = state.draft.trim();
