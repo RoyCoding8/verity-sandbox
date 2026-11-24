@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeError {
     EmptyTaskId,
     InvalidTaskIdChar,
@@ -39,20 +39,141 @@ impl fmt::Display for TypeError {
 
 impl std::error::Error for TypeError {}
 
+/// Pure, allocation-free byte validator for `TaskId` (used by both runtime and Kani proofs).
+/// Rejects empty/oversized IDs, `.`, `..`, any `..` traversal substring, and non-safe characters.
+pub fn validate_task_id_bytes(bytes: &[u8]) -> Result<(), TypeError> {
+    if bytes.is_empty() || bytes.len() > 128 {
+        return Err(TypeError::EmptyTaskId);
+    }
+    if bytes == b"." || bytes == b".." {
+        return Err(TypeError::TraversalSegment);
+    }
+    let mut prev_dot = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !(b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+            return Err(TypeError::InvalidTaskIdChar);
+        }
+        if b == b'.' && prev_dot {
+            return Err(TypeError::TraversalSegment);
+        }
+        prev_dot = b == b'.';
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Pure, allocation-free byte validator for 40-char SHA-1 or 64-char SHA-256 lowercase hex OIDs.
+pub fn validate_commit_oid_bytes(bytes: &[u8]) -> Result<(), TypeError> {
+    let len = bytes.len();
+    if len != 40 && len != 64 {
+        return Err(TypeError::InvalidCommitOid);
+    }
+    let mut i = 0;
+    while i < len {
+        if !matches!(bytes[i], b'0'..=b'9' | b'a'..=b'f') {
+            return Err(TypeError::InvalidCommitOid);
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i].to_ascii_uppercase() != b[i].to_ascii_uppercase() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn is_windows_reserved_bytes(segment: &[u8]) -> bool {
+    let mut stem_len = 0;
+    while stem_len < segment.len() && segment[stem_len] != b'.' {
+        stem_len += 1;
+    }
+    let stem = &segment[..stem_len];
+    if stem.len() == 3 {
+        eq_ignore_ascii_case(stem, b"CON")
+            || eq_ignore_ascii_case(stem, b"PRN")
+            || eq_ignore_ascii_case(stem, b"AUX")
+            || eq_ignore_ascii_case(stem, b"NUL")
+    } else if stem.len() == 4 {
+        let digit = stem[3];
+        if !matches!(digit, b'1'..=b'9') {
+            return false;
+        }
+        eq_ignore_ascii_case(&stem[..3], b"COM") || eq_ignore_ascii_case(&stem[..3], b"LPT")
+    } else {
+        false
+    }
+}
+
+/// Pure, allocation-free byte validator for `RelPath` (used by both runtime and Kani proofs).
+/// Rejects empty paths, leading `/`, Windows drive prefixes (`C:`), backslashes `\`,
+/// ASCII control chars (`< 0x20` or `0x7f`), empty/`.`/`..` segments, `.git`, and Windows reserved device names.
+pub fn validate_rel_path_bytes(raw: &[u8]) -> Result<usize, TypeError> {
+    let mut end = raw.len();
+    while end > 0 && raw[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return Err(TypeError::EmptyPath);
+    }
+    let trimmed = &raw[..end];
+    if trimmed[0] == b'/' {
+        return Err(TypeError::AbsolutePath);
+    }
+    if trimmed.len() >= 2 && trimmed[0].is_ascii_alphabetic() && trimmed[1] == b':' {
+        return Err(TypeError::AbsolutePath);
+    }
+    let mut i = 0;
+    while i < trimmed.len() {
+        let b = trimmed[i];
+        if b == b'\\' {
+            return Err(TypeError::BackslashPath);
+        }
+        if b < 0x20 || b == 0x7f {
+            return Err(TypeError::ControlCharInPath);
+        }
+        i += 1;
+    }
+
+    let mut seg_start = 0;
+    let mut idx = 0;
+    while idx <= trimmed.len() {
+        if idx == trimmed.len() || trimmed[idx] == b'/' {
+            let segment = &trimmed[seg_start..idx];
+            if segment.is_empty() || segment == b"." || segment == b".." {
+                return Err(TypeError::TraversalSegment);
+            }
+            if eq_ignore_ascii_case(segment, b".git") {
+                return Err(TypeError::DotGitSegment);
+            }
+            if is_windows_reserved_bytes(segment) {
+                return Err(TypeError::ReservedDeviceName);
+            }
+            seg_start = idx + 1;
+        }
+        idx += 1;
+    }
+
+    Ok(end)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TaskId(String);
 
 impl TaskId {
     pub fn parse(raw: &str) -> Result<Self, TypeError> {
-        if raw.is_empty() || raw.len() > 128 {
-            return Err(TypeError::EmptyTaskId);
-        }
-        if !raw
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-        {
-            return Err(TypeError::InvalidTaskIdChar);
-        }
+        validate_task_id_bytes(raw.as_bytes())?;
         Ok(Self(raw.to_string()))
     }
 
@@ -66,13 +187,7 @@ pub struct CommitOid(String);
 
 impl CommitOid {
     pub fn parse(raw: &str) -> Result<Self, TypeError> {
-        let len = raw.len();
-        if len != 40 && len != 64 {
-            return Err(TypeError::InvalidCommitOid);
-        }
-        if !raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return Err(TypeError::InvalidCommitOid);
-        }
+        validate_commit_oid_bytes(raw.as_bytes())?;
         Ok(Self(raw.to_string()))
     }
 
@@ -84,36 +199,6 @@ impl CommitOid {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelPath(String);
 
-fn is_windows_reserved(segment: &str) -> bool {
-    let stem = segment.split('.').next().unwrap_or("");
-    let upper = stem.to_ascii_uppercase();
-    matches!(
-        upper.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
-}
-
 impl AsRef<str> for RelPath {
     fn as_ref(&self) -> &str {
         &self.0
@@ -122,33 +207,8 @@ impl AsRef<str> for RelPath {
 
 impl RelPath {
     pub fn parse(raw: &str) -> Result<Self, TypeError> {
-        let trimmed = raw.trim_end_matches('/');
-        if trimmed.is_empty() {
-            return Err(TypeError::EmptyPath);
-        }
-        if trimmed.starts_with('/') {
-            return Err(TypeError::AbsolutePath);
-        }
-        if trimmed.contains('\\') {
-            return Err(TypeError::BackslashPath);
-        }
-        if trimmed.bytes().any(|b| b < 0x20 || b == 0x7f) {
-            return Err(TypeError::ControlCharInPath);
-        }
-        let mut normalized = Vec::new();
-        for segment in trimmed.split('/') {
-            if segment.is_empty() || segment == "." || segment == ".." {
-                return Err(TypeError::TraversalSegment);
-            }
-            if segment.eq_ignore_ascii_case(".git") {
-                return Err(TypeError::DotGitSegment);
-            }
-            if is_windows_reserved(segment) {
-                return Err(TypeError::ReservedDeviceName);
-            }
-            normalized.push(segment);
-        }
-        Ok(Self(normalized.join("/")))
+        let end = validate_rel_path_bytes(raw.as_bytes())?;
+        Ok(Self(raw[..end].to_string()))
     }
 
     pub fn as_str(&self) -> &str {
