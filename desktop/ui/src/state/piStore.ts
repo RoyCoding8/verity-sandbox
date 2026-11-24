@@ -73,6 +73,7 @@ export interface PiWorkspaceState {
   readonly activeSessionId: string;
   readonly messages: readonly PiChatMessage[];
   readonly isStreaming: boolean;
+  readonly ignoreStaleTurnEvents: boolean;
   readonly liveTools: readonly PiToolCallState[];
   readonly retryBanner: RetryBannerState | null;
   readonly pendingQueueCount: number;
@@ -235,6 +236,7 @@ export function createInitialPiState(): PiWorkspaceState {
     activeSessionId: "",
     messages: [],
     isStreaming: false,
+    ignoreStaleTurnEvents: false,
     liveTools: [],
     retryBanner: null,
     pendingQueueCount: 0,
@@ -303,6 +305,7 @@ export type PiAction =
   | { readonly type: "bootstrap_start" }
   | { readonly type: "bootstrap_loaded"; readonly data: PiBootstrapData }
   | { readonly type: "set_error"; readonly error: string | null }
+  | { readonly type: "event_stream_failed"; readonly error: string }
   | { readonly type: "set_connection_state"; readonly connectionState: ConnectionState }
   | { readonly type: "toggle_theme" }
   | { readonly type: "select_project"; readonly projectId: string }
@@ -354,12 +357,100 @@ function nowTimeLabel(): string {
   });
 }
 
+const TERMINAL_ASSISTANT_STOP_REASONS = new Set<string>([
+  "stop",
+  "end_turn",
+  "length",
+  "error",
+  "aborted",
+]);
+
+function isNonAssistantMessageRole(role: string | null | undefined): boolean {
+  return role === "user" || role === "toolResult" || role === "tool_result" || role === "tool";
+}
+
+function isTurnScopedEvent(event: PiUiEvent): boolean {
+  switch (event.type) {
+    case "message_start":
+    case "message_update":
+    case "message_end":
+    case "tool_execution_start":
+    case "tool_execution_end":
+    case "queue_update":
+    case "auto_retry_start":
+    case "auto_retry_end":
+    case "agent_settled":
+      return true;
+    case "error":
+    case "process_exited":
+    case "extension_ui_request":
+    case "extension_snackbar":
+    case "extension_widget":
+      return false;
+    default: {
+      const _exhaustive: never = event;
+      return _exhaustive;
+    }
+  }
+}
+
+function hasToolIdInMessages(messages: readonly PiChatMessage[], id: string): boolean {
+  return messages.some((m) => Boolean(m.toolCalls?.some((t) => t.id === id)));
+}
+
+function collectToolIdsExcludingIndex(
+  messages: readonly PiChatMessage[],
+  excludeIdx: number
+): Set<string> {
+  const ids = new Set<string>();
+  for (let i = 0; i < messages.length; i += 1) {
+    if (i === excludeIdx) continue;
+    const tools = messages[i].toolCalls;
+    if (!tools) continue;
+    for (const tool of tools) {
+      ids.add(tool.id);
+    }
+  }
+  return ids;
+}
+
+function filterUniqueIncomingTools(
+  messages: readonly PiChatMessage[],
+  targetIdx: number,
+  incoming: readonly PiToolCallState[]
+): readonly PiToolCallState[] {
+  if (incoming.length === 0) return incoming;
+  const takenElsewhere = collectToolIdsExcludingIndex(messages, targetIdx);
+  if (takenElsewhere.size === 0) return incoming;
+  return incoming.filter((t) => !takenElsewhere.has(t.id));
+}
+
+function updateToolInMessages(
+  messages: readonly PiChatMessage[],
+  id: string,
+  updater: (tool: PiToolCallState) => PiToolCallState
+): readonly PiChatMessage[] {
+  return messages.map((m) => {
+    if (!m.toolCalls || !m.toolCalls.some((t) => t.id === id)) return m;
+    return {
+      ...m,
+      toolCalls: m.toolCalls.map((t) => (t.id === id ? updater(t) : t)),
+    };
+  });
+}
+
 function mergeToolCalls(
   existing: readonly PiToolCallState[] | undefined,
   incoming: readonly PiToolCallState[]
 ): readonly PiToolCallState[] | undefined {
   if (incoming.length === 0) return existing;
-  if (!existing || existing.length === 0) return incoming;
+  if (!existing || existing.length === 0) {
+    const byId = new Map<string, PiToolCallState>();
+    for (const tool of incoming) {
+      byId.set(tool.id, tool);
+    }
+    return Array.from(byId.values());
+  }
   const byId = new Map<string, PiToolCallState>();
   for (const tool of existing) {
     byId.set(tool.id, tool);
@@ -393,13 +484,17 @@ function attachToolsAndClearStreaming(
 ): readonly PiChatMessage[] {
   const latestAssistantIdx =
     toolsToAttach.length > 0 ? findLatestAssistantIndexInCurrentTurn(messages) : -1;
+  const uniqueTools =
+    latestAssistantIdx >= 0
+      ? filterUniqueIncomingTools(messages, latestAssistantIdx, toolsToAttach)
+      : [];
   return messages.map((m, idx) => {
-    const shouldAttach = idx === latestAssistantIdx;
+    const shouldAttach = idx === latestAssistantIdx && uniqueTools.length > 0;
     if (!m.streaming && !shouldAttach) return m;
     return {
       ...m,
       streaming: false,
-      toolCalls: shouldAttach ? mergeToolCalls(m.toolCalls, toolsToAttach) : m.toolCalls,
+      toolCalls: shouldAttach ? mergeToolCalls(m.toolCalls, uniqueTools) : m.toolCalls,
     };
   });
 }
@@ -415,6 +510,7 @@ function attachErrorToActiveTurn(
   if (latestAssistantIdx >= 0) {
     const target = messages[latestAssistantIdx];
     if (target.streaming || isStreaming) {
+      const uniqueTools = filterUniqueIncomingTools(messages, latestAssistantIdx, settledTools);
       return messages.map((m, idx) => {
         if (idx === latestAssistantIdx) {
           return {
@@ -422,7 +518,7 @@ function attachErrorToActiveTurn(
             streaming: false,
             stopReason: "error",
             errorMessage,
-            toolCalls: mergeToolCalls(m.toolCalls, settledTools),
+            toolCalls: mergeToolCalls(m.toolCalls, uniqueTools),
           };
         }
         return m.streaming ? { ...m, streaming: false } : m;
@@ -432,6 +528,7 @@ function attachErrorToActiveTurn(
   if (!isStreaming) {
     return messages.map((m) => (m.streaming ? { ...m, streaming: false } : m));
   }
+  const uniqueTools = filterUniqueIncomingTools(messages, -1, settledTools);
   const failedTurn: PiChatMessage = {
     id: nextClientId("stream"),
     role: "assistant",
@@ -440,7 +537,7 @@ function attachErrorToActiveTurn(
     streaming: false,
     stopReason: "error",
     errorMessage,
-    toolCalls: settledTools.length > 0 ? settledTools : undefined,
+    toolCalls: uniqueTools.length > 0 ? uniqueTools : undefined,
   };
   return [
     ...messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
@@ -484,22 +581,25 @@ function resolveAssistantTarget(
       break;
     }
   }
-  const lastIdx = messages.length - 1;
-  if (lastIdx >= 0 && messages[lastIdx].role === "assistant") {
-    return { kind: "found", index: lastIdx };
-  }
   return { kind: "none" };
 }
 
 function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceState {
+  if (state.ignoreStaleTurnEvents && isTurnScopedEvent(event)) {
+    return state;
+  }
+
   switch (event.type) {
     case "message_start": {
-      if (event.role === "user") {
+      if (isNonAssistantMessageRole(event.role)) {
         return state.isStreaming ? state : { ...state, isStreaming: true };
       }
       const id = event.message_id ?? nextClientId("stream");
       const existingIdx = state.messages.findIndex((m) => m.id === id);
       if (existingIdx >= 0) {
+        if (state.messages[existingIdx].role === "user") {
+          return state.isStreaming ? state : { ...state, isStreaming: true };
+        }
         const messages = state.messages.map((m, idx) =>
           idx === existingIdx ? { ...m, streaming: true } : m
         );
@@ -560,20 +660,32 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
     }
 
     case "message_end": {
-      if (event.role === "user") {
+      if (isNonAssistantMessageRole(event.role)) {
         return state;
       }
       const finalText = event.text ?? null;
       const finalThinking = event.thinking ?? null;
       const stopReason = event.stop_reason ?? null;
       const errorMessage = event.error_message ?? null;
+      const isTerminalStop =
+        stopReason !== null && TERMINAL_ASSISTANT_STOP_REASONS.has(stopReason);
+      const toolsToAttach = isTerminalStop
+        ? settleRunningTools(state.liveTools)
+        : state.liveTools;
       const target = resolveAssistantTarget(state.messages, event.message_id);
       if (target.kind === "user_message") {
         return state;
       }
       if (target.kind === "found") {
+        const uniqueTools = filterUniqueIncomingTools(
+          state.messages,
+          target.index,
+          toolsToAttach
+        );
         const messages = state.messages.map((m, idx) => {
-          if (idx !== target.index) return m;
+          if (idx !== target.index) {
+            return isTerminalStop && m.streaming ? { ...m, streaming: false } : m;
+          }
           const hydratedContent = m.content.length === 0 && finalText ? finalText : m.content;
           const hydratedThinking =
             (!m.thinking || m.thinking.length === 0) && finalThinking
@@ -586,18 +698,33 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
             streaming: false,
             stopReason: stopReason ?? m.stopReason,
             errorMessage: errorMessage ?? m.errorMessage,
-            toolCalls: mergeToolCalls(m.toolCalls, state.liveTools),
+            toolCalls: mergeToolCalls(m.toolCalls, uniqueTools),
           };
         });
         return {
           ...state,
           messages,
           liveTools: [],
+          isStreaming: isTerminalStop ? false : state.isStreaming,
+          pendingQueueCount: isTerminalStop ? 0 : state.pendingQueueCount,
+          retryBanner: isTerminalStop ? null : state.retryBanner,
         };
       }
-      const hasError = stopReason === "error" || Boolean(errorMessage && errorMessage.trim().length > 0);
-      if (!finalText && !finalThinking && !hasError && state.liveTools.length === 0) {
-        return state;
+      const hasError =
+        stopReason === "error" || Boolean(errorMessage && errorMessage.trim().length > 0);
+      const uniqueTools = filterUniqueIncomingTools(state.messages, -1, toolsToAttach);
+      if (!finalText && !finalThinking && !hasError && uniqueTools.length === 0) {
+        if (!isTerminalStop) {
+          return state;
+        }
+        return {
+          ...state,
+          isStreaming: false,
+          pendingQueueCount: 0,
+          retryBanner: null,
+          liveTools: [],
+          messages: state.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+        };
       }
       const completed: PiChatMessage = {
         id: event.message_id ?? nextClientId("stream"),
@@ -608,12 +735,18 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         streaming: false,
         stopReason,
         errorMessage,
-        toolCalls: state.liveTools.length > 0 ? state.liveTools : undefined,
+        toolCalls: uniqueTools.length > 0 ? uniqueTools : undefined,
       };
+      const baseMessages = isTerminalStop
+        ? state.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m))
+        : state.messages;
       return {
         ...state,
-        messages: [...state.messages, completed],
+        messages: [...baseMessages, completed],
         liveTools: [],
+        isStreaming: isTerminalStop ? false : state.isStreaming,
+        pendingQueueCount: isTerminalStop ? 0 : state.pendingQueueCount,
+        retryBanner: isTerminalStop ? null : state.retryBanner,
       };
     }
 
@@ -621,21 +754,35 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
       const id = event.tool_call_id ?? nextClientId("tool");
       const name = event.tool_name ?? "tool";
       const nextTool: PiToolCallState = { id, name, status: "running" };
-      const exists = state.liveTools.some((t) => t.id === id);
-      const liveTools = exists
-        ? state.liveTools.map((t) => (t.id === id ? nextTool : t))
-        : [...state.liveTools, nextTool];
-      return { ...state, isStreaming: true, liveTools };
+      if (state.liveTools.some((t) => t.id === id)) {
+        const liveTools = state.liveTools.map((t) => (t.id === id ? nextTool : t));
+        return { ...state, isStreaming: true, liveTools };
+      }
+      if (hasToolIdInMessages(state.messages, id)) {
+        const messages = updateToolInMessages(state.messages, id, () => nextTool);
+        return { ...state, isStreaming: true, messages };
+      }
+      return { ...state, isStreaming: true, liveTools: [...state.liveTools, nextTool] };
     }
 
     case "tool_execution_end": {
       const id = event.tool_call_id;
       const nextStatus: PiToolCallState["status"] = event.is_error ? "error" : "done";
       if (id) {
-        const liveTools = state.liveTools.map((t) =>
-          t.id === id ? { ...t, status: nextStatus } : t
-        );
-        return { ...state, liveTools };
+        if (state.liveTools.some((t) => t.id === id)) {
+          const liveTools = state.liveTools.map((t) =>
+            t.id === id ? { ...t, status: nextStatus } : t
+          );
+          return { ...state, liveTools };
+        }
+        if (hasToolIdInMessages(state.messages, id)) {
+          const messages = updateToolInMessages(state.messages, id, (t) => ({
+            ...t,
+            status: nextStatus,
+          }));
+          return { ...state, messages };
+        }
+        return state;
       }
       const matchIdx = state.liveTools.findIndex(
         (t) => t.name === event.tool_name && t.status === "running"
@@ -652,7 +799,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
     case "queue_update":
       return {
         ...state,
-        pendingQueueCount: Math.max(0, event.pending_count ?? 0),
+        pendingQueueCount: state.isStreaming ? Math.max(0, event.pending_count ?? 0) : 0,
       };
 
     case "auto_retry_start":
@@ -675,10 +822,19 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
           message: finalError,
           tone: "error",
         };
+        const messages = attachErrorToActiveTurn(
+          state.messages,
+          state.liveTools,
+          state.isStreaming,
+          finalError
+        );
         return {
           ...state,
           isStreaming: false,
           retryBanner: null,
+          pendingQueueCount: 0,
+          liveTools: [],
+          messages,
           extensionSnackbars: [...state.extensionSnackbars.slice(-3), snackbar],
         };
       }
@@ -817,12 +973,19 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         connectionState: "connecting",
       };
 
-    case "bootstrap_loaded":
+    case "bootstrap_loaded": {
+      const listenerAlreadyFailed =
+        state.connectionState === "disconnected" && state.error !== null;
       return {
         ...state,
         loading: false,
-        error: null,
-        connectionState: "connected",
+        error: listenerAlreadyFailed ? state.error : null,
+        connectionState: listenerAlreadyFailed ? "disconnected" : "connected",
+        isStreaming: false,
+        ignoreStaleTurnEvents: false,
+        liveTools: [],
+        retryBanner: null,
+        pendingQueueCount: 0,
         projects: action.data.projects,
         sessions: action.data.sessions,
         activeProjectId: action.data.activeProjectId,
@@ -842,14 +1005,56 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         commands: action.data.commands,
         providers: action.data.providers,
       };
+    }
 
-    case "set_error":
+    case "set_error": {
+      if (!action.error) {
+        return {
+          ...state,
+          error: null,
+          loading: false,
+        };
+      }
+      const settledTools = settleRunningTools(state.liveTools);
+      const messages = attachToolsAndClearStreaming(state.messages, settledTools);
       return {
         ...state,
         error: action.error,
         loading: false,
-        connectionState: action.error ? "disconnected" : state.connectionState,
+        connectionState: "disconnected",
+        isStreaming: false,
+        liveTools: [],
+        retryBanner: null,
+        pendingQueueCount: 0,
+        messages,
       };
+    }
+
+    case "event_stream_failed": {
+      const detail = action.error.trim() || "Unknown event stream error";
+      const message = detail.startsWith("Event stream unavailable:")
+        ? detail
+        : `Event stream unavailable: ${detail}`;
+      const snackbar: ExtensionSnackbar = {
+        id: nextClientId("sb"),
+        message,
+        tone: "error",
+      };
+      const settledTools = settleRunningTools(state.liveTools);
+      const messages = attachToolsAndClearStreaming(state.messages, settledTools);
+      return {
+        ...state,
+        error: message,
+        loading: false,
+        connectionState: "disconnected",
+        isStreaming: false,
+        liveTools: [],
+        retryBanner: null,
+        pendingQueueCount: 0,
+        messages,
+        extensionSnackbars: [...state.extensionSnackbars.slice(-3), snackbar],
+      };
+    }
 
     case "set_connection_state":
       return { ...state, connectionState: action.connectionState };
@@ -870,6 +1075,7 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         activeSessionId: "",
         messages: [],
         isStreaming: false,
+        ignoreStaleTurnEvents: true,
         liveTools: [],
         retryBanner: null,
         pendingQueueCount: 0,
@@ -883,6 +1089,7 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         activeSessionId: action.sessionId,
         messages: action.messages,
         isStreaming: false,
+        ignoreStaleTurnEvents: true,
         liveTools: [],
         retryBanner: null,
         pendingQueueCount: 0,
@@ -897,6 +1104,7 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         activeSessionId: action.session.id,
         messages: action.messages,
         isStreaming: false,
+        ignoreStaleTurnEvents: true,
         liveTools: [],
         retryBanner: null,
         pendingQueueCount: 0,
@@ -970,6 +1178,7 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         ...state,
         messages: [...state.messages, action.message],
         isStreaming: true,
+        ignoreStaleTurnEvents: false,
         draft: "",
         attachments: [],
         recall: { history: nextHistory, index: null, draftSnapshot: "" },
@@ -982,6 +1191,7 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         isStreaming: false,
         liveTools: [],
         retryBanner: null,
+        pendingQueueCount: 0,
         messages: state.messages.map((m) =>
           m.streaming ? { ...m, streaming: false } : m
         ),
@@ -1139,14 +1349,9 @@ export function usePiWorkspace() {
       })
       .catch((err: unknown) => {
         if (!active) return;
-        dispatch({ type: "set_connection_state", connectionState: "degraded" });
         dispatch({
-          type: "push_snackbar",
-          snackbar: {
-            id: nextClientId("sb"),
-            message: `Event stream unavailable: ${formatErrorMessage(err)}`,
-            tone: "error",
-          },
+          type: "event_stream_failed",
+          error: formatErrorMessage(err),
         });
       });
 

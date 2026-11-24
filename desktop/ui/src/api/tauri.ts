@@ -346,17 +346,35 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
   const type = readString(raw, "type");
   switch (type) {
     case "agent_settled":
-      return { type, summary: readString(raw, "summary") };
+    case "agent_end":
+    case "turn_end":
+      return { type: "agent_settled", summary: readString(raw, "summary") };
     case "message_start": {
-      let messageId = readString(raw, "message_id") ?? readString(raw, "messageId");
-      let role = readString(raw, "role");
+      const directMsg = isRecord(raw["message"]) ? raw["message"] : null;
+      let messageId =
+        readString(raw, "message_id") ??
+        readString(raw, "messageId") ??
+        (directMsg
+          ? readString(directMsg, "id") ??
+            readString(directMsg, "messageId") ??
+            readString(directMsg, "message_id")
+          : null);
+      let role =
+        readString(raw, "role") ??
+        (directMsg ? readString(directMsg, "role") : null);
       if (!messageId || !role) {
         const rawJson = parseRawJsonRecord(raw);
         const nestedMsg = rawJson && isRecord(rawJson["message"]) ? rawJson["message"] : null;
         if (!messageId) {
           messageId =
-            (nestedMsg ? readString(nestedMsg, "id") : null) ??
-            (rawJson ? readString(rawJson, "messageId") ?? readString(rawJson, "message_id") : null);
+            (nestedMsg
+              ? readString(nestedMsg, "id") ??
+                readString(nestedMsg, "messageId") ??
+                readString(nestedMsg, "message_id")
+              : null) ??
+            (rawJson
+              ? readString(rawJson, "messageId") ?? readString(rawJson, "message_id")
+              : null);
         }
         if (!role) {
           role =
@@ -367,23 +385,46 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
       return { type, message_id: messageId, role };
     }
     case "message_update": {
-      const messageId = readString(raw, "message_id") ?? readString(raw, "messageId");
+      const directMsg = isRecord(raw["message"]) ? raw["message"] : null;
+      let messageId =
+        readString(raw, "message_id") ??
+        readString(raw, "messageId") ??
+        (directMsg
+          ? readString(directMsg, "id") ??
+            readString(directMsg, "messageId") ??
+            readString(directMsg, "message_id")
+          : null);
       let delta = readString(raw, "delta");
       let thinkingDelta =
         readString(raw, "thinking_delta") ?? readString(raw, "thinkingDelta");
       if (!delta && !thinkingDelta) {
-        const rawJson = parseRawJsonRecord(raw);
+        const directAssistantEvent = isRecord(raw["assistantMessageEvent"])
+          ? raw["assistantMessageEvent"]
+          : null;
+        const rawJson = directAssistantEvent ? null : parseRawJsonRecord(raw);
         const assistantEvent =
-          rawJson && isRecord(rawJson["assistantMessageEvent"])
+          directAssistantEvent ??
+          (rawJson && isRecord(rawJson["assistantMessageEvent"])
             ? rawJson["assistantMessageEvent"]
-            : null;
+            : null);
+        if (!messageId && rawJson) {
+          const nestedMsg = isRecord(rawJson["message"]) ? rawJson["message"] : null;
+          messageId =
+            (nestedMsg ? readString(nestedMsg, "id") : null) ??
+            readString(rawJson, "messageId") ??
+            readString(rawJson, "message_id");
+        }
         if (assistantEvent) {
           const evType = readString(assistantEvent, "type");
-          const evDelta = readString(assistantEvent, "delta");
-          if (evType === "thinking_delta") {
-            thinkingDelta = evDelta;
+          if (evType === "thinking_delta" || evType === "reasoning_delta") {
+            thinkingDelta =
+              readString(assistantEvent, "delta") ??
+              readString(assistantEvent, "thinking") ??
+              readString(assistantEvent, "text");
           } else if (evType === "text_delta") {
-            delta = evDelta;
+            delta =
+              readString(assistantEvent, "delta") ??
+              readString(assistantEvent, "text");
           }
         }
       }
@@ -395,13 +436,37 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
       };
     }
     case "message_end": {
-      const messageId = readString(raw, "message_id") ?? readString(raw, "messageId");
-      let stopReason = readString(raw, "stop_reason") ?? readString(raw, "stopReason");
-      let role = readString(raw, "role");
-      let text = readString(raw, "text");
-      let thinking = readString(raw, "thinking");
-      let errorMessage = readString(raw, "error_message") ?? readString(raw, "errorMessage");
+      const directMsg = isRecord(raw["message"]) ? raw["message"] : null;
+      const directExtracted = extractMessageContentParts(directMsg);
+      let messageId =
+        readString(raw, "message_id") ??
+        readString(raw, "messageId") ??
+        (directMsg
+          ? readString(directMsg, "id") ??
+            readString(directMsg, "messageId") ??
+            readString(directMsg, "message_id")
+          : null);
+      let stopReason =
+        readString(raw, "stop_reason") ??
+        readString(raw, "stopReason") ??
+        (directMsg
+          ? readString(directMsg, "stopReason") ?? readString(directMsg, "stop_reason")
+          : null);
+      let role =
+        readString(raw, "role") ??
+        (directMsg ? readString(directMsg, "role") : null);
+      let text = readString(raw, "text") ?? directExtracted.text;
+      let thinking = readString(raw, "thinking") ?? directExtracted.thinking;
+      let errorMessage =
+        readString(raw, "error_message") ??
+        readString(raw, "errorMessage") ??
+        (directMsg
+          ? readString(directMsg, "errorMessage") ??
+            readString(directMsg, "error_message") ??
+            readString(directMsg, "error")
+          : null);
       if (
+        messageId === null ||
         text === null ||
         thinking === null ||
         role === null ||
@@ -411,6 +476,17 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
         const rawJson = parseRawJsonRecord(raw);
         const nestedMsg = rawJson && isRecord(rawJson["message"]) ? rawJson["message"] : null;
         const extracted = extractMessageContentParts(nestedMsg);
+        if (messageId === null) {
+          messageId =
+            (nestedMsg
+              ? readString(nestedMsg, "id") ??
+                readString(nestedMsg, "messageId") ??
+                readString(nestedMsg, "message_id")
+              : null) ??
+            (rawJson
+              ? readString(rawJson, "messageId") ?? readString(rawJson, "message_id")
+              : null);
+        }
         if (text === null) text = extracted.text;
         if (thinking === null) thinking = extracted.thinking;
         if (role === null) {
@@ -421,10 +497,14 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
         if (errorMessage === null) {
           errorMessage =
             (nestedMsg
-              ? readString(nestedMsg, "errorMessage") ?? readString(nestedMsg, "error_message")
+              ? readString(nestedMsg, "errorMessage") ??
+                readString(nestedMsg, "error_message") ??
+                readString(nestedMsg, "error")
               : null) ??
             (rawJson
-              ? readString(rawJson, "errorMessage") ?? readString(rawJson, "error_message")
+              ? readString(rawJson, "errorMessage") ??
+                readString(rawJson, "error_message") ??
+                readString(rawJson, "error")
               : null);
         }
         if (stopReason === null) {
@@ -450,40 +530,74 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
     case "tool_execution_start":
       return {
         type,
-        tool_call_id: readString(raw, "tool_call_id"),
-        tool_name: readString(raw, "tool_name"),
+        tool_call_id:
+          readString(raw, "tool_call_id") ??
+          readString(raw, "toolCallId") ??
+          readString(raw, "id"),
+        tool_name:
+          readString(raw, "tool_name") ??
+          readString(raw, "toolName") ??
+          readString(raw, "name"),
       };
     case "tool_execution_end":
       return {
         type,
-        tool_call_id: readString(raw, "tool_call_id"),
-        tool_name: readString(raw, "tool_name"),
-        is_error: readBool(raw, "is_error") ?? false,
+        tool_call_id:
+          readString(raw, "tool_call_id") ??
+          readString(raw, "toolCallId") ??
+          readString(raw, "id"),
+        tool_name:
+          readString(raw, "tool_name") ??
+          readString(raw, "toolName") ??
+          readString(raw, "name"),
+        is_error: readBool(raw, "is_error") ?? readBool(raw, "isError") ?? false,
       };
     case "queue_update":
-      return { type, pending_count: readNumber(raw, "pending_count") };
+      return {
+        type,
+        pending_count:
+          readNumber(raw, "pending_count") ??
+          readNumber(raw, "pendingCount") ??
+          readNumber(raw, "count"),
+      };
     case "auto_retry_start": {
-      let errorMessage = readString(raw, "error_message") ?? readString(raw, "errorMessage");
+      let errorMessage =
+        readString(raw, "error_message") ??
+        readString(raw, "errorMessage") ??
+        readString(raw, "error") ??
+        readString(raw, "reason");
       if (errorMessage === null) {
         const rawJson = parseRawJsonRecord(raw);
         errorMessage = rawJson
-          ? readString(rawJson, "errorMessage") ?? readString(rawJson, "error_message")
+          ? readString(rawJson, "errorMessage") ??
+            readString(rawJson, "error_message") ??
+            readString(rawJson, "error") ??
+            readString(rawJson, "reason")
           : null;
       }
       return {
         type,
         attempt: readNumber(raw, "attempt"),
-        max_attempts: readNumber(raw, "max_attempts"),
-        delay_ms: readNumber(raw, "delay_ms"),
+        max_attempts: readNumber(raw, "max_attempts") ?? readNumber(raw, "maxAttempts"),
+        delay_ms: readNumber(raw, "delay_ms") ?? readNumber(raw, "delayMs"),
         error_message: errorMessage,
       };
     }
     case "auto_retry_end": {
-      let finalError = readString(raw, "final_error") ?? readString(raw, "finalError");
+      let finalError =
+        readString(raw, "final_error") ??
+        readString(raw, "finalError") ??
+        readString(raw, "errorMessage") ??
+        readString(raw, "error_message") ??
+        readString(raw, "error");
       if (finalError === null) {
         const rawJson = parseRawJsonRecord(raw);
         finalError = rawJson
-          ? readString(rawJson, "finalError") ?? readString(rawJson, "final_error")
+          ? readString(rawJson, "finalError") ??
+            readString(rawJson, "final_error") ??
+            readString(rawJson, "errorMessage") ??
+            readString(rawJson, "error_message") ??
+            readString(rawJson, "error")
           : null;
       }
       return {
@@ -493,13 +607,17 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
         final_error: finalError,
       };
     }
-    case "error": {
+    case "error":
+    case "extension_error": {
       const message =
         readString(raw, "message") ??
         readString(raw, "error") ??
-        readString(raw, "detail");
+        readString(raw, "errorMessage") ??
+        readString(raw, "error_message") ??
+        readString(raw, "detail") ??
+        readString(raw, "reason");
       return {
-        type,
+        type: "error",
         message: message && message.trim().length > 0 ? message : "Unknown error",
       };
     }
