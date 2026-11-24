@@ -5,7 +5,7 @@ A Rust controller and Tauri v2 Material Design 3 desktop app for running coding 
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://v2.tauri.app/)
 [![Material Design 3](https://img.shields.io/badge/UI-Material%20Design%203-6750A4)](https://m3.material.io/)
-[![Kani Verified](https://img.shields.io/badge/Kani-22%20proofs-2E7D32)](https://model-checking.github.io/kani/)
+[![Kani Verified](https://img.shields.io/badge/Kani-20%20proofs-2E7D32)](https://model-checking.github.io/kani/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue)](https://www.apache.org/licenses/LICENSE-2.0)
 
 ## Why Verity?
@@ -26,7 +26,7 @@ flowchart LR
     Shell -->|Per-turn checkpoints| Shadow["Shadow-Git Snapshots<br/>Targeted revert and lossless redo"]
     Shell -->|Subagent lifecycle| Runtime["Verity Runtime<br/>crates/verity-runtime"]
     Runtime --> Worktree["Isolated git worktree<br/>bubblewrap / sandbox-exec"]
-    Runtime --> Gate["Verification Gate<br/>22 Kani proofs + hygiene lints"]
+    Runtime --> Gate["Verification Gate<br/>20 Kani proofs + hygiene lints"]
     Gate --> Merge["Spec-only handoff<br/>Lock-free git merge-tree"]
     Core["Pure Domain Core<br/>crates/verity-core"] -.-> Runtime
     Core -.-> Shell
@@ -39,7 +39,7 @@ flowchart LR
 | Multi-project desktop | Stores workspaces in `~/.verity/projects.json`, opens repositories through the native folder picker (`tauri-plugin-dialog`), and isolates Pi sessions per project. |
 | Full Pi RPC parity | Supports slash commands, skills, prompt templates, `!` and `!!` bash execution, a session settings and stats modal, and extension UI dialogs, toasts, and widgets. |
 | Turn revert and checkpoints | Captures shadow-git snapshots on each turn for targeted chat and code revert with lossless redo, plus one-click copy for individual messages or full chats. |
-| Formal verification and handoffs | Runs 22 Kani `#[kani::proof]` drivers in `formal/` against `verity-core` and protocol contracts, enforces OS sandboxing (`bubblewrap` on Linux, `sandbox-exec` on macOS), and merges approved changes with `git merge-tree`. |
+| Formal verification and handoffs | Runs 20 Kani `#[kani::proof]` drivers in `formal/` against `verity-core` and protocol contracts, enforces OS sandboxing (`bubblewrap` on Linux, `sandbox-exec` on macOS), and merges approved changes with `git merge-tree`. |
 
 ## Quick start
 
@@ -86,7 +86,7 @@ npm run tauri:build
 | `crates/verity-core` | Zero-IO pure Rust domain types, task state machine, Pi session exclusivity laws, Pi wire types, provider URL validation, write-scope rules, Kani verdict classifier, and JSON parser. |
 | `crates/verity-runtime` | Native `git worktree` and `git merge-tree` operations, rootless Linux `bubblewrap` and macOS `sandbox-exec` sandboxing, `O_NOFOLLOW` workspace path jail, comment-aware Kani and Lean 4 hygiene lints, Pi JSONL RPC client, write-subagent orchestrator, and spec-only handoff extractor. |
 | `crates/verity-cli` | Headless `verity` CLI (`run-readonly`, `spawn`, `review`, `merge`, `log`) and local STDIO MCP server (`verity mcp`). |
-| `formal/` | 22 Kani 0.68.0 `#[kani::proof]` proof drivers with `kani::cover!` reachability probes verifying `verity-core` and protocol contracts directly. |
+| `formal/` | 20 Kani 0.68.0 `#[kani::proof]` proof drivers with `kani::cover!` reachability probes verifying `verity-core` and protocol contracts directly. |
 | `desktop/` | Tauri v2 Rust shell (`desktop/src-tauri/`) and Material Design 3 React 19 frontend (`desktop/ui/`). |
 
 ## Verification
@@ -103,7 +103,7 @@ Run the Tauri backend test suite by itself:
 cargo test --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
-Run all 22 Kani formal proofs in `formal/` (requires Kani 0.68.0):
+Run all 20 Kani formal proofs in `formal/` (requires Kani 0.68.0):
 
 ```sh
 npm run formal
