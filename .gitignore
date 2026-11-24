@@ -6,3 +6,4 @@
 *.log
 .worktrees/
 /desktop/node_modules/
+.worktrees/
