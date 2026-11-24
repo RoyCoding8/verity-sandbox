@@ -119,21 +119,38 @@ pub fn provider_env_key_name(id: &str) -> String {
     format!("VERITY_DESKTOP_KEY_{}", suffix)
 }
 
-pub fn default_store_path() -> PathBuf {
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        if !xdg.trim().is_empty() {
-            return PathBuf::from(xdg).join("verity").join("providers.json");
-        }
+fn non_empty_env(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+pub fn resolve_store_path_from_env(
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    homedrive: Option<&str>,
+    homepath: Option<&str>,
+) -> PathBuf {
+    if let Some(dir) = non_empty_env(home).or_else(|| non_empty_env(userprofile)) {
+        return PathBuf::from(dir).join(".verity").join("providers.json");
     }
-    if let Ok(home) = env::var("HOME") {
-        if !home.trim().is_empty() {
-            return PathBuf::from(home)
-                .join(".config")
-                .join("verity")
-                .join("providers.json");
-        }
+    if let (Some(drive), Some(path)) = (non_empty_env(homedrive), non_empty_env(homepath)) {
+        return PathBuf::from(format!("{}{}", drive, path))
+            .join(".verity")
+            .join("providers.json");
     }
     PathBuf::from(".verity").join("providers.json")
+}
+
+pub fn default_store_path() -> PathBuf {
+    let home = env::var("HOME").ok();
+    let userprofile = env::var("USERPROFILE").ok();
+    let homedrive = env::var("HOMEDRIVE").ok();
+    let homepath = env::var("HOMEPATH").ok();
+    resolve_store_path_from_env(
+        home.as_deref(),
+        userprofile.as_deref(),
+        homedrive.as_deref(),
+        homepath.as_deref(),
+    )
 }
 
 fn validate_optional_sign_in_url(raw: Option<String>) -> Result<Option<String>, String> {
@@ -695,5 +712,85 @@ mod tests {
             secret.to_string()
         )));
         assert!(!env.iter().any(|(k, _)| k == "VERITY_DESKTOP_KEY_OLLAMA"));
+    }
+
+    #[test]
+    fn store_path_prefers_unix_home() {
+        let path = resolve_store_path_from_env(
+            Some("/Users/alice"),
+            Some("C:\\Users\\alice"),
+            Some("C:"),
+            Some("\\Users\\bob"),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/alice")
+                .join(".verity")
+                .join("providers.json")
+        );
+    }
+
+    #[test]
+    fn store_path_uses_windows_userprofile_when_home_unset() {
+        let path = resolve_store_path_from_env(
+            None,
+            Some("C:\\Users\\alice"),
+            Some("D:"),
+            Some("\\Users\\bob"),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("C:\\Users\\alice")
+                .join(".verity")
+                .join("providers.json")
+        );
+    }
+
+    #[test]
+    fn store_path_uses_windows_homedrive_and_homepath() {
+        let path = resolve_store_path_from_env(None, None, Some("C:"), Some("\\Users\\alice"));
+        assert_eq!(
+            path,
+            PathBuf::from("C:\\Users\\alice")
+                .join(".verity")
+                .join("providers.json")
+        );
+    }
+
+    #[test]
+    fn store_path_skips_blank_env_vars() {
+        assert_eq!(
+            resolve_store_path_from_env(Some("   "), Some("C:\\Users\\alice"), None, None),
+            PathBuf::from("C:\\Users\\alice")
+                .join(".verity")
+                .join("providers.json")
+        );
+        assert_eq!(
+            resolve_store_path_from_env(
+                Some(""),
+                Some(" 	 "),
+                Some("C:"),
+                Some("\\Users\\alice")
+            ),
+            PathBuf::from("C:\\Users\\alice")
+                .join(".verity")
+                .join("providers.json")
+        );
+        assert_eq!(
+            resolve_store_path_from_env(None, None, Some("C:"), Some("   ")),
+            PathBuf::from(".verity").join("providers.json")
+        );
+        assert_eq!(
+            resolve_store_path_from_env(None, None, Some(" "), Some("\\Users\\alice")),
+            PathBuf::from(".verity").join("providers.json")
+        );
+    }
+
+    #[test]
+    fn store_path_falls_back_when_no_home_env_is_set() {
+        assert_eq!(
+            resolve_store_path_from_env(None, None, None, None),
+            PathBuf::from(".verity").join("providers.json")
+        );
     }
 }
