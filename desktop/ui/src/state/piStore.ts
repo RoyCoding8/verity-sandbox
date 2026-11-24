@@ -2,15 +2,19 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import {
   tauriApi,
   type DialogKind,
+  type ExtensionToastItem,
   type ExtensionUiAnswer,
   type ForkCandidate,
   type HistoryTreeNode,
   type ModelOption,
   type PendingAttachment,
+  type PiBashResult,
   type PiBootstrapData,
   type PiChatMessage,
   type PiProject,
+  type PiQueueMode,
   type PiRetryBanner,
+  type PiSessionStats,
   type PiSessionSummary,
   type PiToolCallState,
   type PiUiEvent,
@@ -19,6 +23,10 @@ import {
   type SlashOrSkillCommand,
   type ThinkingLevel,
 } from "../api/tauri";
+import {
+  parseBashPrefix,
+  parseBuiltinSlashInvocation,
+} from "../lib/slashCommands";
 import { applyMd3Theme, detectPreferredTheme, type ThemeMode } from "../theme/md3";
 
 // ============================================================
@@ -47,7 +55,10 @@ export interface ExtensionWidget {
   readonly id: string;
   readonly title: string;
   readonly body: string;
+  readonly lines?: readonly string[];
 }
+
+export type SettingsModalTab = "behavior" | "stats" | "commands";
 
 export type ActiveModal =
   | { readonly kind: "none" }
@@ -90,6 +101,20 @@ export interface PiWorkspaceState {
   readonly extensionDialogs: readonly QueuedExtensionDialog[];
   readonly extensionSnackbars: readonly ExtensionSnackbar[];
   readonly extensionWidgets: readonly ExtensionWidget[];
+  readonly extensionWidgetLines: Readonly<Record<string, readonly string[]>>;
+  readonly extensionToasts: readonly ExtensionToastItem[];
+  readonly extensionStatus: Readonly<Record<string, string>>;
+  readonly editorPrefillText: string | null;
+  readonly autoCompactionEnabled: boolean;
+  readonly autoRetryEnabled: boolean;
+  readonly steeringMode: PiQueueMode;
+  readonly followUpMode: PiQueueMode;
+  readonly sessionStats: PiSessionStats | null;
+  readonly isCompacting: boolean;
+  readonly bashRunning: boolean;
+  readonly bashOutput: string;
+  readonly settingsModalOpen: boolean;
+  readonly settingsModalTab: SettingsModalTab;
 }
 
 const THEME_STORAGE_KEY = "verity.desktop.theme";
@@ -253,6 +278,20 @@ export function createInitialPiState(): PiWorkspaceState {
     extensionDialogs: [],
     extensionSnackbars: [],
     extensionWidgets: [],
+    extensionWidgetLines: {},
+    extensionToasts: [],
+    extensionStatus: {},
+    editorPrefillText: null,
+    autoCompactionEnabled: true,
+    autoRetryEnabled: true,
+    steeringMode: "one-at-a-time",
+    followUpMode: "one-at-a-time",
+    sessionStats: null,
+    isCompacting: false,
+    bashRunning: false,
+    bashOutput: "",
+    settingsModalOpen: false,
+    settingsModalTab: "behavior",
   };
 }
 
@@ -348,7 +387,24 @@ export type PiAction =
   | { readonly type: "shift_extension_dialog"; readonly dialogId: string }
   | { readonly type: "push_snackbar"; readonly snackbar: ExtensionSnackbar }
   | { readonly type: "dismiss_snackbar"; readonly id: string }
-  | { readonly type: "dismiss_widget"; readonly id: string };
+  | { readonly type: "push_toast"; readonly toast: ExtensionToastItem }
+  | { readonly type: "dismiss_toast"; readonly id: string }
+  | { readonly type: "dismiss_widget"; readonly id: string }
+  | { readonly type: "set_auto_compaction"; readonly enabled: boolean }
+  | { readonly type: "set_auto_retry"; readonly enabled: boolean }
+  | { readonly type: "set_steering_mode"; readonly mode: PiQueueMode }
+  | { readonly type: "set_follow_up_mode"; readonly mode: PiQueueMode }
+  | { readonly type: "set_session_stats"; readonly stats: PiSessionStats | null }
+  | { readonly type: "bash_started"; readonly command: string }
+  | {
+      readonly type: "bash_finished";
+      readonly command: string;
+      readonly result: PiBashResult;
+    }
+  | { readonly type: "bash_aborted" }
+  | { readonly type: "open_settings_modal"; readonly tab?: SettingsModalTab }
+  | { readonly type: "close_settings_modal" }
+  | { readonly type: "consume_editor_prefill" };
 
 function nowTimeLabel(): string {
   return new Date().toLocaleTimeString([], {
@@ -378,21 +434,31 @@ function isNonAssistantMessageRole(role: string | null | undefined): boolean {
 
 function isTurnScopedEvent(event: PiUiEvent): boolean {
   switch (event.type) {
+    case "agent_start":
+    case "turn_start":
+    case "turn_end":
     case "message_start":
     case "message_update":
     case "message_end":
     case "tool_execution_start":
+    case "tool_execution_update":
     case "tool_execution_end":
     case "queue_update":
     case "auto_retry_start":
     case "auto_retry_end":
     case "agent_settled":
       return true;
+    case "compaction_start":
+    case "compaction_end":
+    case "bash_execution_update":
+    case "session_info_changed":
+    case "thinking_level_changed":
     case "error":
     case "process_exited":
     case "extension_ui_request":
     case "extension_snackbar":
     case "extension_widget":
+    case "extension_ui_effect":
       return false;
     default: {
       const _exhaustive: never = event;
@@ -600,6 +666,10 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
   }
 
   switch (event.type) {
+    case "agent_start":
+    case "turn_start":
+      return state.isStreaming ? state : { ...state, isStreaming: true };
+
     case "message_start": {
       if (isNonAssistantMessageRole(event.role)) {
         return state.isStreaming ? state : { ...state, isStreaming: true };
@@ -774,6 +844,54 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
       return { ...state, isStreaming: true, liveTools: [...state.liveTools, nextTool] };
     }
 
+    case "tool_execution_update": {
+      const partial = event.partial_output;
+      if (partial === null) {
+        return state;
+      }
+      const id = event.tool_call_id;
+      const summaryDetail = partial.trim().split(/\r?\n/)[0]?.slice(0, 120) || undefined;
+      if (id) {
+        if (state.liveTools.some((t) => t.id === id)) {
+          const liveTools = state.liveTools.map((t) =>
+            t.id === id
+              ? { ...t, partialOutput: partial, detail: summaryDetail ?? t.detail }
+              : t
+          );
+          return { ...state, isStreaming: true, liveTools };
+        }
+        if (hasToolIdInMessages(state.messages, id)) {
+          const messages = updateToolInMessages(state.messages, id, (t) => ({
+            ...t,
+            partialOutput: partial,
+            detail: summaryDetail ?? t.detail,
+          }));
+          return { ...state, isStreaming: true, messages };
+        }
+        const created: PiToolCallState = {
+          id,
+          name: event.tool_name ?? "tool",
+          status: "running",
+          detail: summaryDetail,
+          partialOutput: partial,
+        };
+        return { ...state, isStreaming: true, liveTools: [...state.liveTools, created] };
+      }
+      const matchIdx = state.liveTools.findIndex(
+        (t) =>
+          (event.tool_name ? t.name === event.tool_name : true) && t.status === "running"
+      );
+      if (matchIdx < 0) {
+        return state;
+      }
+      const liveTools = state.liveTools.map((t, idx) =>
+        idx === matchIdx
+          ? { ...t, partialOutput: partial, detail: summaryDetail ?? t.detail }
+          : t
+      );
+      return { ...state, isStreaming: true, liveTools };
+    }
+
     case "tool_execution_end": {
       const id = event.tool_call_id;
       const nextStatus: PiToolCallState["status"] = event.is_error ? "error" : "done";
@@ -903,6 +1021,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
       };
     }
 
+    case "turn_end":
     case "agent_settled": {
       const settledTools = settleRunningTools(state.liveTools);
       const finalized = attachToolsAndClearStreaming(state.messages, settledTools).filter(
@@ -946,15 +1065,20 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
 
     case "extension_widget": {
       if (event.dismissed) {
+        const nextWidgetLines = { ...state.extensionWidgetLines };
+        delete nextWidgetLines[event.id];
         return {
           ...state,
           extensionWidgets: state.extensionWidgets.filter((w) => w.id !== event.id),
+          extensionWidgetLines: nextWidgetLines,
         };
       }
+      const lines = event.body.split(/\r?\n/);
       const nextWidget: ExtensionWidget = {
         id: event.id,
         title: event.title,
         body: event.body,
+        lines,
       };
       const exists = state.extensionWidgets.some((w) => w.id === event.id);
       return {
@@ -962,7 +1086,157 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         extensionWidgets: exists
           ? state.extensionWidgets.map((w) => (w.id === event.id ? nextWidget : w))
           : [...state.extensionWidgets, nextWidget],
+        extensionWidgetLines: {
+          ...state.extensionWidgetLines,
+          [event.id]: lines,
+        },
       };
+    }
+
+    case "compaction_start":
+      return {
+        ...state,
+        isCompacting: true,
+      };
+
+    case "compaction_end": {
+      if (event.error_message && event.error_message.trim().length > 0) {
+        const errText = event.error_message.trim();
+        const toast: ExtensionToastItem = {
+          id: nextClientId("toast"),
+          message: errText,
+          notifyType: "error",
+          timestamp: nowTimeLabel(),
+        };
+        const snackbar: ExtensionSnackbar = {
+          id: toast.id,
+          message: errText,
+          tone: "error",
+        };
+        return {
+          ...state,
+          isCompacting: false,
+          extensionToasts: [...state.extensionToasts.slice(-5), toast],
+          extensionSnackbars: [...state.extensionSnackbars.slice(-3), snackbar],
+        };
+      }
+      return {
+        ...state,
+        isCompacting: false,
+      };
+    }
+
+    case "bash_execution_update": {
+      const nextOutput = event.chunk ? state.bashOutput + event.chunk : state.bashOutput;
+      return {
+        ...state,
+        bashRunning: !event.done,
+        bashOutput: nextOutput,
+      };
+    }
+
+    case "session_info_changed": {
+      const nextName = event.name?.trim();
+      if (!nextName) return state;
+      const targetId = event.session_id ?? state.activeSessionId;
+      if (!targetId) return state;
+      return {
+        ...state,
+        sessions: state.sessions.map((s) =>
+          s.id === targetId ? { ...s, name: nextName } : s
+        ),
+      };
+    }
+
+    case "thinking_level_changed":
+      return {
+        ...state,
+        thinkingLevel: event.level,
+        thinkingLevels: normalizeThinkingLevels(state.thinkingLevels, event.level),
+      };
+
+    case "extension_ui_effect": {
+      const method = event.method;
+      if (method === "notify") {
+        const message = (event.message ?? event.text ?? "").trim();
+        if (!message) return state;
+        const rawType = (event.notifyType ?? event.notify_type ?? "info").toLowerCase();
+        const notifyType: ExtensionToastItem["notifyType"] =
+          rawType === "error" ? "error" : rawType === "warning" || rawType === "warn" ? "warning" : "info";
+        const toast: ExtensionToastItem = {
+          id: nextClientId("toast"),
+          message,
+          notifyType,
+          timestamp: nowTimeLabel(),
+        };
+        const snackbar: ExtensionSnackbar = {
+          id: toast.id,
+          message,
+          tone: notifyType === "error" ? "error" : "info",
+        };
+        return {
+          ...state,
+          extensionToasts: [...state.extensionToasts.slice(-5), toast],
+          extensionSnackbars: [...state.extensionSnackbars.slice(-3), snackbar],
+        };
+      }
+
+      if (method === "setStatus" || method === "set_status") {
+        const key = (event.statusKey ?? event.status_key ?? "").trim();
+        if (!key) return state;
+        const text = event.statusText ?? event.status_text;
+        const nextStatus = { ...state.extensionStatus };
+        if (text === null || text === undefined || text.trim().length === 0) {
+          delete nextStatus[key];
+        } else {
+          nextStatus[key] = text;
+        }
+        return {
+          ...state,
+          extensionStatus: nextStatus,
+        };
+      }
+
+      if (method === "setWidget" || method === "set_widget") {
+        const key = (event.widgetKey ?? event.widget_key ?? "").trim();
+        if (!key) return state;
+        const lines = event.widgetLines ?? event.widget_lines;
+        const nextWidgetLines = { ...state.extensionWidgetLines };
+        if (!lines || lines.length === 0) {
+          delete nextWidgetLines[key];
+          return {
+            ...state,
+            extensionWidgets: state.extensionWidgets.filter((w) => w.id !== key),
+            extensionWidgetLines: nextWidgetLines,
+          };
+        }
+        const copiedLines = [...lines];
+        nextWidgetLines[key] = copiedLines;
+        const nextWidget: ExtensionWidget = {
+          id: key,
+          title: event.title?.trim() || key,
+          body: copiedLines.join("\n"),
+          lines: copiedLines,
+        };
+        const exists = state.extensionWidgets.some((w) => w.id === key);
+        return {
+          ...state,
+          extensionWidgets: exists
+            ? state.extensionWidgets.map((w) => (w.id === key ? nextWidget : w))
+            : [...state.extensionWidgets, nextWidget],
+          extensionWidgetLines: nextWidgetLines,
+        };
+      }
+
+      if (method === "set_editor_text" || method === "setEditorText") {
+        const text = event.text ?? event.message ?? "";
+        return {
+          ...state,
+          editorPrefillText: text,
+        };
+      }
+
+      return state;
     }
 
     default: {
@@ -1282,10 +1556,95 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         extensionSnackbars: state.extensionSnackbars.filter((s) => s.id !== action.id),
       };
 
-    case "dismiss_widget":
+    case "push_toast":
+      return {
+        ...state,
+        extensionToasts: [...state.extensionToasts.slice(-5), action.toast],
+      };
+
+    case "dismiss_toast":
+      return {
+        ...state,
+        extensionToasts: state.extensionToasts.filter((t) => t.id !== action.id),
+        extensionSnackbars: state.extensionSnackbars.filter((s) => s.id !== action.id),
+      };
+
+    case "dismiss_widget": {
+      const nextWidgetLines = { ...state.extensionWidgetLines };
+      delete nextWidgetLines[action.id];
       return {
         ...state,
         extensionWidgets: state.extensionWidgets.filter((w) => w.id !== action.id),
+        extensionWidgetLines: nextWidgetLines,
+      };
+    }
+
+    case "set_auto_compaction":
+      return { ...state, autoCompactionEnabled: action.enabled };
+
+    case "set_auto_retry":
+      return { ...state, autoRetryEnabled: action.enabled };
+
+    case "set_steering_mode":
+      return { ...state, steeringMode: action.mode };
+
+    case "set_follow_up_mode":
+      return { ...state, followUpMode: action.mode };
+
+    case "set_session_stats":
+      return { ...state, sessionStats: action.stats };
+
+    case "bash_started":
+      return {
+        ...state,
+        bashRunning: true,
+        bashOutput: `$ ${action.command}\n`,
+      };
+
+    case "bash_finished": {
+      const exitLabel =
+        action.result.exitCode !== null ? `exit ${action.result.exitCode}` : "finished";
+      const statusSuffix = action.result.cancelled ? " (cancelled)" : "";
+      const bodyText = action.result.output.trim().length > 0
+        ? action.result.output
+        : "(no output)";
+      const bashMessage: PiChatMessage = {
+        id: nextClientId("bash"),
+        role: "system",
+        content: `\`$ ${action.command}\` — ${exitLabel}${statusSuffix}\n\n\`\`\`\n${bodyText}\n\`\`\``,
+        timestamp: nowTimeLabel(),
+      };
+      return {
+        ...state,
+        bashRunning: false,
+        bashOutput: action.result.output,
+        messages: [...state.messages, bashMessage],
+      };
+    }
+
+    case "bash_aborted":
+      return {
+        ...state,
+        bashRunning: false,
+      };
+
+    case "open_settings_modal":
+      return {
+        ...state,
+        settingsModalOpen: true,
+        settingsModalTab: action.tab ?? state.settingsModalTab,
+      };
+
+    case "close_settings_modal":
+      return {
+        ...state,
+        settingsModalOpen: false,
+      };
+
+    case "consume_editor_prefill":
+      return {
+        ...state,
+        editorPrefillText: null,
       };
 
     default: {
@@ -1381,29 +1740,82 @@ export function usePiWorkspace() {
     setBootstrapNonce((n) => n + 1);
   }, []);
 
+  const hydrateBootstrap = useCallback((data: PiBootstrapData) => {
+    lastConfirmedModelRef.current = data.selectedModel;
+    lastConfirmedThinkingRef.current = data.thinkingLevel;
+    dispatch({ type: "bootstrap_loaded", data });
+  }, []);
+
   const selectProject = useCallback(
-    async (projectId: string) => {
+    async (pathOrId: string) => {
       const reqId = ++sessionRequestIdRef.current;
-      dispatch({ type: "select_project", projectId });
-      const firstSession = stateRef.current.sessions.find((s) => s.projectId === projectId);
-      if (!firstSession) return;
+      const matched = stateRef.current.projects.find(
+        (p) => p.path === pathOrId || p.id === pathOrId
+      );
+      const targetPath = matched?.path ?? pathOrId;
       try {
-        const messages = await tauriApi.switchSession(firstSession.path, firstSession.id);
+        const data = await tauriApi.piSwitchProject(targetPath);
         if (reqId === sessionRequestIdRef.current) {
-          dispatch({
-            type: "session_switched",
-            sessionId: firstSession.id,
-            projectId,
-            messages,
-          });
+          hydrateBootstrap(data);
         }
       } catch (err: unknown) {
         if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to switch project session: ${formatErrorMessage(err)}`, "error");
+          notify(`Failed to switch project: ${formatErrorMessage(err)}`, "error");
         }
       }
     },
-    [notify]
+    [hydrateBootstrap, notify]
+  );
+
+  const addProject = useCallback(
+    async (path: string) => {
+      const trimmed = path.trim();
+      if (!trimmed) return;
+      const reqId = ++sessionRequestIdRef.current;
+      try {
+        const data = await tauriApi.piAddProject(trimmed);
+        if (reqId === sessionRequestIdRef.current) {
+          hydrateBootstrap(data);
+          notify(`Added project "${trimmed}"`);
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(`Failed to add project: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [hydrateBootstrap, notify]
+  );
+
+  const pickAndAddProject = useCallback(async () => {
+    try {
+      const picked = await tauriApi.piPickProjectFolder();
+      if (picked) {
+        await addProject(picked);
+      }
+    } catch (err: unknown) {
+      notify(`Failed to pick project folder: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [addProject, notify]);
+
+  const removeProject = useCallback(
+    async (path: string) => {
+      const trimmed = path.trim();
+      if (!trimmed) return;
+      const reqId = ++sessionRequestIdRef.current;
+      try {
+        const data = await tauriApi.piRemoveProject(trimmed);
+        if (reqId === sessionRequestIdRef.current) {
+          hydrateBootstrap(data);
+          notify(`Removed project "${trimmed}"`);
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(`Failed to remove project: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [hydrateBootstrap, notify]
   );
 
   const switchSession = useCallback(
@@ -1543,60 +1955,211 @@ export function usePiWorkspace() {
     }
   }, [notify]);
 
-  const compactSession = useCallback(async () => {
+  const pushToast = useCallback(
+    (message: string, notifyType: ExtensionToastItem["notifyType"] = "info") => {
+      const id = nextClientId("toast");
+      dispatch({
+        type: "push_toast",
+        toast: { id, message, notifyType, timestamp: nowTimeLabel() },
+      });
+      dispatch({
+        type: "push_snackbar",
+        snackbar: { id, message, tone: notifyType === "error" ? "error" : "info" },
+      });
+    },
+    []
+  );
+
+  const compactSession = useCallback(
+    async (customInstructions?: string) => {
+      try {
+        await tauriApi.compactSession(customInstructions);
+        notify("Compacted session context.");
+      } catch (err: unknown) {
+        notify(`Failed to compact session: ${formatErrorMessage(err)}`, "error");
+      }
+    },
+    [notify]
+  );
+
+  const runBash = useCallback(
+    async (command: string) => {
+      const trimmed = command.trim();
+      if (!trimmed) return;
+      dispatch({ type: "bash_started", command: trimmed });
+      try {
+        const result = await tauriApi.piBash(trimmed);
+        dispatch({ type: "bash_finished", command: trimmed, result });
+      } catch (err: unknown) {
+        dispatch({ type: "bash_aborted" });
+        notify(`Bash execution failed: ${formatErrorMessage(err)}`, "error");
+      }
+    },
+    [notify]
+  );
+
+  const abortBash = useCallback(async () => {
     try {
-      await tauriApi.compactSession();
-      notify("Compacted session context.");
+      await tauriApi.piAbortBash();
     } catch (err: unknown) {
-      notify(`Failed to compact session: ${formatErrorMessage(err)}`, "error");
+      notify(`Failed to abort bash: ${formatErrorMessage(err)}`, "error");
+    } finally {
+      dispatch({ type: "bash_aborted" });
     }
   }, [notify]);
 
-  const sendPrompt = useCallback(async () => {
-    if (submittingRef.current || stateRef.current.isStreaming) return;
-    const text = stateRef.current.draft.trim();
-    const attachments = stateRef.current.attachments;
-    if (!text && attachments.length === 0) return;
-
-    if (text === "/tree") {
-      dispatch({ type: "set_draft", draft: "" });
-      await openHistoryTree();
-      return;
-    }
-    if (text === "/fork") {
-      dispatch({ type: "set_draft", draft: "" });
-      await openForkModal();
-      return;
-    }
-    if (text === "/export") {
-      dispatch({ type: "set_draft", draft: "" });
-      await exportSessionHtml();
-      return;
-    }
-    if (text === "/compact" || text.startsWith("/compact ")) {
-      dispatch({ type: "set_draft", draft: "" });
-      await compactSession();
-      return;
-    }
-
-    submittingRef.current = true;
-    const optimisticMsg: PiChatMessage = {
-      id: nextClientId("local"),
-      role: "user",
-      content: text,
-      timestamp: nowTimeLabel(),
-      attachments: attachments.length > 0 ? attachments : undefined,
-    };
-    dispatch({ type: "prompt_submitted", message: optimisticMsg });
+  const refreshSessionStats = useCallback(async () => {
     try {
-      await tauriApi.sendPrompt(text, attachments);
+      const stats = await tauriApi.piGetSessionStats();
+      dispatch({ type: "set_session_stats", stats });
     } catch (err: unknown) {
-      dispatch({ type: "prompt_failed" });
-      notify(`Failed to send prompt: ${formatErrorMessage(err)}`, "error");
-    } finally {
-      submittingRef.current = false;
+      notify(`Failed to load session stats: ${formatErrorMessage(err)}`, "error");
     }
-  }, [openHistoryTree, openForkModal, exportSessionHtml, compactSession, notify]);
+  }, [notify]);
+
+  const setAutoCompaction = useCallback(
+    async (enabled: boolean) => {
+      const prev = stateRef.current.autoCompactionEnabled;
+      dispatch({ type: "set_auto_compaction", enabled });
+      try {
+        await tauriApi.piSetAutoCompaction(enabled);
+      } catch (err: unknown) {
+        dispatch({ type: "set_auto_compaction", enabled: prev });
+        notify(`Failed to update auto-compaction: ${formatErrorMessage(err)}`, "error");
+      }
+    },
+    [notify]
+  );
+
+  const setAutoRetry = useCallback(
+    async (enabled: boolean) => {
+      const prev = stateRef.current.autoRetryEnabled;
+      dispatch({ type: "set_auto_retry", enabled });
+      try {
+        await tauriApi.piSetAutoRetry(enabled);
+      } catch (err: unknown) {
+        dispatch({ type: "set_auto_retry", enabled: prev });
+        notify(`Failed to update auto-retry: ${formatErrorMessage(err)}`, "error");
+      }
+    },
+    [notify]
+  );
+
+  const setSteeringMode = useCallback(
+    async (mode: PiQueueMode) => {
+      const prev = stateRef.current.steeringMode;
+      dispatch({ type: "set_steering_mode", mode });
+      try {
+        await tauriApi.piSetSteeringMode(mode);
+      } catch (err: unknown) {
+        dispatch({ type: "set_steering_mode", mode: prev });
+        notify(`Failed to update steering mode: ${formatErrorMessage(err)}`, "error");
+      }
+    },
+    [notify]
+  );
+
+  const setFollowUpMode = useCallback(
+    async (mode: PiQueueMode) => {
+      const prev = stateRef.current.followUpMode;
+      dispatch({ type: "set_follow_up_mode", mode });
+      try {
+        await tauriApi.piSetFollowUpMode(mode);
+      } catch (err: unknown) {
+        dispatch({ type: "set_follow_up_mode", mode: prev });
+        notify(`Failed to update follow-up mode: ${formatErrorMessage(err)}`, "error");
+      }
+    },
+    [notify]
+  );
+
+  const cycleModel = useCallback(async () => {
+    try {
+      const cycled = await tauriApi.piCycleModel();
+      if (cycled && (cycled.provider || cycled.id)) {
+        const provider = cycled.provider ?? stateRef.current.selectedModel.provider;
+        const modelId = cycled.id ?? stateRef.current.selectedModel.modelId;
+        const existing = stateRef.current.models.find(
+          (m) => m.provider === provider && m.modelId === modelId
+        );
+        const nextModel: ModelOption = existing ?? {
+          provider,
+          modelId,
+          label: modelId,
+        };
+        lastConfirmedModelRef.current = nextModel;
+        dispatch({ type: "model_selected", model: nextModel });
+        pushToast(`Switched model to ${nextModel.label}`);
+      }
+    } catch (err: unknown) {
+      notify(`Failed to cycle model: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify, pushToast]);
+
+  const cycleThinkingLevel = useCallback(async () => {
+    try {
+      const cycled = await tauriApi.piCycleThinkingLevel();
+      const rawLevel = cycled?.level;
+      if (
+        rawLevel === "off" ||
+        rawLevel === "minimal" ||
+        rawLevel === "low" ||
+        rawLevel === "medium" ||
+        rawLevel === "high" ||
+        rawLevel === "xhigh"
+      ) {
+        lastConfirmedThinkingRef.current = rawLevel;
+        dispatch({ type: "thinking_selected", level: rawLevel });
+        pushToast(`Thinking level set to ${rawLevel}`);
+      }
+    } catch (err: unknown) {
+      notify(`Failed to cycle thinking level: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify, pushToast]);
+
+  const copyLastAssistantText = useCallback(async () => {
+    try {
+      const text = await tauriApi.piGetLastAssistantText();
+      if (!text || text.trim().length === 0) {
+        pushToast("No assistant response available to copy.", "warning");
+        return;
+      }
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        pushToast("Copied last assistant response to clipboard.");
+      } else {
+        pushToast("Clipboard API unavailable in this environment.", "warning");
+      }
+    } catch (err: unknown) {
+      notify(`Failed to copy response: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify, pushToast]);
+
+  const openSettingsModal = useCallback(
+    (tab?: SettingsModalTab) => {
+      dispatch({ type: "open_settings_modal", tab });
+      if (tab === "stats") {
+        void refreshSessionStats();
+      }
+    },
+    [refreshSessionStats]
+  );
+
+  const closeSettingsModal = useCallback(() => {
+    dispatch({ type: "close_settings_modal" });
+  }, []);
+
+  const dismissToast = useCallback((id: string) => {
+    dispatch({ type: "dismiss_toast", id });
+  }, []);
+
+  const consumeEditorPrefill = useCallback((): string | null => {
+    const current = stateRef.current.editorPrefillText;
+    if (current !== null) {
+      dispatch({ type: "consume_editor_prefill" });
+    }
+    return current;
+  }, []);
 
   const steerPrompt = useCallback(async () => {
     if (submittingRef.current) return;
@@ -1720,6 +2283,147 @@ export function usePiWorkspace() {
     [notify]
   );
 
+  const sendPrompt = useCallback(async () => {
+    if (submittingRef.current || stateRef.current.isStreaming) return;
+    const text = stateRef.current.draft.trim();
+    const attachments = stateRef.current.attachments;
+    if (!text && attachments.length === 0) return;
+
+    const bashInvocation = parseBashPrefix(text);
+    if (bashInvocation) {
+      dispatch({ type: "set_draft", draft: "" });
+      await runBash(bashInvocation.command);
+      return;
+    }
+
+    const slashInvocation = parseBuiltinSlashInvocation(text);
+    if (slashInvocation) {
+      dispatch({ type: "set_draft", draft: "" });
+      switch (slashInvocation.command) {
+        case "new":
+          await createSession();
+          return;
+        case "name": {
+          const title = slashInvocation.args.trim();
+          const activeId = stateRef.current.activeSessionId;
+          if (!title) {
+            pushToast("Usage: /name <title>", "warning");
+            return;
+          }
+          if (activeId) {
+            await renameSession(activeId, title);
+          }
+          return;
+        }
+        case "compact":
+          await compactSession(slashInvocation.args || undefined);
+          return;
+        case "fork":
+          await openForkModal();
+          return;
+        case "tree":
+          await openHistoryTree();
+          return;
+        case "export":
+          await exportSessionHtml();
+          return;
+        case "session":
+          openSettingsModal("stats");
+          await refreshSessionStats();
+          return;
+        case "copy":
+          await copyLastAssistantText();
+          return;
+        case "model": {
+          const arg = slashInvocation.args.trim().toLowerCase();
+          if (!arg) {
+            await cycleModel();
+            return;
+          }
+          const matched = stateRef.current.models.find(
+            (m) =>
+              m.modelId.toLowerCase() === arg ||
+              m.label.toLowerCase() === arg ||
+              `${m.provider}/${m.modelId}`.toLowerCase() === arg ||
+              m.modelId.toLowerCase().includes(arg) ||
+              m.label.toLowerCase().includes(arg)
+          );
+          if (matched) {
+            await selectModel(matched.provider, matched.modelId);
+          } else {
+            pushToast(`No model matching "${slashInvocation.args.trim()}".`, "warning");
+          }
+          return;
+        }
+        case "thinking": {
+          const arg = slashInvocation.args.trim().toLowerCase();
+          if (!arg) {
+            await cycleThinkingLevel();
+            return;
+          }
+          if (
+            arg === "off" ||
+            arg === "minimal" ||
+            arg === "low" ||
+            arg === "medium" ||
+            arg === "high" ||
+            arg === "xhigh"
+          ) {
+            await selectThinkingLevel(arg);
+          } else {
+            pushToast(
+              `Invalid thinking level "${slashInvocation.args.trim()}". Use off, minimal, low, medium, high, or xhigh.`,
+              "warning"
+            );
+          }
+          return;
+        }
+        case "settings":
+          openSettingsModal("behavior");
+          return;
+        default: {
+          const _exhaustive: never = slashInvocation.command;
+          return _exhaustive;
+        }
+      }
+    }
+
+    submittingRef.current = true;
+    const optimisticMsg: PiChatMessage = {
+      id: nextClientId("local"),
+      role: "user",
+      content: text,
+      timestamp: nowTimeLabel(),
+      attachments: attachments.length > 0 ? attachments : undefined,
+    };
+    dispatch({ type: "prompt_submitted", message: optimisticMsg });
+    try {
+      await tauriApi.sendPrompt(text, attachments);
+    } catch (err: unknown) {
+      dispatch({ type: "prompt_failed" });
+      notify(`Failed to send prompt: ${formatErrorMessage(err)}`, "error");
+    } finally {
+      submittingRef.current = false;
+    }
+  }, [
+    runBash,
+    createSession,
+    renameSession,
+    compactSession,
+    openForkModal,
+    openHistoryTree,
+    exportSessionHtml,
+    openSettingsModal,
+    refreshSessionStats,
+    copyLastAssistantText,
+    cycleModel,
+    selectModel,
+    cycleThinkingLevel,
+    selectThinkingLevel,
+    pushToast,
+    notify,
+  ]);
+
   const upsertProvider = useCallback(
     async (input: ProviderProfileInput) => {
       const reqId = ++providerRequestIdRef.current;
@@ -1815,6 +2519,9 @@ export function usePiWorkspace() {
       toggleTheme: () => dispatch({ type: "toggle_theme" }),
       retryBootstrap,
       selectProject,
+      pickAndAddProject,
+      addProject,
+      removeProject,
       switchSession,
       createSession,
       renameSession,
@@ -1844,6 +2551,20 @@ export function usePiWorkspace() {
       upsertProvider,
       deleteProvider,
       respondExtensionDialog,
+      runBash,
+      abortBash,
+      refreshSessionStats,
+      setAutoCompaction,
+      setAutoRetry,
+      setSteeringMode,
+      setFollowUpMode,
+      cycleModel,
+      cycleThinkingLevel,
+      copyLastAssistantText,
+      dismissToast,
+      openSettingsModal,
+      closeSettingsModal,
+      consumeEditorPrefill,
       dismissSnackbar: (id: string) => dispatch({ type: "dismiss_snackbar", id }),
       dismissWidget: (id: string) => dispatch({ type: "dismiss_widget", id }),
     },

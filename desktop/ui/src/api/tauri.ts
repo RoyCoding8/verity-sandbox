@@ -46,11 +46,60 @@ export interface ModelOption {
   readonly label: string;
 }
 
+export type PiCommandSource = "skill" | "prompt" | "extension" | "builtin" | string;
+
 export interface SlashOrSkillCommand {
   readonly trigger: "/" | "$";
   readonly name: string;
   readonly description: string;
   readonly insertText: string;
+  readonly source?: PiCommandSource;
+  readonly location?: string;
+}
+
+export type PiCommandInfo = SlashOrSkillCommand;
+
+export type PiQueueMode = "all" | "one-at-a-time";
+
+export interface PiSessionStats {
+  readonly sessionFile?: string | null;
+  readonly sessionId?: string | null;
+  readonly userMessages?: number;
+  readonly assistantMessages?: number;
+  readonly toolCalls?: number;
+  readonly toolResults?: number;
+  readonly totalMessages?: number;
+  readonly tokens?: {
+    readonly input?: number;
+    readonly output?: number;
+    readonly cacheRead?: number;
+    readonly cacheWrite?: number;
+    readonly total?: number;
+  };
+  readonly cost?: number;
+  readonly contextTokens?: number | null;
+  readonly contextWindow?: number | null;
+  readonly contextUsagePercent?: number | null;
+}
+
+export interface PiBashResult {
+  readonly output: string;
+  readonly exitCode: number | null;
+  readonly cancelled: boolean;
+  readonly truncated: boolean;
+  readonly fullOutputPath?: string | null;
+}
+
+export interface ExtensionToastItem {
+  readonly id: string;
+  readonly message: string;
+  readonly notifyType: "info" | "warning" | "error";
+  readonly timestamp: string;
+}
+
+export interface ExtensionWidgetItem {
+  readonly key: string;
+  readonly lines: readonly string[];
 }
 
 export interface PiProject {
@@ -74,6 +123,7 @@ export interface PiToolCallState {
   readonly name: string;
   readonly status: "running" | "done" | "error";
   readonly detail?: string;
+  readonly partialOutput?: string;
 }
 
 export interface PiChatMessage {
@@ -138,16 +188,51 @@ export type PiUiEvent =
       readonly thinking?: string | null;
       readonly error_message?: string | null;
     }
+  | { readonly type: "agent_start" }
+  | { readonly type: "turn_start" }
+  | { readonly type: "turn_end"; readonly summary: string | null }
   | {
       readonly type: "tool_execution_start";
       readonly tool_call_id: string | null;
       readonly tool_name: string | null;
     }
   | {
+      readonly type: "tool_execution_update";
+      readonly tool_call_id: string | null;
+      readonly tool_name: string | null;
+      readonly partial_output: string | null;
+    }
+  | {
       readonly type: "tool_execution_end";
       readonly tool_call_id: string | null;
       readonly tool_name: string | null;
       readonly is_error: boolean;
+    }
+  | {
+      readonly type: "compaction_start";
+      readonly reason: string | null;
+    }
+  | {
+      readonly type: "compaction_end";
+      readonly aborted: boolean;
+      readonly will_retry: boolean;
+      readonly error_message: string | null;
+      readonly summary: string | null;
+    }
+  | {
+      readonly type: "bash_execution_update";
+      readonly chunk: string | null;
+      readonly done: boolean;
+      readonly exit_code: number | null;
+    }
+  | {
+      readonly type: "session_info_changed";
+      readonly session_id: string | null;
+      readonly name: string | null;
+    }
+  | {
+      readonly type: "thinking_level_changed";
+      readonly level: ThinkingLevel;
     }
   | { readonly type: "queue_update"; readonly pending_count: number | null }
   | {
@@ -189,6 +274,23 @@ export type PiUiEvent =
       readonly title: string;
       readonly body: string;
       readonly dismissed?: boolean;
+    }
+  | {
+      readonly type: "extension_ui_effect";
+      readonly method: string;
+      readonly message?: string | null;
+      readonly notifyType?: string | null;
+      readonly notify_type?: string | null;
+      readonly statusKey?: string | null;
+      readonly status_key?: string | null;
+      readonly statusText?: string | null;
+      readonly status_text?: string | null;
+      readonly widgetKey?: string | null;
+      readonly widget_key?: string | null;
+      readonly widgetLines?: readonly string[] | null;
+      readonly widget_lines?: readonly string[] | null;
+      readonly title?: string | null;
+      readonly text?: string | null;
     };
 
 // Verity Orchestration Types (matching desktop/src-tauri/src/verity_bridge.rs)
@@ -247,6 +349,7 @@ export interface PiBootstrapData {
   readonly projects: readonly PiProject[];
   readonly sessions: readonly PiSessionSummary[];
   readonly activeProjectId: string;
+  readonly activeProjectPath?: string;
   readonly activeSessionId: string;
   readonly messages: readonly PiChatMessage[];
   readonly models: readonly ModelOption[];
@@ -297,6 +400,60 @@ function isDialogKind(raw: string | null): raw is DialogKind {
   return raw === "select" || raw === "confirm" || raw === "input" || raw === "editor";
 }
 
+function isThinkingLevel(raw: string | null): raw is ThinkingLevel {
+  return (
+    raw === "off" ||
+    raw === "minimal" ||
+    raw === "low" ||
+    raw === "medium" ||
+    raw === "high" ||
+    raw === "xhigh"
+  );
+}
+
+function readStringArray(obj: Record<string, unknown>, key: string): readonly string[] | null {
+  const v = obj[key];
+  if (!Array.isArray(v)) return null;
+  return v.filter((item): item is string => typeof item === "string");
+}
+
+function extractPartialToolOutput(raw: Record<string, unknown>): string | null {
+  const direct =
+    readString(raw, "partial_output") ??
+    readString(raw, "partialOutput") ??
+    readString(raw, "output") ??
+    readString(raw, "delta") ??
+    readString(raw, "text");
+  if (direct !== null) return direct;
+
+  const partialResult = raw["partialResult"] ?? raw["partial_result"];
+  if (typeof partialResult === "string") return partialResult;
+  if (isRecord(partialResult)) {
+    const extracted = extractMessageContentParts(partialResult);
+    if (extracted.text !== null) return extracted.text;
+    const resultText =
+      readString(partialResult, "output") ?? readString(partialResult, "text");
+    if (resultText !== null) return resultText;
+  }
+
+  const rawJson = parseRawJsonRecord(raw);
+  if (rawJson) {
+    const nested =
+      readString(rawJson, "partial_output") ??
+      readString(rawJson, "partialOutput") ??
+      readString(rawJson, "output") ??
+      readString(rawJson, "delta");
+    if (nested !== null) return nested;
+    const nestedPartial = rawJson["partialResult"] ?? rawJson["partial_result"];
+    if (typeof nestedPartial === "string") return nestedPartial;
+    if (isRecord(nestedPartial)) {
+      const extracted = extractMessageContentParts(nestedPartial);
+      if (extracted.text !== null) return extracted.text;
+    }
+  }
+  return null;
+}
+
 function parseRawJsonRecord(obj: Record<string, unknown>): Record<string, unknown> | null {
   const rawJson = readString(obj, "raw_json");
   if (!rawJson) return null;
@@ -345,9 +502,14 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
   if (!isRecord(raw)) return null;
   const type = readString(raw, "type");
   switch (type) {
+    case "agent_start":
+      return { type: "agent_start" };
+    case "turn_start":
+      return { type: "turn_start" };
+    case "turn_end":
+      return { type: "turn_end", summary: readString(raw, "summary") };
     case "agent_settled":
     case "agent_end":
-    case "turn_end":
       return { type: "agent_settled", summary: readString(raw, "summary") };
     case "message_start": {
       const directMsg = isRecord(raw["message"]) ? raw["message"] : null;
@@ -539,6 +701,19 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
           readString(raw, "toolName") ??
           readString(raw, "name"),
       };
+    case "tool_execution_update":
+      return {
+        type,
+        tool_call_id:
+          readString(raw, "tool_call_id") ??
+          readString(raw, "toolCallId") ??
+          readString(raw, "id"),
+        tool_name:
+          readString(raw, "tool_name") ??
+          readString(raw, "toolName") ??
+          readString(raw, "name"),
+        partial_output: extractPartialToolOutput(raw),
+      };
     case "tool_execution_end":
       return {
         type,
@@ -662,6 +837,81 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
         title,
         body,
         dismissed: readBool(raw, "dismissed") ?? false,
+      };
+    }
+    case "compaction_start":
+      return {
+        type,
+        reason: readString(raw, "reason"),
+      };
+    case "compaction_end":
+      return {
+        type,
+        aborted: readBool(raw, "aborted") ?? false,
+        will_retry: readBool(raw, "will_retry") ?? readBool(raw, "willRetry") ?? false,
+        error_message:
+          readString(raw, "error_message") ?? readString(raw, "errorMessage"),
+        summary: readString(raw, "summary"),
+      };
+    case "bash_execution_update":
+      return {
+        type,
+        chunk:
+          readString(raw, "chunk") ??
+          readString(raw, "output") ??
+          readString(raw, "delta"),
+        done: readBool(raw, "done") ?? false,
+        exit_code: readNumber(raw, "exit_code") ?? readNumber(raw, "exitCode"),
+      };
+    case "session_info_changed":
+      return {
+        type,
+        session_id: readString(raw, "session_id") ?? readString(raw, "sessionId"),
+        name:
+          readString(raw, "name") ??
+          readString(raw, "sessionName") ??
+          readString(raw, "session_name"),
+      };
+    case "thinking_level_changed": {
+      const rawLevel =
+        readString(raw, "level") ??
+        readString(raw, "thinkingLevel") ??
+        readString(raw, "thinking_level");
+      if (!isThinkingLevel(rawLevel)) return null;
+      return {
+        type,
+        level: rawLevel,
+      };
+    }
+    case "extension_ui_effect": {
+      const method = readString(raw, "method");
+      if (!method) return null;
+      const notifyType =
+        readString(raw, "notifyType") ?? readString(raw, "notify_type");
+      const statusKey =
+        readString(raw, "statusKey") ?? readString(raw, "status_key");
+      const statusText =
+        readString(raw, "statusText") ?? readString(raw, "status_text");
+      const widgetKey =
+        readString(raw, "widgetKey") ?? readString(raw, "widget_key");
+      const widgetLines =
+        readStringArray(raw, "widgetLines") ?? readStringArray(raw, "widget_lines");
+      return {
+        type,
+        method,
+        message: readString(raw, "message"),
+        notifyType,
+        notify_type: notifyType,
+        statusKey,
+        status_key: statusKey,
+        statusText,
+        status_text: statusText,
+        widgetKey,
+        widget_key: widgetKey,
+        widgetLines,
+        widget_lines: widgetLines,
+        title: readString(raw, "title"),
+        text: readString(raw, "text"),
       };
     }
     default:
@@ -819,17 +1069,24 @@ class BrowserPreviewRuntime {
   private selectedModel: ModelOption = this.models[0];
   private thinkingLevels: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
   private thinkingLevel: ThinkingLevel = "medium";
+  private autoCompactionEnabled = true;
+  private autoRetryEnabled = true;
+  private steeringMode: PiQueueMode = "one-at-a-time";
+  private followUpMode: PiQueueMode = "one-at-a-time";
+  private bashRunning = false;
 
   private commands: readonly SlashOrSkillCommand[] = [
-    { trigger: "/", name: "/compact", description: "Compact conversation history into a summary", insertText: "/compact " },
-    { trigger: "/", name: "/fork", description: "Fork the current session from a message", insertText: "/fork" },
-    { trigger: "/", name: "/tree", description: "Open searchable session History Tree", insertText: "/tree" },
-    { trigger: "/", name: "/export", description: "Export current session as standalone HTML", insertText: "/export" },
-    { trigger: "/", name: "/retry-demo", description: "Preview auto-retry countdown banner", insertText: "/retry-demo" },
-    { trigger: "/", name: "/ext-demo", description: "Trigger FIFO Extension UI dialog + widget", insertText: "/ext-demo" },
-    { trigger: "$", name: "$kani-verify", description: "Run Kani formal verification skill", insertText: "$kani-verify " },
-    { trigger: "$", name: "$scope-audit", description: "Audit git write-scope and hygiene rules", insertText: "$scope-audit " },
-    { trigger: "$", name: "$spec-review", description: "Generate blind back-translation spec summary", insertText: "$spec-review " },
+    { trigger: "/", name: "/compact", description: "Compact conversation history into a summary", insertText: "/compact ", source: "builtin" },
+    { trigger: "/", name: "/fork", description: "Fork the current session from a message", insertText: "/fork", source: "builtin" },
+    { trigger: "/", name: "/tree", description: "Open searchable session History Tree", insertText: "/tree", source: "builtin" },
+    { trigger: "/", name: "/export", description: "Export current session as standalone HTML", insertText: "/export", source: "builtin" },
+    { trigger: "/", name: "/retry-demo", description: "Preview auto-retry countdown banner", insertText: "/retry-demo", source: "extension" },
+    { trigger: "/", name: "/ext-demo", description: "Trigger FIFO Extension UI dialog + widget", insertText: "/ext-demo", source: "extension" },
+    { trigger: "/", name: "skill:kani-verify", description: "Run Kani formal verification skill", insertText: "/skill:kani-verify ", source: "skill", location: ".pi/skills/kani-verify/SKILL.md" },
+    { trigger: "/", name: "prompt:scope-audit", description: "Audit git write-scope and hygiene rules", insertText: "/prompt:scope-audit ", source: "prompt", location: ".pi/prompts/scope-audit.md" },
+    { trigger: "$", name: "$kani-verify", description: "Run Kani formal verification skill", insertText: "$kani-verify ", source: "skill" },
+    { trigger: "$", name: "$scope-audit", description: "Audit git write-scope and hygiene rules", insertText: "$scope-audit ", source: "skill" },
+    { trigger: "$", name: "$spec-review", description: "Generate blind back-translation spec summary", insertText: "$spec-review ", source: "skill" },
   ];
 
   private providers: PublicProviderProfile[] = [
@@ -915,10 +1172,12 @@ class BrowserPreviewRuntime {
   }
 
   bootstrap(): PiBootstrapData {
+    const activeProject = this.projects.find((p) => p.id === this.activeProjectId);
     return {
       projects: [...this.projects],
       sessions: [...this.sessions],
       activeProjectId: this.activeProjectId,
+      activeProjectPath: activeProject?.path,
       activeSessionId: this.activeSessionId,
       messages: [...(this.messagesBySession.get(this.activeSessionId) ?? [])],
       models: [...this.models],
@@ -1262,13 +1521,187 @@ class BrowserPreviewRuntime {
     this.emit({ type: "agent_settled", summary: "Retry aborted by user" });
   }
 
-  compactSession(): void {
+  compactSession(customInstructions?: string): void {
+    this.emit({ type: "compaction_start", reason: customInstructions ?? "manual" });
+    const suffix = customInstructions?.trim()
+      ? ` (${customInstructions.trim()})`
+      : "";
+    this.emit({
+      type: "compaction_end",
+      aborted: false,
+      will_retry: false,
+      error_message: null,
+      summary: `Compacted session history${suffix}.`,
+    });
     this.emit({
       type: "extension_snackbar",
       id: `sb-${++this.seq}`,
-      message: "Compacted session history.",
+      message: `Compacted session history${suffix}.`,
       tone: "info",
     });
+  }
+
+  pickProjectFolder(): string | null {
+    return `/workspace/project-${++this.seq}`;
+  }
+
+  addProject(path: string): PiBootstrapData {
+    const trimmed = path.trim();
+    if (trimmed) {
+      const existing = this.projects.find((p) => p.path === trimmed);
+      if (existing) {
+        this.activeProjectId = existing.id;
+      } else {
+        const name = trimmed.split("/").filter(Boolean).pop() ?? trimmed;
+        const id = `proj-${++this.seq}`;
+        this.projects = [...this.projects, { id, name, path: trimmed }];
+        this.activeProjectId = id;
+        const created = this.newSession(id);
+        this.activeSessionId = created.id;
+      }
+    }
+    return this.bootstrap();
+  }
+
+  removeProject(path: string): PiBootstrapData {
+    const trimmed = path.trim();
+    const target = this.projects.find((p) => p.path === trimmed || p.id === trimmed);
+    if (target) {
+      this.projects = this.projects.filter((p) => p.id !== target.id);
+      this.sessions = this.sessions.filter((s) => s.projectId !== target.id);
+      if (this.activeProjectId === target.id) {
+        this.activeProjectId = this.projects[0]?.id ?? "";
+        const nextSess = this.sessions.find((s) => s.projectId === this.activeProjectId);
+        this.activeSessionId = nextSess?.id ?? "";
+      }
+    }
+    return this.bootstrap();
+  }
+
+  switchProject(path: string): PiBootstrapData {
+    this.cancelInFlightWork();
+    const trimmed = path.trim();
+    const target = this.projects.find((p) => p.path === trimmed || p.id === trimmed);
+    if (target) {
+      this.activeProjectId = target.id;
+      const firstSess = this.sessions.find((s) => s.projectId === target.id);
+      this.activeSessionId = firstSess?.id ?? "";
+    }
+    return this.bootstrap();
+  }
+
+  runBash(command: string): PiBashResult {
+    this.bashRunning = true;
+    const output = `$ ${command}\n[preview] executed cleanly`;
+    this.emit({ type: "bash_execution_update", chunk: `${output}\n`, done: false, exit_code: null });
+    this.bashRunning = false;
+    this.emit({ type: "bash_execution_update", chunk: null, done: true, exit_code: 0 });
+    return {
+      output,
+      exitCode: 0,
+      cancelled: false,
+      truncated: false,
+      fullOutputPath: null,
+    };
+  }
+
+  abortBash(): void {
+    if (this.bashRunning) {
+      this.bashRunning = false;
+      this.emit({ type: "bash_execution_update", chunk: "\n[aborted]\n", done: true, exit_code: 130 });
+    }
+  }
+
+  getSessionStats(): PiSessionStats {
+    const msgs = this.messagesBySession.get(this.activeSessionId) ?? [];
+    const userMessages = msgs.filter((m) => m.role === "user").length;
+    const assistantMessages = msgs.filter((m) => m.role === "assistant").length;
+    const toolCalls = msgs.reduce((sum, m) => sum + (m.toolCalls?.length ?? 0), 0);
+    const totalChars = msgs.reduce((sum, m) => sum + m.content.length, 0);
+    const approxTokens = Math.max(128, Math.round(totalChars / 4));
+    return {
+      sessionFile: this.sessions.find((s) => s.id === this.activeSessionId)?.path ?? null,
+      sessionId: this.activeSessionId || null,
+      userMessages,
+      assistantMessages,
+      toolCalls,
+      toolResults: toolCalls,
+      totalMessages: msgs.length,
+      tokens: {
+        input: approxTokens,
+        output: Math.round(approxTokens * 0.6),
+        cacheRead: Math.round(approxTokens * 0.25),
+        cacheWrite: 0,
+        total: Math.round(approxTokens * 1.85),
+      },
+      cost: Number((approxTokens * 0.000015).toFixed(4)),
+      contextTokens: approxTokens,
+      contextWindow: 200000,
+      contextUsagePercent: Number(((approxTokens / 200000) * 100).toFixed(2)),
+    };
+  }
+
+  getLastAssistantText(): string | null {
+    const msgs = this.messagesBySession.get(this.activeSessionId) ?? [];
+    for (let i = msgs.length - 1; i >= 0; i -= 1) {
+      if (msgs[i].role === "assistant" && msgs[i].content.trim().length > 0) {
+        return msgs[i].content;
+      }
+    }
+    return null;
+  }
+
+  setAutoCompaction(enabled: boolean): void {
+    this.autoCompactionEnabled = enabled;
+  }
+
+  setAutoRetry(enabled: boolean): void {
+    this.autoRetryEnabled = enabled;
+  }
+
+  setSteeringMode(mode: PiQueueMode): void {
+    this.steeringMode = mode;
+  }
+
+  setFollowUpMode(mode: PiQueueMode): void {
+    this.followUpMode = mode;
+  }
+
+  cycleModel(): { provider?: string; id?: string; model?: unknown } | null {
+    if (this.models.length === 0) return null;
+    const idx = this.models.findIndex(
+      (m) => m.provider === this.selectedModel.provider && m.modelId === this.selectedModel.modelId
+    );
+    const next = this.models[(idx + 1) % this.models.length];
+    this.selectedModel = next;
+    return { provider: next.provider, id: next.modelId, model: next };
+  }
+
+  cycleThinkingLevel(): { level?: string } | null {
+    if (this.thinkingLevels.length === 0) return null;
+    const idx = this.thinkingLevels.indexOf(this.thinkingLevel);
+    const next = this.thinkingLevels[(idx + 1) % this.thinkingLevels.length];
+    this.thinkingLevel = next;
+    this.emit({ type: "thinking_level_changed", level: next });
+    return { level: next };
+  }
+
+  getCommands(): PiCommandInfo[] {
+    return [...this.commands];
+  }
+
+  getSettingsSnapshot(): {
+    autoCompactionEnabled: boolean;
+    autoRetryEnabled: boolean;
+    steeringMode: PiQueueMode;
+    followUpMode: PiQueueMode;
+  } {
+    return {
+      autoCompactionEnabled: this.autoCompactionEnabled,
+      autoRetryEnabled: this.autoRetryEnabled,
+      steeringMode: this.steeringMode,
+      followUpMode: this.followUpMode,
+    };
   }
 
   respondExtensionUi(dialogId: string, answer: ExtensionUiAnswer): void {
@@ -1512,12 +1945,153 @@ export const tauriApi = {
     await invoke<void>("pi_abort_retry");
   },
 
-  async compactSession(): Promise<void> {
+  async compactSession(customInstructions?: string): Promise<void> {
     if (!isTauriRuntime()) {
-      previewRuntime.compactSession();
+      previewRuntime.compactSession(customInstructions);
       return;
     }
-    await invoke<void>("pi_compact");
+    await invoke<void>("pi_compact", {
+      customInstructions: customInstructions ?? null,
+    });
+  },
+
+  async piCompact(customInstructions?: string): Promise<void> {
+    return this.compactSession(customInstructions);
+  },
+
+  async piPickProjectFolder(): Promise<string | null> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.pickProjectFolder();
+    }
+    return invoke<string | null>("pi_pick_project_folder");
+  },
+
+  async piAddProject(path: string): Promise<PiBootstrapData> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.addProject(path);
+    }
+    return invoke<PiBootstrapData>("pi_add_project", { path });
+  },
+
+  async piRemoveProject(path: string): Promise<PiBootstrapData> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.removeProject(path);
+    }
+    return invoke<PiBootstrapData>("pi_remove_project", { path });
+  },
+
+  async piSwitchProject(path: string): Promise<PiBootstrapData> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.switchProject(path);
+    }
+    return invoke<PiBootstrapData>("pi_switch_project", { path });
+  },
+
+  async piBash(command: string): Promise<PiBashResult> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.runBash(command);
+    }
+    return invoke<PiBashResult>("pi_bash", { command });
+  },
+
+  async piAbortBash(): Promise<void> {
+    if (!isTauriRuntime()) {
+      previewRuntime.abortBash();
+      return;
+    }
+    await invoke<void>("pi_abort_bash");
+  },
+
+  async piGetSessionStats(): Promise<PiSessionStats> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.getSessionStats();
+    }
+    return invoke<PiSessionStats>("pi_get_session_stats");
+  },
+
+  async piGetLastAssistantText(): Promise<string | null> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.getLastAssistantText();
+    }
+    return invoke<string | null>("pi_get_last_assistant_text");
+  },
+
+  async piSetAutoCompaction(enabled: boolean): Promise<void> {
+    if (!isTauriRuntime()) {
+      previewRuntime.setAutoCompaction(enabled);
+      return;
+    }
+    await invoke<void>("pi_set_auto_compaction", { enabled });
+  },
+
+  async piSetAutoRetry(enabled: boolean): Promise<void> {
+    if (!isTauriRuntime()) {
+      previewRuntime.setAutoRetry(enabled);
+      return;
+    }
+    await invoke<void>("pi_set_auto_retry", { enabled });
+  },
+
+  async piSetSteeringMode(mode: PiQueueMode): Promise<void> {
+    if (!isTauriRuntime()) {
+      previewRuntime.setSteeringMode(mode);
+      return;
+    }
+    await invoke<void>("pi_set_steering_mode", { mode });
+  },
+
+  async piSetFollowUpMode(mode: PiQueueMode): Promise<void> {
+    if (!isTauriRuntime()) {
+      previewRuntime.setFollowUpMode(mode);
+      return;
+    }
+    await invoke<void>("pi_set_follow_up_mode", { mode });
+  },
+
+  async piCycleModel(): Promise<{ provider?: string; id?: string; model?: unknown } | null> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.cycleModel();
+    }
+    return invoke<{ provider?: string; id?: string; model?: unknown } | null>("pi_cycle_model");
+  },
+
+  async piCycleThinkingLevel(): Promise<{ level?: string } | null> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.cycleThinkingLevel();
+    }
+    return invoke<{ level?: string } | null>("pi_cycle_thinking_level");
+  },
+
+  async piGetCommands(): Promise<PiCommandInfo[]> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.getCommands();
+    }
+    const rawList = await invoke<unknown[]>("pi_get_commands");
+    if (!Array.isArray(rawList)) return [];
+    const normalized: PiCommandInfo[] = [];
+    for (const item of rawList) {
+      if (!isRecord(item)) continue;
+      const name = readString(item, "name");
+      if (!name) continue;
+      const triggerRaw = readString(item, "trigger");
+      const trigger: "/" | "$" = triggerRaw === "$" || name.startsWith("$") ? "$" : "/";
+      const description = readString(item, "description") ?? "";
+      const insertText =
+        readString(item, "insertText") ??
+        readString(item, "insert_text") ??
+        (name.startsWith("/") || name.startsWith("$") ? name : `${trigger}${name}`);
+      const source = readString(item, "source") ?? undefined;
+      const location = readString(item, "location") ?? undefined;
+      normalized.push({
+        trigger,
+        name,
+        description,
+        insertText,
+        source,
+        location,
+      });
+    }
+    return normalized;
   },
 
   async openExternalUrl(url: string): Promise<void> {
@@ -1648,3 +2222,36 @@ export const tauriApi = {
     });
   },
 };
+
+export const piCompact = (customInstructions?: string): Promise<void> =>
+  tauriApi.compactSession(customInstructions);
+export const piPickProjectFolder = (): Promise<string | null> =>
+  tauriApi.piPickProjectFolder();
+export const piAddProject = (path: string): Promise<PiBootstrapData> =>
+  tauriApi.piAddProject(path);
+export const piRemoveProject = (path: string): Promise<PiBootstrapData> =>
+  tauriApi.piRemoveProject(path);
+export const piSwitchProject = (path: string): Promise<PiBootstrapData> =>
+  tauriApi.piSwitchProject(path);
+export const piBash = (command: string): Promise<PiBashResult> =>
+  tauriApi.piBash(command);
+export const piAbortBash = (): Promise<void> =>
+  tauriApi.piAbortBash();
+export const piGetSessionStats = (): Promise<PiSessionStats> =>
+  tauriApi.piGetSessionStats();
+export const piGetLastAssistantText = (): Promise<string | null> =>
+  tauriApi.piGetLastAssistantText();
+export const piSetAutoCompaction = (enabled: boolean): Promise<void> =>
+  tauriApi.piSetAutoCompaction(enabled);
+export const piSetAutoRetry = (enabled: boolean): Promise<void> =>
+  tauriApi.piSetAutoRetry(enabled);
+export const piSetSteeringMode = (mode: PiQueueMode): Promise<void> =>
+  tauriApi.piSetSteeringMode(mode);
+export const piSetFollowUpMode = (mode: PiQueueMode): Promise<void> =>
+  tauriApi.piSetFollowUpMode(mode);
+export const piCycleModel = (): Promise<{ provider?: string; id?: string; model?: unknown } | null> =>
+  tauriApi.piCycleModel();
+export const piCycleThinkingLevel = (): Promise<{ level?: string } | null> =>
+  tauriApi.piCycleThinkingLevel();
+export const piGetCommands = (): Promise<PiCommandInfo[]> =>
+  tauriApi.piGetCommands();
