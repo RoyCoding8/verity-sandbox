@@ -214,54 +214,79 @@ pub fn approve_and_merge_view(
 }
 
 #[tauri::command]
-pub fn list_run_log(repo_path: String) -> Result<Vec<String>, String> {
-    let log = RunLog::open(&PathBuf::from(repo_path)).map_err(|e| e.to_string())?;
-    log.read_lines().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn run_readonly_subagent(repo_path: String, goal: String) -> Result<ReadOnlyResponse, String> {
-    let repo = PathBuf::from(&repo_path);
-    let cfg = PiRpcConfig::default_pi(repo.clone(), true);
-    let res = run_pi_prompt(&cfg, "desktop-readonly", &goal).map_err(|e| e.to_string())?;
-    if let Ok(log) = RunLog::open(&repo) {
-        let _ = log.append_event("desktop-readonly", "completed_readonly", &res.final_text);
-    }
-    Ok(ReadOnlyResponse {
-        summary: res.final_text,
-        tool_calls: res.tool_calls,
-        settled: res.settled,
+pub async fn list_run_log(repo_path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let log = RunLog::open(&PathBuf::from(repo_path)).map_err(|e| e.to_string())?;
+        log.read_lines().map_err(|e| e.to_string())
     })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn spawn_write_subagent(input: SpawnWriteTaskInput) -> Result<HandoffView, String> {
-    spawn_write_task_view(input)
+pub async fn run_readonly_subagent(
+    repo_path: String,
+    goal: String,
+) -> Result<ReadOnlyResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repo = PathBuf::from(&repo_path);
+        let cfg = PiRpcConfig::default_pi(repo.clone(), true);
+        let res = run_pi_prompt(&cfg, "desktop-readonly", &goal).map_err(|e| e.to_string())?;
+        if let Ok(log) = RunLog::open(&repo) {
+            let _ = log.append_event("desktop-readonly", "completed_readonly", &res.final_text);
+        }
+        Ok(ReadOnlyResponse {
+            summary: res.final_text,
+            tool_calls: res.tool_calls,
+            settled: res.settled,
+        })
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn list_handoffs(repo_path: String) -> Result<Vec<HandoffView>, String> {
-    list_persisted_handoffs(&PathBuf::from(repo_path))
+pub async fn spawn_write_subagent(input: SpawnWriteTaskInput) -> Result<HandoffView, String> {
+    tauri::async_runtime::spawn_blocking(move || spawn_write_task_view(input))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn get_handoff(repo_path: String, task_id: String) -> Result<HandoffView, String> {
-    load_handoff_view(&PathBuf::from(repo_path), &task_id)
+pub async fn list_handoffs(repo_path: String) -> Result<Vec<HandoffView>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        list_persisted_handoffs(&PathBuf::from(repo_path))
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn approve_and_merge_handoff(
+pub async fn get_handoff(repo_path: String, task_id: String) -> Result<HandoffView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        load_handoff_view(&PathBuf::from(repo_path), &task_id)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn approve_and_merge_handoff(
     repo_path: String,
     task_id: String,
     target_ref: String,
     approved_digest: String,
 ) -> Result<MergeResponse, String> {
-    approve_and_merge_view(
-        &PathBuf::from(repo_path),
-        &task_id,
-        &target_ref,
-        &approved_digest,
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        approve_and_merge_view(
+            &PathBuf::from(repo_path),
+            &task_id,
+            &target_ref,
+            &approved_digest,
+        )
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[cfg(test)]

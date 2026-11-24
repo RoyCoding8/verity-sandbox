@@ -25,7 +25,7 @@ fn any_activity() -> SessionActivity {
 #[cfg(kani)]
 fn any_command() -> SessionCommand {
     let tag: u8 = kani::any();
-    kani::assume(tag <= 9);
+    kani::assume(tag <= 14);
     match tag {
         0 => SessionCommand::SendPrompt,
         1 => SessionCommand::Steer,
@@ -33,19 +33,25 @@ fn any_command() -> SessionCommand {
         3 => SessionCommand::ClearQueue,
         4 => SessionCommand::Compact,
         5 => SessionCommand::SwitchSession,
-        6 => SessionCommand::RequestProviderReload,
-        7 => SessionCommand::AgentSettled,
-        8 => SessionCommand::FinishCompacting,
-        _ => SessionCommand::FinishSwitch,
+        6 => SessionCommand::NewSession,
+        7 => SessionCommand::Fork,
+        8 => SessionCommand::CloneSession,
+        9 => SessionCommand::RequestProviderReload,
+        10 => SessionCommand::AgentSettled,
+        11 => SessionCommand::FinishCompacting,
+        12 => SessionCommand::FinishSwitch,
+        13 => SessionCommand::Abort,
+        _ => SessionCommand::ProcessExited,
     }
 }
 
-/// Session Exclusivity & Queue Laws (all 4 states x all 10 commands x all u16 queue depths):
+/// Session Exclusivity & Queue Laws (all 4 states x all 15 commands x all u16 queue depths):
 /// - `SendPrompt` is rejected if Streaming, Compacting, SwitchingSession, or `pending_queue > 0`.
-/// - `Compact` and `SwitchSession` are rejected unless Idle.
+/// - `Compact`, `SwitchSession`, `NewSession`, `Fork`, and `CloneSession` are rejected unless Idle.
 /// - `Steer` and `FollowUp` are accepted only while Streaming and increment `pending_queue` without overflow.
 /// - `RequestProviderReload` while Streaming sets `reload_deferred = true` without interrupting the turn;
-///   `AgentSettled` returns whether a deferred reload must now run.
+///   `AgentSettled` and `Abort` return whether a deferred reload must now run.
+/// - `Abort` and `ProcessExited` always succeed from any state and converge to `Idle`.
 #[cfg(kani)]
 #[kani::proof]
 pub fn prove_session_exclusivity_and_queue_laws() {
@@ -78,9 +84,12 @@ pub fn prove_session_exclusivity_and_queue_laws() {
                 assert_eq!(res, Err(SessionError::NotIdle));
             }
         }
-        SessionCommand::SwitchSession => {
+        SessionCommand::SwitchSession
+        | SessionCommand::NewSession
+        | SessionCommand::Fork
+        | SessionCommand::CloneSession => {
             if activity.is_idle() {
-                let t = res.expect("Idle must accept SwitchSession");
+                let t = res.expect("Idle must accept exclusive session lifecycle command");
                 assert_eq!(t.activity, SessionActivity::SwitchingSession);
                 assert!(!t.run_provider_reload);
             } else {
@@ -173,6 +182,18 @@ pub fn prove_session_exclusivity_and_queue_laws() {
                 assert_eq!(res, Err(SessionError::NotSwitching));
             }
         }
+        SessionCommand::Abort => {
+            let t = res.expect("Abort must succeed from any state");
+            assert_eq!(t.activity, SessionActivity::Idle);
+            assert_eq!(t.activity.pending_queue(), 0);
+            assert_eq!(t.run_provider_reload, activity.reload_deferred());
+        }
+        SessionCommand::ProcessExited => {
+            let t = res.expect("ProcessExited must succeed from any state");
+            assert_eq!(t.activity, SessionActivity::Idle);
+            assert_eq!(t.activity.pending_queue(), 0);
+            assert!(!t.run_provider_reload);
+        }
     }
 
     // Non-vacuity reachability probes.
@@ -192,6 +213,26 @@ pub fn prove_session_exclusivity_and_queue_laws() {
             (SessionCommand::SendPrompt, Err(SessionError::NotIdle))
         ),
         "send_prompt_reject_reachable"
+    );
+    kani::cover!(
+        matches!(
+            (command, res),
+            (
+                SessionCommand::NewSession | SessionCommand::Fork | SessionCommand::CloneSession,
+                Ok(t)
+            ) if t.activity == SessionActivity::SwitchingSession
+        ),
+        "lifecycle_switch_accept_reachable"
+    );
+    kani::cover!(
+        matches!(
+            (command, res),
+            (
+                SessionCommand::NewSession | SessionCommand::Fork | SessionCommand::CloneSession,
+                Err(SessionError::NotIdle)
+            )
+        ),
+        "lifecycle_switch_reject_reachable"
     );
     kani::cover!(
         matches!(
@@ -227,52 +268,232 @@ pub fn prove_session_exclusivity_and_queue_laws() {
         ),
         "deferred_reload_dispatch_reachable"
     );
+    kani::cover!(
+        matches!(
+            (command, res),
+            (SessionCommand::Abort, Ok(t)) if t.activity == SessionActivity::Idle && t.run_provider_reload
+        ),
+        "abort_deferred_reload_dispatch_reachable"
+    );
+    kani::cover!(
+        matches!(
+            (activity, command, res),
+            (SessionActivity::Streaming { .. }, SessionCommand::ProcessExited, Ok(t)) if t.activity == SessionActivity::Idle
+        ),
+        "process_exited_streaming_recovery_reachable"
+    );
 }
 
-/// Multi-step trace proving deferred provider reload is never lost while streaming
-/// and fires when the agent settles back to Idle.
+/// Universal Abort & ProcessExited Recovery Law:
+/// From ANY symbolic `SessionActivity` state, `Abort` and `ProcessExited` ALWAYS
+/// converge to `Idle` with `pending_queue == 0` and are idempotent on repetition.
 #[cfg(kani)]
 #[kani::proof]
-#[kani::unwind(6)]
-pub fn prove_deferred_reload_survives_streaming_turns() {
+pub fn prove_universal_abort_and_process_exited_recovery() {
+    let activity = any_activity();
+
+    let abort_res = transition_session(activity, SessionCommand::Abort)
+        .expect("Abort must always succeed from any state");
+    assert_eq!(abort_res.activity, SessionActivity::Idle);
+    assert_eq!(abort_res.activity.pending_queue(), 0);
+    assert!(!abort_res.activity.reload_deferred());
+    assert_eq!(abort_res.run_provider_reload, activity.reload_deferred());
+
+    // Idempotence: a second Abort from Idle stays Idle without re-triggering reload.
+    let abort_again = transition_session(abort_res.activity, SessionCommand::Abort)
+        .expect("Abort from Idle must be idempotent");
+    assert_eq!(abort_again.activity, SessionActivity::Idle);
+    assert_eq!(abort_again.activity.pending_queue(), 0);
+    assert!(!abort_again.run_provider_reload);
+
+    let exit_res = transition_session(activity, SessionCommand::ProcessExited)
+        .expect("ProcessExited must always succeed from any state");
+    assert_eq!(exit_res.activity, SessionActivity::Idle);
+    assert_eq!(exit_res.activity.pending_queue(), 0);
+    assert!(!exit_res.activity.reload_deferred());
+    assert!(!exit_res.run_provider_reload);
+
+    // Idempotence: a second ProcessExited stays Idle.
+    let exit_again = transition_session(exit_res.activity, SessionCommand::ProcessExited)
+        .expect("ProcessExited from Idle must be idempotent");
+    assert_eq!(exit_again.activity, SessionActivity::Idle);
+    assert_eq!(exit_again.activity.pending_queue(), 0);
+
+    kani::cover!(
+        matches!(
+            activity,
+            SessionActivity::Streaming {
+                reload_deferred: true,
+                ..
+            }
+        ) && abort_res.run_provider_reload,
+        "abort_streaming_with_deferred_reload"
+    );
+    kani::cover!(
+        matches!(activity, SessionActivity::Compacting),
+        "abort_and_exit_from_compacting"
+    );
+    kani::cover!(
+        matches!(activity, SessionActivity::SwitchingSession),
+        "abort_and_exit_from_switching"
+    );
+}
+
+/// Deferred Reload Preservation Law:
+/// Whenever `reload_deferred == true` in `Streaming`, `AgentSettled` and `Abort`
+/// ALWAYS emit `run_provider_reload == true`, and in-flight queue operations never clear it.
+#[cfg(kani)]
+#[kani::proof]
+pub fn prove_deferred_reload_preservation_on_settle_and_abort() {
+    let pending_queue: u16 = kani::any();
+    let streaming = SessionActivity::Streaming {
+        pending_queue,
+        reload_deferred: true,
+    };
+
+    let settled = transition_session(streaming, SessionCommand::AgentSettled)
+        .expect("Streaming must accept AgentSettled");
+    assert_eq!(settled.activity, SessionActivity::Idle);
+    assert!(settled.run_provider_reload);
+
+    let aborted = transition_session(streaming, SessionCommand::Abort)
+        .expect("Streaming must accept Abort");
+    assert_eq!(aborted.activity, SessionActivity::Idle);
+    assert!(aborted.run_provider_reload);
+
+    let cleared = transition_session(streaming, SessionCommand::ClearQueue)
+        .expect("Streaming must accept ClearQueue");
+    assert!(cleared.activity.reload_deferred());
+    assert!(!cleared.run_provider_reload);
+
+    if let Ok(steered) = transition_session(streaming, SessionCommand::Steer) {
+        assert!(steered.activity.reload_deferred());
+        assert!(!steered.run_provider_reload);
+    }
+    if let Ok(followed) = transition_session(streaming, SessionCommand::FollowUp) {
+        assert!(followed.activity.reload_deferred());
+        assert!(!followed.run_provider_reload);
+    }
+
+    kani::cover!(
+        pending_queue == MAX_PENDING_QUEUE,
+        "deferred_reload_at_max_queue"
+    );
+    kani::cover!(pending_queue == 0, "deferred_reload_at_empty_queue");
+}
+
+/// Bounded Multi-Step Trace Law:
+/// Over an arbitrary symbolic sequence of up to 5 commands starting from `Idle`,
+/// every session invariant holds at every step:
+/// - `pending_queue == 0` and `!reload_deferred` whenever not `Streaming`
+/// - Exclusive commands (`SendPrompt`, `Compact`, `SwitchSession`, `NewSession`, `Fork`, `CloneSession`)
+///   are never accepted when not `Idle`
+/// - `reload_deferred` is never lost while `Streaming` and fires on `AgentSettled` or `Abort`
+/// - `Abort` and `ProcessExited` always succeed and recover to `Idle`
+#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(7)]
+pub fn prove_bounded_multi_step_session_trace() {
     let mut activity = SessionActivity::Idle;
     let mut reload_requested_while_streaming = false;
-    let mut deferred_reload_dispatched = false;
+    let mut deferred_reload_on_settle = false;
+    let mut deferred_reload_on_abort = false;
+    let mut process_exited_from_busy = false;
+    let mut exclusive_rejected_while_busy = false;
 
     let steps: u8 = kani::any();
-    kani::assume(steps <= 4);
+    kani::assume(steps <= 5);
 
     for _ in 0..steps {
         let cmd = any_command();
+        let was_idle = activity.is_idle();
         let was_streaming = activity.is_streaming();
-        if let Ok(t) = transition_session(activity, cmd) {
-            if was_streaming && matches!(cmd, SessionCommand::RequestProviderReload) {
-                reload_requested_while_streaming = true;
-                assert!(t.activity.is_streaming());
-                assert!(t.activity.reload_deferred());
-                assert!(!t.run_provider_reload);
-            }
-            if matches!(cmd, SessionCommand::AgentSettled) {
-                assert_eq!(t.activity, SessionActivity::Idle);
-                assert_eq!(t.run_provider_reload, reload_requested_while_streaming);
-                if t.run_provider_reload {
-                    deferred_reload_dispatched = true;
+        let is_exclusive = matches!(
+            cmd,
+            SessionCommand::SendPrompt
+                | SessionCommand::Compact
+                | SessionCommand::SwitchSession
+                | SessionCommand::NewSession
+                | SessionCommand::Fork
+                | SessionCommand::CloneSession
+        );
+
+        match transition_session(activity, cmd) {
+            Ok(t) => {
+                if is_exclusive {
+                    assert!(was_idle, "exclusive command must only succeed from Idle");
                 }
-                reload_requested_while_streaming = false;
+                if was_streaming && matches!(cmd, SessionCommand::RequestProviderReload) {
+                    reload_requested_while_streaming = true;
+                    assert!(t.activity.is_streaming());
+                    assert!(t.activity.reload_deferred());
+                    assert!(!t.run_provider_reload);
+                }
+                if matches!(cmd, SessionCommand::AgentSettled) {
+                    assert_eq!(t.activity, SessionActivity::Idle);
+                    assert_eq!(t.run_provider_reload, reload_requested_while_streaming);
+                    if t.run_provider_reload {
+                        deferred_reload_on_settle = true;
+                    }
+                    reload_requested_while_streaming = false;
+                }
+                if matches!(cmd, SessionCommand::Abort) {
+                    assert_eq!(t.activity, SessionActivity::Idle);
+                    assert_eq!(t.activity.pending_queue(), 0);
+                    assert_eq!(t.run_provider_reload, reload_requested_while_streaming);
+                    if t.run_provider_reload {
+                        deferred_reload_on_abort = true;
+                    }
+                    reload_requested_while_streaming = false;
+                }
+                if matches!(cmd, SessionCommand::ProcessExited) {
+                    assert_eq!(t.activity, SessionActivity::Idle);
+                    assert_eq!(t.activity.pending_queue(), 0);
+                    if !was_idle {
+                        process_exited_from_busy = true;
+                    }
+                    reload_requested_while_streaming = false;
+                }
+                if t.activity.is_streaming() && reload_requested_while_streaming {
+                    assert!(
+                        t.activity.reload_deferred(),
+                        "deferred reload flag must persist until AgentSettled or Abort"
+                    );
+                }
+                if !t.activity.is_streaming() {
+                    assert_eq!(t.activity.pending_queue(), 0);
+                    assert!(!t.activity.reload_deferred());
+                }
+                activity = t.activity;
             }
-            if t.activity.is_streaming() && reload_requested_while_streaming {
+            Err(err) => {
                 assert!(
-                    t.activity.reload_deferred(),
-                    "deferred reload flag must persist until AgentSettled"
+                    !matches!(cmd, SessionCommand::Abort | SessionCommand::ProcessExited),
+                    "Abort and ProcessExited must never fail"
                 );
+                if is_exclusive && !was_idle {
+                    assert_eq!(err, SessionError::NotIdle);
+                    exclusive_rejected_while_busy = true;
+                }
             }
-            activity = t.activity;
         }
     }
 
     kani::cover!(
-        deferred_reload_dispatched,
-        "multi_step_deferred_reload_dispatched"
+        deferred_reload_on_settle,
+        "multi_step_deferred_reload_on_settle"
+    );
+    kani::cover!(
+        deferred_reload_on_abort,
+        "multi_step_deferred_reload_on_abort"
+    );
+    kani::cover!(
+        process_exited_from_busy,
+        "multi_step_process_exited_recovery"
+    );
+    kani::cover!(
+        exclusive_rejected_while_busy,
+        "multi_step_exclusive_rejected_while_busy"
     );
 }
 
@@ -400,6 +621,18 @@ mod tests {
             Err(SessionError::NotIdle)
         );
         assert_eq!(
+            transition_session(compacting, SessionCommand::NewSession),
+            Err(SessionError::NotIdle)
+        );
+        assert_eq!(
+            transition_session(compacting, SessionCommand::Fork),
+            Err(SessionError::NotIdle)
+        );
+        assert_eq!(
+            transition_session(compacting, SessionCommand::CloneSession),
+            Err(SessionError::NotIdle)
+        );
+        assert_eq!(
             transition_session(compacting, SessionCommand::RequestProviderReload),
             Err(SessionError::Busy)
         );
@@ -408,21 +641,67 @@ mod tests {
             .activity;
         assert_eq!(idle, SessionActivity::Idle);
 
-        let switching = transition_session(idle, SessionCommand::SwitchSession)
-            .unwrap()
-            .activity;
-        assert_eq!(
-            transition_session(switching, SessionCommand::Compact),
-            Err(SessionError::NotIdle)
-        );
-        assert_eq!(
-            transition_session(switching, SessionCommand::SendPrompt),
-            Err(SessionError::NotIdle)
-        );
-        let back_idle = transition_session(switching, SessionCommand::FinishSwitch)
-            .unwrap()
-            .activity;
-        assert_eq!(back_idle, SessionActivity::Idle);
+        for lifecycle_cmd in [
+            SessionCommand::SwitchSession,
+            SessionCommand::NewSession,
+            SessionCommand::Fork,
+            SessionCommand::CloneSession,
+        ] {
+            let switching = transition_session(idle, lifecycle_cmd).unwrap().activity;
+            assert_eq!(switching, SessionActivity::SwitchingSession);
+            assert_eq!(
+                transition_session(switching, SessionCommand::Compact),
+                Err(SessionError::NotIdle)
+            );
+            assert_eq!(
+                transition_session(switching, SessionCommand::SendPrompt),
+                Err(SessionError::NotIdle)
+            );
+            let back_idle = transition_session(switching, SessionCommand::FinishSwitch)
+                .unwrap()
+                .activity;
+            assert_eq!(back_idle, SessionActivity::Idle);
+        }
+    }
+
+    #[test]
+    fn abort_and_process_exited_recover_from_all_states_and_preserve_deferred_reload() {
+        let streaming_deferred = SessionActivity::Streaming {
+            pending_queue: 3,
+            reload_deferred: true,
+        };
+        let aborted = transition_session(streaming_deferred, SessionCommand::Abort).unwrap();
+        assert_eq!(aborted.activity, SessionActivity::Idle);
+        assert_eq!(aborted.activity.pending_queue(), 0);
+        assert!(aborted.run_provider_reload);
+
+        let aborted_idle = transition_session(SessionActivity::Idle, SessionCommand::Abort).unwrap();
+        assert_eq!(aborted_idle.activity, SessionActivity::Idle);
+        assert!(!aborted_idle.run_provider_reload);
+
+        for state in [
+            SessionActivity::Idle,
+            SessionActivity::Streaming {
+                pending_queue: 2,
+                reload_deferred: false,
+            },
+            SessionActivity::Streaming {
+                pending_queue: 5,
+                reload_deferred: true,
+            },
+            SessionActivity::Compacting,
+            SessionActivity::SwitchingSession,
+        ] {
+            let exited = transition_session(state, SessionCommand::ProcessExited).unwrap();
+            assert_eq!(exited.activity, SessionActivity::Idle);
+            assert_eq!(exited.activity.pending_queue(), 0);
+            assert!(!exited.run_provider_reload);
+
+            let aborted_any = transition_session(state, SessionCommand::Abort).unwrap();
+            assert_eq!(aborted_any.activity, SessionActivity::Idle);
+            assert_eq!(aborted_any.activity.pending_queue(), 0);
+            assert_eq!(aborted_any.run_provider_reload, state.reload_deferred());
+        }
     }
 
     #[test]

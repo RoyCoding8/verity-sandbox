@@ -32,12 +32,14 @@ fn main() {
             pi_ipc::pi_set_model,
             pi_ipc::pi_set_thinking_level,
             pi_ipc::pi_prompt,
+            pi_ipc::pi_compact,
             pi_ipc::pi_steer,
             pi_ipc::pi_follow_up,
             pi_ipc::pi_clear_queue,
             pi_ipc::pi_abort,
             pi_ipc::pi_abort_retry,
             pi_ipc::pi_extension_ui_response,
+            pi_ipc::pi_open_external_url,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Verity desktop");

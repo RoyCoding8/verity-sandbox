@@ -5,14 +5,24 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use verity_core::json::{parse_json, to_json_string, JsonValue};
-use verity_core::provider::{validate_external_sign_in_url, validate_provider_url, ProviderApi};
+use verity_core::provider::{validate_external_sign_in_url, validate_provider_url};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static STORE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub const VERITY_PI_EXTENSION_FILENAME: &str = "verity-providers.js";
 pub const VERITY_PI_EXTENSION_SOURCE: &str =
     include_str!("../resources/verity-providers-extension.js");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderApi {
+    OpenAiCompletions,
+    OpenAiResponses,
+    AnthropicMessages,
+    GoogleGenerativeAi,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredProviderProfile {
@@ -80,6 +90,7 @@ pub fn provider_api_str(api: ProviderApi) -> &'static str {
         ProviderApi::OpenAiCompletions => "openai-completions",
         ProviderApi::OpenAiResponses => "openai-responses",
         ProviderApi::AnthropicMessages => "anthropic-messages",
+        ProviderApi::GoogleGenerativeAi => "google-generative-ai",
     }
 }
 
@@ -88,8 +99,9 @@ pub fn parse_provider_api(raw: &str) -> Result<ProviderApi, String> {
         "openai-completions" => Ok(ProviderApi::OpenAiCompletions),
         "openai-responses" => Ok(ProviderApi::OpenAiResponses),
         "anthropic-messages" => Ok(ProviderApi::AnthropicMessages),
+        "google-generative-ai" => Ok(ProviderApi::GoogleGenerativeAi),
         other => Err(format!(
-            "unsupported provider api '{}' (expected openai-completions, openai-responses, or anthropic-messages)",
+            "unsupported provider api '{}' (expected openai-completions, openai-responses, anthropic-messages, or google-generative-ai)",
             other
         )),
     }
@@ -458,6 +470,18 @@ impl ProviderStore {
 
     pub fn upsert(&mut self, input: ProviderProfileInput) -> Result<PublicProviderProfile, String> {
         let id = validate_provider_id(&input.id)?;
+        let env_key = provider_env_key_name(&id);
+        if let Some(conflict) = self
+            .profiles
+            .iter()
+            .find(|p| p.id != id && provider_env_key_name(&p.id) == env_key)
+        {
+            return Err(format!(
+                "provider id '{}' collides with existing provider '{}' environment key '{}'",
+                id, conflict.id, env_key
+            ));
+        }
+
         let name = input.name.trim().to_string();
         if name.is_empty() {
             return Err("provider name cannot be empty".to_string());
@@ -572,43 +596,78 @@ pub fn build_pi_provider_env(store: &ProviderStore) -> Vec<(String, String)> {
 }
 
 #[tauri::command]
-pub fn list_providers() -> Result<Vec<PublicProviderProfile>, String> {
-    let store = ProviderStore::load(&default_store_path())?;
-    Ok(store.public_profiles())
+pub async fn list_providers() -> Result<Vec<PublicProviderProfile>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let _guard = STORE_WRITE_LOCK
+            .lock()
+            .expect("provider store lock poisoned");
+        let store = ProviderStore::load(&default_store_path())?;
+        Ok(store.public_profiles())
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn upsert_provider(
+pub async fn upsert_provider(
     state: tauri::State<'_, crate::pi_ipc::PiAppState>,
     input: ProviderProfileInput,
 ) -> Result<PublicProviderProfile, String> {
-    let path = default_store_path();
-    let mut store = ProviderStore::load(&path)?;
-    let public = store.upsert(input)?;
-    store.save_atomic(&path)?;
-    state.notify_providers_changed();
-    Ok(public)
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let public = {
+            let _guard = STORE_WRITE_LOCK
+                .lock()
+                .expect("provider store lock poisoned");
+            let path = default_store_path();
+            let mut store = ProviderStore::load(&path)?;
+            let public = store.upsert(input)?;
+            store.save_atomic(&path)?;
+            public
+        };
+        app_state.notify_providers_changed();
+        Ok(public)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn delete_provider(
+pub async fn delete_provider(
     state: tauri::State<'_, crate::pi_ipc::PiAppState>,
     id: String,
 ) -> Result<bool, String> {
-    let path = default_store_path();
-    let mut store = ProviderStore::load(&path)?;
-    let removed = store.remove(&id)?;
-    if removed {
-        store.save_atomic(&path)?;
-        state.notify_providers_changed();
-    }
-    Ok(removed)
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let removed = {
+            let _guard = STORE_WRITE_LOCK
+                .lock()
+                .expect("provider store lock poisoned");
+            let path = default_store_path();
+            let mut store = ProviderStore::load(&path)?;
+            let removed = store.remove(&id)?;
+            if removed {
+                store.save_atomic(&path)?;
+            }
+            removed
+        };
+        if removed {
+            app_state.notify_providers_changed();
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn validate_provider_sign_in_url(url: String) -> Result<String, String> {
-    validate_external_sign_in_url(&url).map_err(|e| e.to_string())?;
-    Ok(url)
+pub async fn validate_provider_sign_in_url(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        validate_external_sign_in_url(&url).map_err(|e| e.to_string())?;
+        Ok(url)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[cfg(test)]
@@ -691,6 +750,37 @@ mod tests {
         assert!(!updated.remove("local-vllm").unwrap());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn supports_google_generative_ai_and_rejects_env_key_collisions() {
+        let mut store = ProviderStore::default();
+        let google = store
+            .upsert(ProviderProfileInput {
+                id: "my-gemini".to_string(),
+                name: "Google Gemini".to_string(),
+                api: "google-generative-ai".to_string(),
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                sign_in_url: None,
+                models: vec!["gemini-2.5-pro".to_string()],
+                api_key: Some("gm-secret".to_string()),
+            })
+            .unwrap();
+        assert_eq!(google.api, "google-generative-ai");
+
+        // Distinct ID that normalizes to the same VERITY_DESKTOP_KEY_MY_GEMINI must be rejected.
+        let err = store
+            .upsert(ProviderProfileInput {
+                id: "my_gemini".to_string(),
+                name: "Collision".to_string(),
+                api: "google-generative-ai".to_string(),
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                sign_in_url: None,
+                models: vec![],
+                api_key: None,
+            })
+            .unwrap_err();
+        assert!(err.contains("collides"));
     }
 
     #[test]
@@ -865,7 +955,7 @@ mod tests {
         assert_eq!(
             resolve_store_path_from_env(
                 Some(""),
-                Some(" 	 "),
+                Some(" \t "),
                 Some("C:"),
                 Some("\\Users\\alice")
             ),

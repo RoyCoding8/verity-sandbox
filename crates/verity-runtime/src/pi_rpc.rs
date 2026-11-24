@@ -5,7 +5,47 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use verity_core::json::{escape_json_string, parse_json};
+use verity_core::json::{escape_json_string, parse_json, JsonValue};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn apply_no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// Resolves the Pi CLI executable name across platforms.
+/// On Windows, npm global shims are `.cmd` files, so `"pi"` resolves to
+/// `pi.exe` / `pi.cmd` on `PATH` or `%APPDATA%\npm\pi.cmd` before falling back to `"pi.cmd"`.
+pub fn resolve_pi_program(program: &str) -> String {
+    #[cfg(windows)]
+    {
+        if program == "pi" {
+            if let Some(paths) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&paths) {
+                    let exe = dir.join("pi.exe");
+                    if exe.is_file() {
+                        return exe.to_string_lossy().to_string();
+                    }
+                    let cmd = dir.join("pi.cmd");
+                    if cmd.is_file() {
+                        return cmd.to_string_lossy().to_string();
+                    }
+                }
+            }
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                let npm_cmd = PathBuf::from(appdata).join("npm").join("pi.cmd");
+                if npm_cmd.is_file() {
+                    return npm_cmd.to_string_lossy().to_string();
+                }
+            }
+            return "pi.cmd".to_string();
+        }
+    }
+    program.to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct PiRpcConfig {
@@ -28,7 +68,7 @@ impl PiRpcConfig {
             args.push("read,grep,find,ls".to_string());
         }
         Self {
-            program: "pi".to_string(),
+            program: resolve_pi_program("pi"),
             args,
             cwd,
             timeout: Duration::from_secs(300),
@@ -72,16 +112,21 @@ pub struct PiPromptResult {
 fn kill_tree(pid: u32) {
     #[cfg(unix)]
     {
+        let pgid_arg = format!("-{}", pid);
         let pid_str = pid.to_string();
+        let _ = Command::new("kill")
+            .args(["-9", "--", &pgid_arg])
+            .status();
         let _ = Command::new("pkill").args(["-9", "-P", &pid_str]).status();
         let _ = Command::new("kill").args(["-9", &pid_str]).status();
     }
     #[cfg(windows)]
     {
         let pid_str = pid.to_string();
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid_str, "/T", "/F"])
-            .status();
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid_str, "/T", "/F"]);
+        apply_no_window(&mut cmd);
+        let _ = cmd.status();
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -95,6 +140,23 @@ fn kill_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Extracts text delta from either nested Pi `assistantMessageEvent` (`text_delta`)
+/// or top-level `delta` fields on a `message_update` event.
+fn extract_text_delta(val: &JsonValue) -> Option<&str> {
+    if let Some(ame) = val.get("assistantMessageEvent") {
+        if let Some(ame_type) = ame.get("type").and_then(JsonValue::as_str) {
+            return match ame_type {
+                "text_delta" => ame
+                    .get("delta")
+                    .or_else(|| ame.get("text"))
+                    .and_then(JsonValue::as_str),
+                _ => None,
+            };
+        }
+    }
+    val.get("delta").and_then(JsonValue::as_str)
+}
+
 /// Runs a single prompt turn against a Pi JSONL RPC child process with hard
 /// wall-clock timeout and tool-call budget enforcement, tearing down the child
 /// and any descendant processes so no orphan workers survive.
@@ -103,12 +165,22 @@ pub fn run_pi_prompt(
     prompt_id: &str,
     prompt_text: &str,
 ) -> Result<PiPromptResult, PiRpcError> {
-    let mut child = Command::new(&cfg.program)
-        .args(&cfg.args)
+    let resolved_program = resolve_pi_program(&cfg.program);
+    let mut cmd = Command::new(&resolved_program);
+    cmd.args(&cfg.args)
         .current_dir(&cfg.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    apply_no_window(&mut cmd);
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| PiRpcError::SpawnFailed(e.to_string()))?;
 
@@ -178,11 +250,11 @@ pub fn run_pi_prompt(
         };
         match val.get("type").and_then(|v| v.as_str()) {
             Some("message_update") => {
-                if let Some(delta) = val.get("delta").and_then(|v| v.as_str()) {
+                if let Some(delta) = extract_text_delta(&val) {
                     final_text.push_str(delta);
                 }
             }
-            Some("tool_call") => {
+            Some("tool_call") | Some("tool_execution_start") => {
                 tool_calls += 1;
                 if tool_calls > cfg.max_tool_calls {
                     budget_err = Some(PiRpcError::ToolCallBudgetExceeded {
@@ -193,7 +265,7 @@ pub fn run_pi_prompt(
                     break;
                 }
             }
-            Some("agent_settled") => {
+            Some("agent_settled") | Some("agent_end") => {
                 settled = true;
                 if let Some(summary) = val.get("summary").and_then(|v| v.as_str()) {
                     if final_text.is_empty() {
@@ -222,4 +294,27 @@ pub fn run_pi_prompt(
         tool_calls,
         settled,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_nested_assistant_message_event_text_deltas_only() {
+        let nested = parse_json(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_text_delta(&nested), Some("hello"));
+
+        let thinking = parse_json(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"secret"}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_text_delta(&thinking), None);
+
+        let flat = parse_json(r#"{"type":"message_update","delta":"world"}"#).unwrap();
+        assert_eq!(extract_text_delta(&flat), Some("world"));
+    }
 }

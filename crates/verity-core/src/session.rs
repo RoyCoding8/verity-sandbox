@@ -51,10 +51,15 @@ pub enum SessionCommand {
     ClearQueue,
     Compact,
     SwitchSession,
+    NewSession,
+    Fork,
+    CloneSession,
     RequestProviderReload,
     AgentSettled,
     FinishCompacting,
     FinishSwitch,
+    Abort,
+    ProcessExited,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +94,8 @@ pub struct SessionTransition {
 }
 
 /// Applies a single `SessionCommand` to `activity`, enforcing session exclusivity,
-/// bounded queue increments, and deferred provider reloads during streaming.
+/// bounded queue increments, deferred provider reloads during streaming, and
+/// universal idempotent recovery on `Abort` and `ProcessExited`.
 pub fn transition_session(
     activity: SessionActivity,
     command: SessionCommand,
@@ -110,11 +116,23 @@ pub fn transition_session(
         }),
         (_, SessionCommand::Compact) => Err(SessionError::NotIdle),
 
-        (SessionActivity::Idle, SessionCommand::SwitchSession) => Ok(SessionTransition {
+        (
+            SessionActivity::Idle,
+            SessionCommand::SwitchSession
+            | SessionCommand::NewSession
+            | SessionCommand::Fork
+            | SessionCommand::CloneSession,
+        ) => Ok(SessionTransition {
             activity: SessionActivity::SwitchingSession,
             run_provider_reload: false,
         }),
-        (_, SessionCommand::SwitchSession) => Err(SessionError::NotIdle),
+        (
+            _,
+            SessionCommand::SwitchSession
+            | SessionCommand::NewSession
+            | SessionCommand::Fork
+            | SessionCommand::CloneSession,
+        ) => Err(SessionError::NotIdle),
 
         (
             SessionActivity::Streaming {
@@ -193,5 +211,27 @@ pub fn transition_session(
             })
         }
         (_, SessionCommand::FinishSwitch) => Err(SessionError::NotSwitching),
+
+        (
+            SessionActivity::Streaming {
+                reload_deferred, ..
+            },
+            SessionCommand::Abort,
+        ) => Ok(SessionTransition {
+            activity: SessionActivity::Idle,
+            run_provider_reload: reload_deferred,
+        }),
+        (
+            SessionActivity::Idle | SessionActivity::Compacting | SessionActivity::SwitchingSession,
+            SessionCommand::Abort,
+        ) => Ok(SessionTransition {
+            activity: SessionActivity::Idle,
+            run_provider_reload: false,
+        }),
+
+        (_, SessionCommand::ProcessExited) => Ok(SessionTransition {
+            activity: SessionActivity::Idle,
+            run_provider_reload: false,
+        }),
     }
 }

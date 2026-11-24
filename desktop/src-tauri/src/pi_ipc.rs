@@ -1,7 +1,8 @@
 use crate::attachments::PendingAttachment;
 use crate::extension_ui::{DialogId, ExtensionUiAnswer};
 use crate::pi_session::{
-    EventSink, PiRpcResponse, PiSessionConfig, PiSessionSupervisor, ReloadDisposition, ReloadHook,
+    EventSink, PiRpcResponse, PiSessionConfig, PiSessionSupervisor, PiUiEvent, ReloadDisposition,
+    ReloadHook,
 };
 use crate::providers::{
     build_pi_provider_env, default_store_path, ensure_verity_pi_extension_path, ProviderStore,
@@ -12,6 +13,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Runtime, State};
@@ -266,6 +268,68 @@ pub fn build_default_pi_config(
     }
 }
 
+/// Validates an external URL at the boundary, allowing only `http://` or `https://`
+/// with a non-empty host and no whitespace or control characters.
+pub fn validate_external_open_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("external URL must not be empty".to_string());
+    }
+    if trimmed
+        .bytes()
+        .any(|b| b < 0x20 || b == 0x7f || b.is_ascii_whitespace())
+    {
+        return Err("external URL must not contain whitespace or control characters".to_string());
+    }
+    let rest = if let Some(r) = trimmed.strip_prefix("https://") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        r
+    } else {
+        return Err("external URL must use http:// or https://".to_string());
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return Err("external URL must include a non-empty host".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn launch_os_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("failed to launch browser: {}", e))?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("failed to launch browser: {}", e))?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("failed to launch browser: {}", e))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = url;
+        Err("opening external URLs is not supported on this platform".to_string())
+    }
+}
+
 // ============================================================
 // Pure RPC Response Boundary Parsers
 // ============================================================
@@ -280,6 +344,14 @@ fn opt_str(val: &JsonValue, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|k| val.get(k).and_then(JsonValue::as_str))
         .map(ToString::to_string)
+}
+
+fn opt_timestamp(val: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| match val.get(k) {
+        Some(JsonValue::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(JsonValue::Number(n)) if n.is_finite() && *n >= 0.0 => Some((*n as u64).to_string()),
+        _ => None,
+    })
 }
 
 fn opt_usize(val: &JsonValue, keys: &[&str]) -> Option<usize> {
@@ -362,7 +434,7 @@ pub fn parse_chat_messages(val: &JsonValue) -> Vec<PiChatMessage> {
                 .unwrap_or_else(|| format!("msg-{}", idx + 1)),
             role: normalize_role(opt_str(item, &["role"])),
             content: extract_message_content(item),
-            timestamp: opt_str(item, &["timestamp", "createdAt", "created_at"])
+            timestamp: opt_timestamp(item, &["timestamp", "createdAt", "created_at"])
                 .unwrap_or_else(|| "now".to_string()),
             streaming: opt_bool(item, &["streaming"]),
             attachments: None,
@@ -385,8 +457,18 @@ pub fn parse_session_summary(
     let name = opt_str(obj, &["name", "sessionName", "session_name", "title"])
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| fallback_name.to_string());
-    let path = opt_str(obj, &["path", "sessionPath", "session_path"]).unwrap_or_default();
-    let updated_at = opt_str(obj, &["updatedAt", "updated_at", "timestamp"])
+    let path = opt_str(
+        obj,
+        &[
+            "path",
+            "sessionPath",
+            "session_path",
+            "sessionFile",
+            "session_file",
+        ],
+    )
+    .unwrap_or_default();
+    let updated_at = opt_timestamp(obj, &["updatedAt", "updated_at", "timestamp"])
         .unwrap_or_else(|| "Just now".to_string());
     let message_count = opt_usize(obj, &["messageCount", "message_count"]).unwrap_or(0);
     let parent_session_id = opt_str(obj, &["parentSessionId", "parent_session_id"]);
@@ -426,7 +508,7 @@ pub fn parse_history_tree(val: &JsonValue) -> Vec<HistoryTreeNode> {
             parent_id: opt_str(item, &["parentId", "parent_id"]),
             role: normalize_role(opt_str(item, &["role"])),
             preview: opt_str(item, &["preview", "text", "content"]).unwrap_or_default(),
-            timestamp: opt_str(item, &["timestamp", "createdAt", "created_at"])
+            timestamp: opt_timestamp(item, &["timestamp", "createdAt", "created_at"])
                 .unwrap_or_else(|| "now".to_string()),
             depth: opt_usize(item, &["depth"]).unwrap_or(0),
             is_active_branch: opt_bool(item, &["isActiveBranch", "is_active_branch"])
@@ -463,7 +545,7 @@ pub fn parse_fork_candidates(val: &JsonValue) -> Vec<ForkCandidate> {
                     .unwrap_or_else(|| format!("entry-{}", idx + 1)),
                 role,
                 preview: opt_str(item, &["preview", "text", "content"]).unwrap_or_default(),
-                timestamp: opt_str(item, &["timestamp", "createdAt", "created_at"])
+                timestamp: opt_timestamp(item, &["timestamp", "createdAt", "created_at"])
                     .unwrap_or_else(|| "now".to_string()),
             }
         })
@@ -805,8 +887,7 @@ fn require_non_empty(field: &str, value: &str) -> Result<String, String> {
 // Managed Tauri Application State
 // ============================================================
 
-/// Managed Tauri v2 state owning the long-lived `PiSessionSupervisor` lifecycle.
-pub struct PiAppState {
+struct PiAppStateInner {
     supervisor: Mutex<Option<Arc<PiSessionSupervisor>>>,
     project_path: Mutex<PathBuf>,
     provider_store_path: PathBuf,
@@ -818,20 +899,48 @@ pub struct PiAppState {
     provider_reload_pending: Arc<AtomicBool>,
 }
 
+impl PiAppStateInner {
+    fn shutdown(&self) {
+        let taken = {
+            let mut guard = self.supervisor.lock().expect("supervisor lock poisoned");
+            guard.take()
+        };
+        if let Some(sup) = taken {
+            sup.shutdown();
+        }
+    }
+}
+
+impl Drop for PiAppStateInner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Managed Tauri v2 state owning the long-lived `PiSessionSupervisor` lifecycle.
+/// Cheaply cloneable (`Arc`) so async Tauri commands can offload blocking IPC
+/// work onto `tauri::async_runtime::spawn_blocking`.
+#[derive(Clone)]
+pub struct PiAppState {
+    inner: Arc<PiAppStateInner>,
+}
+
 impl PiAppState {
     /// Creates default desktop state using the current working directory and standard provider store.
     pub fn new_default() -> Self {
         let project_path = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
-            supervisor: Mutex::new(None),
-            project_path: Mutex::new(project_path),
-            provider_store_path: default_store_path(),
-            base_config: None,
-            selected_model: Mutex::new(None),
-            thinking_level: Mutex::new(ThinkingLevel::Medium),
-            model_pending_sync: AtomicBool::new(false),
-            thinking_level_pending_sync: AtomicBool::new(false),
-            provider_reload_pending: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(PiAppStateInner {
+                supervisor: Mutex::new(None),
+                project_path: Mutex::new(project_path),
+                provider_store_path: default_store_path(),
+                base_config: None,
+                selected_model: Mutex::new(None),
+                thinking_level: Mutex::new(ThinkingLevel::Medium),
+                model_pending_sync: AtomicBool::new(false),
+                thinking_level_pending_sync: AtomicBool::new(false),
+                provider_reload_pending: Arc::new(AtomicBool::new(false)),
+            }),
         }
     }
 
@@ -842,21 +951,24 @@ impl PiAppState {
         base_config: PiSessionConfig,
     ) -> Self {
         Self {
-            supervisor: Mutex::new(None),
-            project_path: Mutex::new(project_path),
-            provider_store_path,
-            base_config: Some(base_config),
-            selected_model: Mutex::new(None),
-            thinking_level: Mutex::new(ThinkingLevel::Medium),
-            model_pending_sync: AtomicBool::new(false),
-            thinking_level_pending_sync: AtomicBool::new(false),
-            provider_reload_pending: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(PiAppStateInner {
+                supervisor: Mutex::new(None),
+                project_path: Mutex::new(project_path),
+                provider_store_path,
+                base_config: Some(base_config),
+                selected_model: Mutex::new(None),
+                thinking_level: Mutex::new(ThinkingLevel::Medium),
+                model_pending_sync: AtomicBool::new(false),
+                thinking_level_pending_sync: AtomicBool::new(false),
+                provider_reload_pending: Arc::new(AtomicBool::new(false)),
+            }),
         }
     }
 
     /// Returns the active project path.
     pub fn project_path(&self) -> PathBuf {
-        self.project_path
+        self.inner
+            .project_path
             .lock()
             .expect("project_path lock poisoned")
             .clone()
@@ -879,7 +991,11 @@ impl PiAppState {
     /// environment variables once idle (or immediately if already idle).
     pub fn notify_providers_changed(&self) {
         let live = {
-            let guard = self.supervisor.lock().expect("supervisor lock poisoned");
+            let guard = self
+                .inner
+                .supervisor
+                .lock()
+                .expect("supervisor lock poisoned");
             guard.as_ref().filter(|s| s.is_alive()).cloned()
         };
         let Some(sup) = live else {
@@ -887,44 +1003,65 @@ impl PiAppState {
         };
         match sup.request_provider_reload() {
             Ok(ReloadDisposition::ExecutedImmediately) => {
-                self.provider_reload_pending.store(false, Ordering::Release);
+                self.inner
+                    .provider_reload_pending
+                    .store(false, Ordering::Release);
                 self.shutdown();
             }
             Ok(ReloadDisposition::DeferredUntilSettled) => {
-                // `reload_hook` will set `provider_reload_pending` once `agent_settled` arrives.
+                // `reload_hook` will set `provider_reload_pending` once `agent_settled` or `abort` arrives.
             }
             Err(_) => {
-                self.provider_reload_pending.store(true, Ordering::Release);
+                self.inner
+                    .provider_reload_pending
+                    .store(true, Ordering::Release);
             }
         }
     }
 
     /// Idempotently returns a live `PiSessionSupervisor`, reconciling any exited/stale instance
     /// and injecting `0o600` provider env vars + `VERITY_MCP_BIN` into the child process.
+    /// Always swaps out and shuts down any replaced supervisor outside the mutex.
     pub fn ensure_supervisor_with_sink(
         &self,
         event_sink: EventSink,
     ) -> Result<Arc<PiSessionSupervisor>, String> {
-        let mut guard = self.supervisor.lock().expect("supervisor lock poisoned");
-        if let Some(existing) = guard.as_ref() {
-            let should_recycle = self.provider_reload_pending.load(Ordering::Acquire)
-                && !existing.activity().is_streaming();
-            if existing.is_alive() && !should_recycle {
-                return Ok(Arc::clone(existing));
+        let to_shutdown = {
+            let mut guard = self
+                .inner
+                .supervisor
+                .lock()
+                .expect("supervisor lock poisoned");
+            if let Some(existing) = guard.as_ref() {
+                let should_recycle = self
+                    .inner
+                    .provider_reload_pending
+                    .load(Ordering::Acquire)
+                    && existing.activity().is_idle();
+                if existing.is_alive() && !should_recycle {
+                    return Ok(Arc::clone(existing));
+                }
+                if should_recycle {
+                    self.inner
+                        .provider_reload_pending
+                        .store(false, Ordering::Release);
+                }
+                guard.take()
+            } else {
+                None
             }
-            if should_recycle {
-                self.provider_reload_pending.store(false, Ordering::Release);
-            }
-            existing.shutdown();
-            *guard = None;
+        };
+
+        if let Some(old) = to_shutdown {
+            old.shutdown();
         }
 
         let project_path = self.project_path();
-        let store = ProviderStore::load(&self.provider_store_path).unwrap_or_default();
+        let store = ProviderStore::load(&self.inner.provider_store_path).unwrap_or_default();
         let verity_bin = resolve_verity_mcp_bin(&project_path);
         let launch_env = build_pi_launch_env(&store, verity_bin.as_deref());
 
-        let mut config = match &self.base_config {
+        let mut config = match &self.inner.base_config {
             Some(cfg) => cfg.clone(),
             None => {
                 let ext_path = ensure_verity_pi_extension_path().ok();
@@ -933,15 +1070,34 @@ impl PiAppState {
         };
         config.env.extend(launch_env);
 
-        let pending_flag = Arc::clone(&self.provider_reload_pending);
+        let pending_flag = Arc::clone(&self.inner.provider_reload_pending);
         let reload_hook: ReloadHook = Arc::new(move || {
             pending_flag.store(true, Ordering::Release);
         });
         let spawned = PiSessionSupervisor::spawn(config, event_sink, reload_hook)
             .map_err(|e| e.to_string())?;
         let arc = Arc::new(spawned);
-        *guard = Some(Arc::clone(&arc));
-        drop(guard);
+
+        let loser = {
+            let mut guard = self
+                .inner
+                .supervisor
+                .lock()
+                .expect("supervisor lock poisoned");
+            if let Some(existing) = guard.as_ref() {
+                if existing.is_alive() {
+                    let winner = Arc::clone(existing);
+                    drop(guard);
+                    arc.shutdown();
+                    return Ok(winner);
+                }
+            }
+            guard.replace(Arc::clone(&arc))
+        };
+        if let Some(old) = loser {
+            old.shutdown();
+        }
+
         self.replay_pending_preferences(&arc);
         Ok(arc)
     }
@@ -949,8 +1105,9 @@ impl PiAppState {
     /// Replays any model or thinking-level selections made while Pi was unavailable
     /// so a newly started supervisor converges idempotently to `PiAppState`.
     fn replay_pending_preferences(&self, sup: &PiSessionSupervisor) {
-        if self.model_pending_sync.load(Ordering::Acquire) {
+        if self.inner.model_pending_sync.load(Ordering::Acquire) {
             let pending_model = self
+                .inner
                 .selected_model
                 .lock()
                 .expect("selected_model lock poisoned")
@@ -961,18 +1118,28 @@ impl PiAppState {
                         .map(|v| parse_model_option(&v, &model.provider, &model.model_id))
                         .unwrap_or(model);
                     *self
+                        .inner
                         .selected_model
                         .lock()
                         .expect("selected_model lock poisoned") = Some(confirmed);
-                    self.model_pending_sync.store(false, Ordering::Release);
+                    self.inner
+                        .model_pending_sync
+                        .store(false, Ordering::Release);
                 }
             } else {
-                self.model_pending_sync.store(false, Ordering::Release);
+                self.inner
+                    .model_pending_sync
+                    .store(false, Ordering::Release);
             }
         }
 
-        if self.thinking_level_pending_sync.load(Ordering::Acquire) {
+        if self
+            .inner
+            .thinking_level_pending_sync
+            .load(Ordering::Acquire)
+        {
             let pending_level = *self
+                .inner
                 .thinking_level
                 .lock()
                 .expect("thinking_level lock poisoned");
@@ -982,10 +1149,12 @@ impl PiAppState {
                     .and_then(|raw| ThinkingLevel::parse(&raw))
                     .unwrap_or(pending_level);
                 *self
+                    .inner
                     .thinking_level
                     .lock()
                     .expect("thinking_level lock poisoned") = confirmed;
-                self.thinking_level_pending_sync
+                self.inner
+                    .thinking_level_pending_sync
                     .store(false, Ordering::Release);
             }
         }
@@ -993,18 +1162,16 @@ impl PiAppState {
 
     /// Idempotently shuts down any running `PiSessionSupervisor` (safe to call on `RunEvent::Exit` and `Drop`).
     pub fn shutdown(&self) {
-        let taken = {
-            let mut guard = self.supervisor.lock().expect("supervisor lock poisoned");
-            guard.take()
-        };
-        if let Some(sup) = taken {
-            sup.shutdown();
-        }
+        self.inner.shutdown();
     }
 
     /// Returns whether a live supervisor is currently active.
     pub fn has_live_supervisor(&self) -> bool {
-        let guard = self.supervisor.lock().expect("supervisor lock poisoned");
+        let guard = self
+            .inner
+            .supervisor
+            .lock()
+            .expect("supervisor lock poisoned");
         guard.as_ref().is_some_and(|s| s.is_alive())
     }
 
@@ -1012,7 +1179,7 @@ impl PiAppState {
 
     pub fn bootstrap_with_sink(&self, event_sink: EventSink) -> PiBootstrapData {
         let project = project_from_path(&self.project_path());
-        let store = ProviderStore::load(&self.provider_store_path).unwrap_or_default();
+        let store = ProviderStore::load(&self.inner.provider_store_path).unwrap_or_default();
         let providers = store.public_profiles();
         let provider_models = models_from_providers(&providers);
         let agent_models = load_pi_agent_models();
@@ -1020,12 +1187,14 @@ impl PiAppState {
         let Ok(sup) = self.ensure_supervisor_with_sink(event_sink) else {
             let models = merge_models_with_fallback(Vec::new(), provider_models, agent_models);
             let stored_model = self
+                .inner
                 .selected_model
                 .lock()
                 .expect("selected_model lock poisoned")
                 .clone();
             let selected_model = stored_model.unwrap_or_else(|| fallback_model(&models));
             let thinking_level = *self
+                .inner
                 .thinking_level
                 .lock()
                 .expect("thinking_level lock poisoned");
@@ -1077,6 +1246,7 @@ impl PiAppState {
             .unwrap_or_default();
 
         let stored_model = self
+            .inner
             .selected_model
             .lock()
             .expect("selected_model lock poisoned")
@@ -1088,11 +1258,13 @@ impl PiAppState {
             .map(|m| parse_model_option(m, &default_model.provider, &default_model.model_id))
             .unwrap_or(default_model);
         *self
+            .inner
             .selected_model
             .lock()
             .expect("selected_model lock poisoned") = Some(selected_model.clone());
 
         let stored_thinking = *self
+            .inner
             .thinking_level
             .lock()
             .expect("thinking_level lock poisoned");
@@ -1102,6 +1274,7 @@ impl PiAppState {
             .and_then(|raw| ThinkingLevel::parse(&raw))
             .unwrap_or(stored_thinking);
         *self
+            .inner
             .thinking_level
             .lock()
             .expect("thinking_level lock poisoned") = thinking_level;
@@ -1284,13 +1457,15 @@ impl PiAppState {
             model_id: model_id.clone(),
         };
 
-        *self
-            .selected_model
-            .lock()
-            .expect("selected_model lock poisoned") = Some(updated_model.clone());
-
         let Ok(sup) = self.ensure_supervisor_with_sink(event_sink) else {
-            self.model_pending_sync.store(true, Ordering::Release);
+            *self
+                .inner
+                .selected_model
+                .lock()
+                .expect("selected_model lock poisoned") = Some(updated_model.clone());
+            self.inner
+                .model_pending_sync
+                .store(true, Ordering::Release);
             return Ok(updated_model);
         };
 
@@ -1301,10 +1476,13 @@ impl PiAppState {
             .map(|v| parse_model_option(&v, &provider, &model_id))
             .unwrap_or(updated_model);
         *self
+            .inner
             .selected_model
             .lock()
             .expect("selected_model lock poisoned") = Some(confirmed.clone());
-        self.model_pending_sync.store(false, Ordering::Release);
+        self.inner
+            .model_pending_sync
+            .store(false, Ordering::Release);
         Ok(confirmed)
     }
 
@@ -1313,13 +1491,14 @@ impl PiAppState {
         event_sink: EventSink,
         level: ThinkingLevel,
     ) -> Result<ThinkingLevel, String> {
-        *self
-            .thinking_level
-            .lock()
-            .expect("thinking_level lock poisoned") = level;
-
         let Ok(sup) = self.ensure_supervisor_with_sink(event_sink) else {
-            self.thinking_level_pending_sync
+            *self
+                .inner
+                .thinking_level
+                .lock()
+                .expect("thinking_level lock poisoned") = level;
+            self.inner
+                .thinking_level_pending_sync
                 .store(true, Ordering::Release);
             return Ok(level);
         };
@@ -1332,10 +1511,12 @@ impl PiAppState {
             .and_then(|raw| ThinkingLevel::parse(&raw))
             .unwrap_or(level);
         *self
+            .inner
             .thinking_level
             .lock()
             .expect("thinking_level lock poisoned") = confirmed;
-        self.thinking_level_pending_sync
+        self.inner
+            .thinking_level_pending_sync
             .store(false, Ordering::Release);
         Ok(confirmed)
     }
@@ -1348,6 +1529,17 @@ impl PiAppState {
     ) -> Result<(), String> {
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
         sup.prompt(message, images).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn compact_with_sink(
+        &self,
+        event_sink: EventSink,
+        custom_instructions: Option<String>,
+    ) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.compact(custom_instructions)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -1380,13 +1572,41 @@ impl PiAppState {
     }
 
     pub fn abort_with_sink(&self, event_sink: EventSink) -> Result<(), String> {
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let live = {
+            let guard = self
+                .inner
+                .supervisor
+                .lock()
+                .expect("supervisor lock poisoned");
+            guard.as_ref().filter(|s| s.is_alive()).cloned()
+        };
+        let Some(sup) = live else {
+            event_sink(PiUiEvent::AgentSettled {
+                summary: Some("aborted".to_string()),
+                raw_json: r#"{"type":"agent_settled","summary":"aborted"}"#.to_string(),
+            });
+            return Ok(());
+        };
         sup.abort().map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn abort_retry_with_sink(&self, event_sink: EventSink) -> Result<(), String> {
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let live = {
+            let guard = self
+                .inner
+                .supervisor
+                .lock()
+                .expect("supervisor lock poisoned");
+            guard.as_ref().filter(|s| s.is_alive()).cloned()
+        };
+        let Some(sup) = live else {
+            event_sink(PiUiEvent::AgentSettled {
+                summary: Some("aborted".to_string()),
+                raw_json: r#"{"type":"agent_settled","summary":"aborted"}"#.to_string(),
+            });
+            return Ok(());
+        };
         sup.abort_retry().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -1442,12 +1662,6 @@ impl PiAppState {
     }
 }
 
-impl Drop for PiAppState {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
 fn tauri_event_sink<R: Runtime>(app: &AppHandle<R>) -> EventSink {
     let app_handle = app.clone();
     Arc::new(move |event| {
@@ -1456,168 +1670,277 @@ fn tauri_event_sink<R: Runtime>(app: &AppHandle<R>) -> EventSink {
 }
 
 // ============================================================
-// 18 Thin Tauri v2 IPC Commands
+// 20 Thin Async Tauri v2 IPC Commands (offloaded via spawn_blocking)
 // ============================================================
 
 #[tauri::command]
-pub fn pi_bootstrap(
+pub async fn pi_bootstrap(
     app: AppHandle,
     state: State<'_, PiAppState>,
 ) -> Result<PiBootstrapData, String> {
-    Ok(state.bootstrap_with_sink(tauri_event_sink(&app)))
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || Ok(app_state.bootstrap_with_sink(sink)))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_switch_session(
+pub async fn pi_switch_session(
     app: AppHandle,
     state: State<'_, PiAppState>,
     session_path: String,
 ) -> Result<Vec<PiChatMessage>, String> {
-    state.switch_session_with_sink(tauri_event_sink(&app), session_path)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.switch_session_with_sink(sink, session_path)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_new_session(
+pub async fn pi_new_session(
     app: AppHandle,
     state: State<'_, PiAppState>,
     project_id: Option<String>,
     parent_session: Option<String>,
 ) -> Result<PiSessionSummary, String> {
-    state.new_session_with_sink(tauri_event_sink(&app), project_id, parent_session)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.new_session_with_sink(sink, project_id, parent_session)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_set_session_name(
+pub async fn pi_set_session_name(
     app: AppHandle,
     state: State<'_, PiAppState>,
     session_id: String,
     name: String,
 ) -> Result<PiSessionSummary, String> {
-    state.set_session_name_with_sink(tauri_event_sink(&app), session_id, name)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.set_session_name_with_sink(sink, session_id, name)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_get_tree(
+pub async fn pi_get_tree(
     app: AppHandle,
     state: State<'_, PiAppState>,
 ) -> Result<Vec<HistoryTreeNode>, String> {
-    state.get_tree_with_sink(tauri_event_sink(&app))
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.get_tree_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_get_fork_messages(
+pub async fn pi_get_fork_messages(
     app: AppHandle,
     state: State<'_, PiAppState>,
 ) -> Result<Vec<ForkCandidate>, String> {
-    state.get_fork_messages_with_sink(tauri_event_sink(&app))
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.get_fork_messages_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_fork(
+pub async fn pi_fork(
     app: AppHandle,
     state: State<'_, PiAppState>,
     entry_id: String,
 ) -> Result<SessionWithMessages, String> {
-    state.fork_with_sink(tauri_event_sink(&app), entry_id)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.fork_with_sink(sink, entry_id))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_clone(
+pub async fn pi_clone(
     app: AppHandle,
     state: State<'_, PiAppState>,
     entry_id: Option<String>,
 ) -> Result<SessionWithMessages, String> {
-    state.clone_with_sink(tauri_event_sink(&app), entry_id)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.clone_with_sink(sink, entry_id))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_export_html(
+pub async fn pi_export_html(
     app: AppHandle,
     state: State<'_, PiAppState>,
     output_path: Option<String>,
 ) -> Result<ExportHtmlResult, String> {
-    state.export_html_with_sink(tauri_event_sink(&app), output_path)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.export_html_with_sink(sink, output_path))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_set_model(
+pub async fn pi_set_model(
     app: AppHandle,
     state: State<'_, PiAppState>,
     provider: String,
     model_id: String,
 ) -> Result<ModelOption, String> {
-    state.set_model_with_sink(tauri_event_sink(&app), provider, model_id)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.set_model_with_sink(sink, provider, model_id)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_set_thinking_level(
+pub async fn pi_set_thinking_level(
     app: AppHandle,
     state: State<'_, PiAppState>,
     level: ThinkingLevel,
 ) -> Result<ThinkingLevel, String> {
-    state.set_thinking_level_with_sink(tauri_event_sink(&app), level)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.set_thinking_level_with_sink(sink, level))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_prompt(
+pub async fn pi_prompt(
     app: AppHandle,
     state: State<'_, PiAppState>,
     message: String,
     images: Vec<PendingAttachment>,
 ) -> Result<(), String> {
-    state.prompt_with_sink(tauri_event_sink(&app), message, images)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.prompt_with_sink(sink, message, images))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_steer(
+pub async fn pi_compact(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    custom_instructions: Option<String>,
+) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.compact_with_sink(sink, custom_instructions)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_steer(
     app: AppHandle,
     state: State<'_, PiAppState>,
     message: String,
     images: Vec<PendingAttachment>,
 ) -> Result<(), String> {
-    state.steer_with_sink(tauri_event_sink(&app), message, images)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.steer_with_sink(sink, message, images))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_follow_up(
+pub async fn pi_follow_up(
     app: AppHandle,
     state: State<'_, PiAppState>,
     message: String,
     images: Vec<PendingAttachment>,
 ) -> Result<(), String> {
-    state.follow_up_with_sink(tauri_event_sink(&app), message, images)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.follow_up_with_sink(sink, message, images)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_clear_queue(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
-    state.clear_queue_with_sink(tauri_event_sink(&app))
+pub async fn pi_clear_queue(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.clear_queue_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_abort(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
-    state.abort_with_sink(tauri_event_sink(&app))
+pub async fn pi_abort(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.abort_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_abort_retry(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
-    state.abort_retry_with_sink(tauri_event_sink(&app))
+pub async fn pi_abort_retry(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.abort_retry_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn pi_extension_ui_response(
+pub async fn pi_extension_ui_response(
     app: AppHandle,
     state: State<'_, PiAppState>,
     dialog_id: String,
     answer: ExtensionUiAnswer,
 ) -> Result<(), String> {
-    state.extension_ui_response_with_sink(tauri_event_sink(&app), dialog_id, answer)
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.extension_ui_response_with_sink(sink, dialog_id, answer)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_open_external_url(url: String) -> Result<(), String> {
+    let validated = validate_external_open_url(&url)?;
+    tauri::async_runtime::spawn_blocking(move || launch_os_browser(&validated))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::attachments::{validate_image_bytes, ImageMimeType};
-    use crate::pi_session::PiUiEvent;
     use crate::providers::ProviderProfileInput;
     use std::sync::mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1680,7 +2003,7 @@ mod tests {
     #[test]
     fn parses_all_ipc_response_payloads_to_frontend_shapes() {
         let msgs_val = parse_json(
-            r#"{"messages":[{"id":"m1","role":"user","content":"hello","timestamp":"10:00"},{"id":"m2","role":"assistant","content":[{"text":"world"}],"timestamp":"10:01","toolCalls":[{"id":"tc1","name":"read","status":"done"}]}]}"#,
+            r#"{"messages":[{"id":"m1","role":"user","content":"hello","timestamp":"10:00"},{"id":"m2","role":"assistant","content":[{"text":"world"}],"timestamp":1700000000000,"toolCalls":[{"id":"tc1","name":"read","status":"done"}]}]}"#,
         )
         .unwrap();
         let msgs = parse_chat_messages(&msgs_val);
@@ -1688,24 +2011,35 @@ mod tests {
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content, "hello");
         assert_eq!(msgs[1].content, "world");
+        assert_eq!(msgs[1].timestamp, "1700000000000");
         assert_eq!(msgs[1].tool_calls.as_ref().unwrap()[0].name, "read");
 
+        let sess_val = parse_json(
+            r#"{"id":"s1","sessionFile":"/tmp/s1.jsonl","updatedAt":1700000000}"#,
+        )
+        .unwrap();
+        let sess = parse_session_summary(&sess_val, "p1", "fb", "Fallback");
+        assert_eq!(sess.path, "/tmp/s1.jsonl");
+        assert_eq!(sess.updated_at, "1700000000");
+
         let tree_val = parse_json(
-            r#"{"nodes":[{"id":"n1","parentId":null,"role":"user","preview":"start","timestamp":"10:00","depth":0,"isActiveBranch":true}]}"#,
+            r#"{"nodes":[{"id":"n1","parentId":null,"role":"user","preview":"start","timestamp":1700000001,"depth":0,"isActiveBranch":true}]}"#,
         )
         .unwrap();
         let tree = parse_history_tree(&tree_val);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].parent_id, None);
+        assert_eq!(tree[0].timestamp, "1700000001");
         assert!(tree[0].is_active_branch);
 
         let forks_val = parse_json(
-            r#"{"messages":[{"entryId":"e1","role":"user","preview":"fork point","timestamp":"10:00"}]}"#,
+            r#"{"messages":[{"entryId":"e1","role":"user","preview":"fork point","timestamp":1700000002}]}"#,
         )
         .unwrap();
         let forks = parse_fork_candidates(&forks_val);
         assert_eq!(forks.len(), 1);
         assert_eq!(forks[0].entry_id, "e1");
+        assert_eq!(forks[0].timestamp, "1700000002");
 
         let models_val = parse_json(
             r#"{"models":[{"provider":"anthropic","modelId":"claude-sonnet-4","label":"Claude Sonnet 4"}]}"#,
@@ -1739,6 +2073,57 @@ mod tests {
         let exported = parse_export_html(&export_val, None);
         assert_eq!(exported.path, "/tmp/export.html");
         assert_eq!(exported.html, "<html>ok</html>");
+    }
+
+    #[test]
+    fn validates_external_open_url_schemes_strictly() {
+        assert_eq!(
+            validate_external_open_url("https://example.com/auth?code=1#ok").unwrap(),
+            "https://example.com/auth?code=1#ok"
+        );
+        assert_eq!(
+            validate_external_open_url("http://localhost:3000/login").unwrap(),
+            "http://localhost:3000/login"
+        );
+        assert!(validate_external_open_url("file:///etc/passwd").is_err());
+        assert!(validate_external_open_url("javascript:alert(1)").is_err());
+        assert!(validate_external_open_url("https://").is_err());
+        assert!(validate_external_open_url("https://example.com/a b").is_err());
+    }
+
+    #[test]
+    fn abort_without_live_supervisor_does_not_spawn_and_emits_agent_settled() {
+        let dir = unique_temp_dir("abort-no-spawn");
+        let store_path = dir.join("providers.json");
+        let missing_cfg = PiSessionConfig {
+            program: "/nonexistent/verity-missing-pi-binary".to_string(),
+            args: vec![],
+            cwd: dir.clone(),
+            env: Vec::new(),
+            command_timeout: Duration::from_secs(1),
+        };
+        let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
+
+        let events: Arc<Mutex<Vec<PiUiEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| {
+            events_clone.lock().unwrap().push(ev);
+        });
+
+        state.abort_with_sink(Arc::clone(&sink)).unwrap();
+        state.abort_retry_with_sink(Arc::clone(&sink)).unwrap();
+        assert!(!state.has_live_supervisor());
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, PiUiEvent::AgentSettled { .. }))
+                .count(),
+            2
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1872,7 +2257,7 @@ while IFS= read -r line; do
       printf '{{"type":"response","id":"%s","command":"follow_up","success":true}}\n' "$id"
       printf '{{"type":"agent_settled","summary":"done"}}\n'
       ;;
-    clear_queue|abort|abort_retry)
+    clear_queue|abort|abort_retry|compact)
       printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
       ;;
     extension_ui_response)
@@ -1993,6 +2378,11 @@ done
             .set_thinking_level_with_sink(Arc::clone(&sink), ThinkingLevel::Xhigh)
             .unwrap();
         assert_eq!(level, ThinkingLevel::Xhigh);
+
+        // 11b. pi_compact
+        state
+            .compact_with_sink(Arc::clone(&sink), Some("brief".to_string()))
+            .unwrap();
 
         // 12. pi_prompt (triggers live message_start + extension_ui_request)
         let img = validate_image_bytes("shot.png", ImageMimeType::Png, b"pngdata").unwrap();
