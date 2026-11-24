@@ -6,8 +6,10 @@ use crate::pi_session::{
 };
 pub use crate::projects::{PiProject, PiSessionSummary};
 use crate::projects::{
-    default_projects_store_path, load_or_init_projects, merge_live_and_disk_sessions,
-    project_from_path, scan_project_sessions, ProjectRegistry,
+    default_projects_store_path, default_session_meta_path, delete_session_file,
+    load_archived_session_ids_from, load_or_init_projects, merge_live_and_disk_sessions,
+    project_from_path, scan_project_sessions_with_archived, set_session_archived_at,
+    ProjectRegistry,
 };
 use crate::providers::{
     build_pi_provider_env, default_store_path, ensure_verity_pi_extension_path, ProviderStore,
@@ -504,6 +506,8 @@ pub fn parse_session_summary(
     let message_count = opt_usize(obj, &["messageCount", "message_count"]).unwrap_or(0);
     let parent_session_id = opt_str(obj, &["parentSessionId", "parent_session_id"]);
 
+    let archived = opt_bool(obj, &["archived"]).unwrap_or(false);
+
     PiSessionSummary {
         id,
         project_id,
@@ -512,6 +516,7 @@ pub fn parse_session_summary(
         updated_at,
         message_count,
         parent_session_id,
+        archived,
     }
 }
 
@@ -950,6 +955,7 @@ struct PiAppStateInner {
     supervisor: Mutex<Option<Arc<PiSessionSupervisor>>>,
     default_cwd: PathBuf,
     projects_store_path: PathBuf,
+    session_meta_path: PathBuf,
     registry: Mutex<ProjectRegistry>,
     provider_store_path: PathBuf,
     base_config: Option<PiSessionConfig>,
@@ -992,12 +998,14 @@ impl PiAppState {
     pub fn new_default() -> Self {
         let default_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let projects_store_path = default_projects_store_path();
+        let session_meta_path = default_session_meta_path();
         let registry = load_or_init_projects(&projects_store_path, &default_cwd);
         Self {
             inner: Arc::new(PiAppStateInner {
                 supervisor: Mutex::new(None),
                 default_cwd,
                 projects_store_path,
+                session_meta_path,
                 registry: Mutex::new(registry),
                 provider_store_path: default_store_path(),
                 base_config: None,
@@ -1018,12 +1026,14 @@ impl PiAppState {
         base_config: PiSessionConfig,
     ) -> Self {
         let projects_store_path = provider_store_path.with_file_name("projects.json");
+        let session_meta_path = provider_store_path.with_file_name("session-meta.json");
         let registry = load_or_init_projects(&projects_store_path, &project_path);
         Self {
             inner: Arc::new(PiAppStateInner {
                 supervisor: Mutex::new(None),
                 default_cwd: project_path,
                 projects_store_path,
+                session_meta_path,
                 registry: Mutex::new(registry),
                 provider_store_path,
                 base_config: Some(base_config),
@@ -1266,9 +1276,32 @@ impl PiAppState {
 
     // --- Pure/Testable IPC Operation Implementations ---
 
+    fn scan_all_project_sessions(
+        &self,
+        projects: &[PiProject],
+        archived_ids: &HashSet<String>,
+    ) -> Vec<PiSessionSummary> {
+        let mut all = Vec::new();
+        for proj in projects {
+            let mut proj_sessions = scan_project_sessions_with_archived(
+                &proj.id,
+                Path::new(&proj.path),
+                archived_ids,
+            );
+            all.append(&mut proj_sessions);
+        }
+        all.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.path.cmp(&a.path))
+        });
+        all
+    }
+
     pub fn bootstrap_with_sink(&self, event_sink: EventSink) -> PiBootstrapData {
         let (projects, project) = self.snapshot_projects();
-        let disk_sessions = scan_project_sessions(&project.id, Path::new(&project.path));
+        let archived_ids = load_archived_session_ids_from(&self.inner.session_meta_path);
+        let disk_sessions = self.scan_all_project_sessions(&projects, &archived_ids);
         let store = ProviderStore::load(&self.inner.provider_store_path).unwrap_or_default();
         let providers = store.public_profiles();
         let provider_models = models_from_providers(&providers);
@@ -1289,7 +1322,10 @@ impl PiAppState {
                 .lock()
                 .expect("thinking_level lock poisoned");
             let active_session_id = disk_sessions
-                .first()
+                .iter()
+                .find(|s| s.project_id == project.id && !s.archived)
+                .or_else(|| disk_sessions.iter().find(|s| s.project_id == project.id))
+                .or_else(|| disk_sessions.first())
                 .map(|s| s.id.clone())
                 .unwrap_or_default();
             return PiBootstrapData {
@@ -1374,7 +1410,7 @@ impl PiAppState {
             .lock()
             .expect("thinking_level lock poisoned") = thinking_level;
 
-        let session = state_val
+        let mut session = state_val
             .as_ref()
             .map(|v| parse_session_summary(v, &project.id, "session-1", "Current session"))
             .unwrap_or_else(|| PiSessionSummary {
@@ -1385,7 +1421,9 @@ impl PiAppState {
                 updated_at: "Just now".to_string(),
                 message_count: messages.len(),
                 parent_session_id: None,
+                archived: false,
             });
+        session.archived = archived_ids.contains(&session.id);
 
         let active_session_id = session.id.clone();
         *self
@@ -1458,6 +1496,96 @@ impl PiAppState {
         Ok(self.bootstrap_with_sink(event_sink))
     }
 
+    pub fn archive_session_with_sink(
+        &self,
+        event_sink: EventSink,
+        session_id: String,
+        archived: bool,
+    ) -> Result<PiBootstrapData, String> {
+        let session_id = require_non_empty("sessionId", &session_id)?;
+        set_session_archived_at(&self.inner.session_meta_path, &session_id, archived)?;
+        Ok(self.bootstrap_with_sink(event_sink))
+    }
+
+    pub fn delete_session_with_sink(
+        &self,
+        event_sink: EventSink,
+        session_id: String,
+    ) -> Result<PiBootstrapData, String> {
+        let session_id = require_non_empty("sessionId", &session_id)?;
+        let (projects, active_project) = self.snapshot_projects();
+        let archived_ids = load_archived_session_ids_from(&self.inner.session_meta_path);
+        let disk_sessions = self.scan_all_project_sessions(&projects, &archived_ids);
+
+        let target_disk = disk_sessions.iter().find(|s| s.id == session_id);
+        let mut target_path = target_disk.map(|s| s.path.clone()).unwrap_or_default();
+
+        let tracked_active_id = self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned")
+            .clone();
+
+        let live_sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink)).ok();
+        let live_session = live_sup.as_ref().and_then(|sup| {
+            sup.get_state()
+                .ok()
+                .and_then(|r| parse_data_json(&r))
+                .map(|v| parse_session_summary(&v, &active_project.id, "session-1", "Current session"))
+        });
+
+        if target_path.trim().is_empty() {
+            if let Some(ref live) = live_session {
+                if live.id == session_id && !live.path.trim().is_empty() {
+                    target_path = live.path.clone();
+                }
+            }
+        }
+
+        let is_active = tracked_active_id.as_deref() == Some(session_id.as_str())
+            || live_session
+                .as_ref()
+                .is_some_and(|live| live.id == session_id);
+
+        // Remove from archived metadata store first.
+        let _ = set_session_archived_at(&self.inner.session_meta_path, &session_id, false);
+
+        // If deleting the active session, switch to the next non-archived session in the same
+        // project or start a fresh session before deleting the file on disk.
+        if is_active {
+            if let Some(ref sup) = live_sup {
+                let next_in_project = disk_sessions.iter().find(|s| {
+                    s.project_id == active_project.id
+                        && s.id != session_id
+                        && !s.archived
+                        && !s.path.trim().is_empty()
+                });
+                if let Some(next_sess) = next_in_project {
+                    let _ = sup.switch_session(&next_sess.path);
+                    *self
+                        .inner
+                        .active_session_id
+                        .lock()
+                        .expect("active_session_id lock poisoned") = Some(next_sess.id.clone());
+                } else {
+                    let _ = sup.new_session(None);
+                    *self
+                        .inner
+                        .active_session_id
+                        .lock()
+                        .expect("active_session_id lock poisoned") = None;
+                }
+            }
+        }
+
+        if !target_path.trim().is_empty() {
+            delete_session_file(&target_path)?;
+        }
+
+        Ok(self.bootstrap_with_sink(event_sink))
+    }
+
     pub fn switch_session_with_sink(
         &self,
         event_sink: EventSink,
@@ -1502,6 +1630,7 @@ impl PiAppState {
                 updated_at: "Just now".to_string(),
                 message_count: 0,
                 parent_session_id: parent_session.clone(),
+                archived: false,
             });
         if summary.parent_session_id.is_none() {
             summary.parent_session_id = parent_session;
@@ -1559,6 +1688,7 @@ impl PiAppState {
                 updated_at: "Just now".to_string(),
                 message_count: 0,
                 parent_session_id: None,
+                archived: false,
             }))
     }
 
@@ -1898,6 +2028,7 @@ impl PiAppState {
                         updated_at: "Just now".to_string(),
                         message_count: 0,
                         parent_session_id: None,
+                        archived: false,
                     });
                 SessionWithMessages {
                     session: summary,
@@ -2334,6 +2465,7 @@ impl PiAppState {
                 updated_at: "Just now".to_string(),
                 message_count: 0,
                 parent_session_id: None,
+                archived: false,
             });
 
         let mut messages = data.as_ref().map(parse_chat_messages).unwrap_or_default();
@@ -2849,6 +2981,35 @@ pub async fn pi_redo_revert(
 ) -> Result<RedoRevertResult, String> {
     let app_state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || app_state.redo_revert_with_sink())
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_archive_session(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    session_id: String,
+    archived: bool,
+) -> Result<PiBootstrapData, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.archive_session_with_sink(sink, session_id, archived)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_delete_session(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    session_id: String,
+) -> Result<PiBootstrapData, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.delete_session_with_sink(sink, session_id))
         .await
         .map_err(|e| format!("blocking task failed: {}", e))?
 }
@@ -4169,6 +4330,167 @@ done
             Some(v) => env::set_var("VERITY_HOME", v),
             None => env::remove_var("VERITY_HOME"),
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_groups_sessions_across_projects_and_supports_archive_and_delete() {
+        let dir = unique_temp_dir("multi-proj-archive-delete");
+        let proj_a = dir.join("proj-alpha");
+        let proj_b = dir.join("proj-beta");
+        let a_sessions = proj_a.join(".pi").join("sessions");
+        let b_sessions = proj_b.join(".pi").join("sessions");
+        fs::create_dir_all(&a_sessions).unwrap();
+        fs::create_dir_all(&b_sessions).unwrap();
+
+        let canon_a = fs::canonicalize(&proj_a).unwrap();
+        let canon_b = fs::canonicalize(&proj_b).unwrap();
+
+        let a1_path = a_sessions.join("a1.jsonl");
+        let a2_path = a_sessions.join("a2.jsonl");
+        let b1_path = b_sessions.join("b1.jsonl");
+
+        fs::write(
+            &a1_path,
+            format!(
+                r#"{{"type":"session","id":"sess-a1","name":"Alpha One","timestamp":"2026-11-22T10:00:00Z","cwd":"{}"}}"#,
+                canon_a.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &a2_path,
+            format!(
+                r#"{{"type":"session","id":"sess-a2","name":"Alpha Two","timestamp":"2026-11-21T10:00:00Z","cwd":"{}"}}"#,
+                canon_a.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &b1_path,
+            format!(
+                r#"{{"type":"session","id":"sess-b1","name":"Beta One","timestamp":"2026-11-23T10:00:00Z","cwd":"{}"}}"#,
+                canon_b.display()
+            ),
+        )
+        .unwrap();
+
+        // Mock Pi script tracks current session id/path across switch_session and new_session.
+        let script = format!(
+            r#"
+CUR_ID="sess-a1"
+CUR_PATH="{a1}"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    get_state)
+      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"id":"%s","name":"Live","path":"%s","model":{{"provider":"anthropic","modelId":"claude-sonnet-5-5","label":"Claude Sonnet 5.5"}},"thinkingLevel":"medium"}}}}\n' "$id" "$CUR_ID" "$CUR_PATH"
+      ;;
+    get_messages)
+      printf '{{"type":"response","id":"%s","command":"get_messages","success":true,"data":{{"messages":[]}}}}\n' "$id"
+      ;;
+    get_available_models)
+      printf '{{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{{"models":[]}}}}\n' "$id"
+      ;;
+    get_available_thinking_levels)
+      printf '{{"type":"response","id":"%s","command":"get_available_thinking_levels","success":true,"data":{{"levels":["medium"]}}}}\n' "$id"
+      ;;
+    get_commands)
+      printf '{{"type":"response","id":"%s","command":"get_commands","success":true,"data":{{"commands":[]}}}}\n' "$id"
+      ;;
+    switch_session)
+      CUR_PATH=$(printf '%s\n' "$line" | sed -n 's/.*"sessionPath":"\([^"]*\)".*/\1/p')
+      case "$CUR_PATH" in
+        *a2.jsonl) CUR_ID="sess-a2" ;;
+        *b1.jsonl) CUR_ID="sess-b1" ;;
+        *) CUR_ID="sess-switched" ;;
+      esac
+      printf '{{"type":"response","id":"%s","command":"switch_session","success":true,"data":{{"messages":[]}}}}\n' "$id"
+      ;;
+    new_session)
+      CUR_ID="sess-fresh"
+      CUR_PATH=""
+      printf '{{"type":"response","id":"%s","command":"new_session","success":true,"data":{{"id":"sess-fresh","name":"New session"}}}}\n' "$id"
+      ;;
+    *)
+      printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#,
+            a1 = a1_path.display()
+        );
+
+        let store_path = dir.join("providers.json");
+        let state = PiAppState::with_config(
+            canon_a.clone(),
+            store_path,
+            mock_sh_config(canon_a.clone(), &script),
+        );
+        let sink: EventSink = Arc::new(|_| {});
+
+        // Register project B, then switch back to project A as active.
+        let _ = state
+            .add_project_with_sink(Arc::clone(&sink), canon_b.to_string_lossy().to_string())
+            .unwrap();
+        let boot = state
+            .switch_project_with_sink(Arc::clone(&sink), canon_a.to_string_lossy().to_string())
+            .unwrap();
+
+        let proj_a_id = project_from_path(&canon_a).id;
+        let proj_b_id = project_from_path(&canon_b).id;
+
+        // Bootstrap must return sessions for BOTH registered projects, tagged with exact project_id.
+        assert_eq!(boot.projects.len(), 2);
+        assert_eq!(boot.active_project_id, proj_a_id);
+        let s_a1 = boot.sessions.iter().find(|s| s.id == "sess-a1").expect("sess-a1");
+        let s_a2 = boot.sessions.iter().find(|s| s.id == "sess-a2").expect("sess-a2");
+        let s_b1 = boot.sessions.iter().find(|s| s.id == "sess-b1").expect("sess-b1");
+        assert_eq!(s_a1.project_id, proj_a_id);
+        assert_eq!(s_a2.project_id, proj_a_id);
+        assert_eq!(s_b1.project_id, proj_b_id);
+        assert!(!s_a1.archived && !s_a2.archived && !s_b1.archived);
+
+        // Archive sess-b1 and verify persisted archived flag.
+        let after_arch = state
+            .archive_session_with_sink(Arc::clone(&sink), "sess-b1".to_string(), true)
+            .unwrap();
+        assert!(after_arch
+            .sessions
+            .iter()
+            .find(|s| s.id == "sess-b1")
+            .unwrap()
+            .archived);
+
+        // Unarchive sess-b1.
+        let after_unarch = state
+            .archive_session_with_sink(Arc::clone(&sink), "sess-b1".to_string(), false)
+            .unwrap();
+        assert!(!after_unarch
+            .sessions
+            .iter()
+            .find(|s| s.id == "sess-b1")
+            .unwrap()
+            .archived);
+
+        // Delete active session sess-a1: must delete a1.jsonl on disk and switch to sess-a2.
+        let after_del_a1 = state
+            .delete_session_with_sink(Arc::clone(&sink), "sess-a1".to_string())
+            .unwrap();
+        assert!(!a1_path.exists(), "a1.jsonl must be deleted from disk");
+        assert!(after_del_a1.sessions.iter().all(|s| s.id != "sess-a1"));
+        assert_eq!(after_del_a1.active_session_id, "sess-a2");
+
+        // Delete remaining active session sess-a2: must delete a2.jsonl and start a fresh session.
+        let after_del_a2 = state
+            .delete_session_with_sink(Arc::clone(&sink), "sess-a2".to_string())
+            .unwrap();
+        assert!(!a2_path.exists(), "a2.jsonl must be deleted from disk");
+        assert!(after_del_a2.sessions.iter().all(|s| s.id != "sess-a2"));
+        assert_eq!(after_del_a2.active_session_id, "sess-fresh");
+
+        state.shutdown();
         let _ = fs::remove_dir_all(&dir);
     }
 }
