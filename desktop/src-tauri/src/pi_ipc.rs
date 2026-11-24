@@ -2744,4 +2744,61 @@ done
         state.shutdown();
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn tauri_capabilities_grant_event_listen_for_main_window() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let conf_path = manifest_dir.join("tauri.conf.json");
+        let conf_raw = fs::read_to_string(&conf_path)
+            .expect("desktop/src-tauri/tauri.conf.json must exist");
+        let conf = parse_json(&conf_raw).expect("tauri.conf.json must be valid JSON");
+        let main_label = conf
+            .get("app")
+            .and_then(|app| app.get("windows"))
+            .and_then(JsonValue::as_array)
+            .and_then(|windows| windows.first())
+            .and_then(|win| win.get("label"))
+            .and_then(JsonValue::as_str)
+            .expect("tauri.conf.json app.windows[0].label must be set");
+        assert_eq!(main_label, "main");
+
+        let cap_path = manifest_dir.join("capabilities").join("default.json");
+        let cap_raw = fs::read_to_string(&cap_path)
+            .expect("desktop/src-tauri/capabilities/default.json must exist");
+        let cap = parse_json(&cap_raw).expect("capabilities/default.json must be valid JSON");
+
+        let windows: Vec<&str> = cap
+            .get("windows")
+            .and_then(JsonValue::as_array)
+            .expect("capabilities/default.json must declare a windows array")
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect();
+        assert!(
+            windows.contains(&main_label),
+            "capabilities/default.json must target window label {:?}",
+            main_label
+        );
+
+        let permissions: Vec<&str> = cap
+            .get("permissions")
+            .and_then(JsonValue::as_array)
+            .expect("capabilities/default.json must declare a permissions array")
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect();
+        for required in [
+            "core:default",
+            "core:event:default",
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "core:event:allow-emit",
+        ] {
+            assert!(
+                permissions.contains(&required),
+                "capabilities/default.json missing required permission {required}"
+            );
+        }
+    }
 }

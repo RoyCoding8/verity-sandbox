@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Default capability for Verity main desktop window allowing core Tauri v2 APIs and pi:event listeners.","local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:event:allow-listen","core:event:allow-unlisten","core:event:allow-emit"]}}
