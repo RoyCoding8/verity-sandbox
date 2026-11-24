@@ -29,80 +29,6 @@ import type {
   SubagentTaskItem,
 } from "./types/verity";
 
-const INITIAL_HANDOFF: HandoffView = {
-  task_id: "task-session-laws",
-  base_commit: "961b030c0a00bef3fe708972fffe56368abb2499",
-  verifier: "kani",
-  candidate_commit: "880ece1e7691f6c58c4a4f53285bd7741c518897",
-  changed_paths: [
-    "crates/verity-core/src/session.rs",
-    "formal/src/session_laws.rs",
-  ],
-  extracted_spec: [
-    "// crates/verity-core/src/session.rs",
-    "18: pub enum SessionActivity { Idle, Streaming { pending_queue: u16, reload_deferred: bool }, Compacting, SwitchingSession }",
-    "41: pub fn transition_session(activity: SessionActivity, cmd: SessionCommand) -> Result<SessionTransition, SessionError>",
-    "// formal/src/session_laws.rs",
-    "64: #[kani::proof]",
-    "65: pub fn prove_session_exclusivity_and_queue_laws()",
-    "92: assert!(next.activity == SessionActivity::Idle || !next.run_provider_reload);",
-    "95: kani::cover!(next.run_provider_reload, \"deferred_reload_fires_on_settle\");",
-  ].join("\n"),
-  back_translation:
-    "Prompts, compaction, and session switches are accepted only while the session is idle. Steering and follow-up messages are accepted only while streaming and stay bounded without integer overflow. Provider reloads requested mid-turn are deferred and fire only when agent_settled returns the session to idle.",
-  hygiene_clean: true,
-  hygiene_violations: [],
-  verdict: {
-    status: "pass",
-    reason: "0 of 271 checks failed; 6 of 6 kani::cover! probes satisfied",
-    checks_passed: 271,
-    probes_satisfied: 6,
-  },
-  spec_digest:
-    "7c9e2f4b18d3a50692f1e4c8b7a6d5e4f3c2b1a0987654321fedcba012345678",
-};
-
-const INITIAL_SUBAGENTS: SubagentTaskItem[] = [
-  {
-    taskId: "task-session-laws",
-    goal: "Prove Pi session exclusivity and deferred reload laws",
-    mode: "write",
-    status: "awaiting_spec_review",
-    verifier: "kani",
-    worktreePath: ".worktrees/core-session-laws",
-    writeScope: ["crates/verity-core/src/session.rs", "formal/src/session_laws.rs"],
-    budget: {
-      toolCallsUsed: 12,
-      toolCallsLimit: 64,
-      wallClockSecsUsed: 42,
-      wallClockSecsLimit: 300,
-    },
-    handoff: INITIAL_HANDOFF,
-  },
-  {
-    taskId: "audit-sandbox-binds",
-    goal: "Audit bubblewrap read-only $GIT_COMMON_DIR mount",
-    mode: "readonly",
-    status: "completed_readonly",
-    verifier: null,
-    worktreePath: null,
-    writeScope: [],
-    budget: {
-      toolCallsUsed: 5,
-      toolCallsLimit: 32,
-      wallClockSecsUsed: 11,
-      wallClockSecsLimit: 120,
-    },
-    readonlySummary:
-      "Verified sandbox.rs binds $GIT_COMMON_DIR read-only and passes --unshare-net on Linux.",
-  },
-];
-
-const INITIAL_LOG_LINES: string[] = [
-  '{"task_id":"task-session-laws","kind":"awaiting_spec_review","detail":"Kani 6/6 proofs verified, 22/22 cover! probes satisfied"}',
-  '{"task_id":"audit-sandbox-binds","kind":"completed_readonly","detail":"Verified read-only .git bind mount under bubblewrap"}',
-];
-
 function parseVerdictStatus(raw: string): VerdictStatus {
   const lower = raw.toLowerCase();
   if (lower === "pass") return "pass";
@@ -119,11 +45,11 @@ export function App() {
   const [mergeQueueOpen, setMergeQueueOpen] = useState(false);
   const [runLogOpen, setRunLogOpen] = useState(false);
 
-  const [subagents, setSubagents] = useState<SubagentTaskItem[]>(INITIAL_SUBAGENTS);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>("task-session-laws");
+  const [subagents, setSubagents] = useState<SubagentTaskItem[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [approvedIds, setApprovedIds] = useState<Record<string, boolean>>({});
   const [mergeEntries, setMergeEntries] = useState<MergeQueueEntry[]>([]);
-  const [rawLogLines, setRawLogLines] = useState<string[]>(INITIAL_LOG_LINES);
+  const [rawLogLines, setRawLogLines] = useState<string[]>([]);
   const [spawning, setSpawning] = useState(false);
 
   useEffect(() => {
@@ -143,35 +69,31 @@ export function App() {
       tauriApi.listRunLog(activeProject.path).catch(() => []),
     ]).then(([handoffs, logs]) => {
       if (cancelled) return;
-      if (handoffs.length > 0) {
-        const mapped: SubagentTaskItem[] = handoffs.map((h) => ({
-          taskId: h.task_id,
-          goal: `Write task ${h.task_id}`,
-          mode: "write",
-          status: "awaiting_spec_review",
+      const mapped: SubagentTaskItem[] = handoffs.map((h) => ({
+        taskId: h.task_id,
+        goal: `Write task ${h.task_id}`,
+        mode: "write",
+        status: "awaiting_spec_review",
+        verifier: h.verifier === "lean" ? "lean" : "kani",
+        worktreePath: `.verity/worktrees/${h.task_id}`,
+        writeScope: [...h.changed_paths],
+        budget: {
+          toolCallsUsed: 0,
+          toolCallsLimit: 64,
+          wallClockSecsUsed: 0,
+          wallClockSecsLimit: 300,
+        },
+        handoff: {
+          ...h,
           verifier: h.verifier === "lean" ? "lean" : "kani",
-          worktreePath: `.verity/worktrees/${h.task_id}`,
-          writeScope: [...h.changed_paths],
-          budget: {
-            toolCallsUsed: 0,
-            toolCallsLimit: 64,
-            wallClockSecsUsed: 0,
-            wallClockSecsLimit: 300,
-          },
-          handoff: {
-            ...h,
-            verifier: h.verifier === "lean" ? "lean" : "kani",
-            changed_paths: [...h.changed_paths],
-            hygiene_violations: [...h.hygiene_violations],
-            verdict: { ...h.verdict, status: parseVerdictStatus(h.verdict.status) },
-          },
-        }));
-        setSubagents(mapped);
-        setSelectedTaskId(mapped[0]?.taskId ?? null);
-      }
-      if (logs.length > 0) {
-        setRawLogLines([...logs]);
-      }
+          changed_paths: [...h.changed_paths],
+          hygiene_violations: [...h.hygiene_violations],
+          verdict: { ...h.verdict, status: parseVerdictStatus(h.verdict.status) },
+        },
+      }));
+      setSubagents(mapped);
+      setSelectedTaskId(mapped[0]?.taskId ?? null);
+      setRawLogLines([...logs]);
     });
     return () => {
       cancelled = true;
@@ -189,11 +111,7 @@ export function App() {
   );
 
   function handleToggleRunLog() {
-    setRunLogOpen((open) => {
-      const next = !open;
-      if (next) setVerityPanelOpen(true);
-      return next;
-    });
+    setRunLogOpen((open) => !open);
   }
 
   async function handleSpawnSubagent(req: SpawnSubagentRequest) {
@@ -363,7 +281,7 @@ export function App() {
 
   const hasMessages = state.messages.length > 0;
   const isHeroEmpty = !hasMessages && state.liveTools.length === 0;
-  const runLogVisible = verityPanelOpen && runLogOpen;
+  const rightRailOpen = verityPanelOpen || runLogOpen;
 
   const composerElement = (variant: "hero" | "docked") => (
     <Composer
@@ -395,7 +313,7 @@ export function App() {
   return (
     <div
       className={
-        verityPanelOpen
+        rightRailOpen
           ? "verity-shell verity-shell--panel-open"
           : "verity-shell"
       }
@@ -460,14 +378,14 @@ export function App() {
             <button
               type="button"
               className={
-                runLogVisible
+                runLogOpen
                   ? "verity-topbar-pill verity-topbar-pill--icon verity-topbar-pill--active"
                   : "verity-topbar-pill verity-topbar-pill--icon"
               }
-              aria-pressed={runLogVisible}
-              aria-label={runLogVisible ? "Hide run log" : "Show run log"}
+              aria-pressed={runLogOpen}
+              aria-label={runLogOpen ? "Hide run log" : "Show run log"}
               onClick={handleToggleRunLog}
-              title={runLogVisible ? "Hide run log" : "Show run log"}
+              title={runLogOpen ? "Hide run log" : "Show run log"}
             >
               <TerminalIcon size={15} />
             </button>
@@ -564,33 +482,42 @@ export function App() {
         )}
       </main>
 
-      {verityPanelOpen && (
+      {rightRailOpen && (
         <aside
           className="verity-right-rail"
-          aria-label="Verification workspace"
+          aria-label={
+            verityPanelOpen ? "Verification workspace" : "Run log"
+          }
         >
-          <SubagentRail
-            tasks={subagents}
-            selectedTaskId={selectedTaskId}
-            onSelectTask={setSelectedTaskId}
-            onSpawnSubagent={handleSpawnSubagent}
-            spawning={spawning}
-          />
-          <SpecReviewDrawer
-            handoff={selectedTask?.handoff ?? null}
-            approved={
-              selectedTask ? Boolean(approvedIds[selectedTask.taskId]) : false
-            }
-            onApprove={handleApproveSpec}
-            onReject={handleRejectSpec}
-          />
           {runLogOpen && (
             <RunLogDrawer
               rawLines={rawLogLines}
               open={runLogOpen}
-              onSelectTask={setSelectedTaskId}
+              onSelectTask={(taskId) => {
+                setSelectedTaskId(taskId);
+                setVerityPanelOpen(true);
+              }}
               onClose={() => setRunLogOpen(false)}
             />
+          )}
+          {verityPanelOpen && (
+            <>
+              <SubagentRail
+                tasks={subagents}
+                selectedTaskId={selectedTaskId}
+                onSelectTask={setSelectedTaskId}
+                onSpawnSubagent={handleSpawnSubagent}
+                spawning={spawning}
+              />
+              <SpecReviewDrawer
+                handoff={selectedTask?.handoff ?? null}
+                approved={
+                  selectedTask ? Boolean(approvedIds[selectedTask.taskId]) : false
+                }
+                onApprove={handleApproveSpec}
+                onReject={handleRejectSpec}
+              />
+            </>
           )}
         </aside>
       )}
