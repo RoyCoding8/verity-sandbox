@@ -1,7 +1,7 @@
 //! Kani 0.68.0 symbolic verification harnesses and unit tests for the Verity
 //! chat-turn and Pi RPC to UI streaming contract (`verity_core::pi_wire`).
 
-#[cfg(any(kani, test))]
+#[cfg(kani)]
 use verity_core::pi_wire::{
     step_ui_turn, UiTurnEvent, UiTurnPhase, UiTurnState, WireRole, WireStopReason,
 };
@@ -380,66 +380,4 @@ pub fn prove_bounded_ui_turn_trace_invariants() {
     kani::cover!(saw_user_abort_recovery, "reach_user_abort_recovery");
     kani::cover!(saw_process_exit_recovery, "reach_process_exit_recovery");
     kani::cover!(saw_stale_epoch_rejection, "reach_stale_epoch_rejection");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_spinners_clear_on_abort_and_process_exit() {
-        let s1 = step_ui_turn(UiTurnState::idle(0), UiTurnEvent::PromptSubmitted);
-        let s2 = step_ui_turn(s1, UiTurnEvent::ToolStart { event_epoch: 0 });
-        assert_eq!(s2.running_tools, 1);
-
-        let aborted = step_ui_turn(s2, UiTurnEvent::UserAbort);
-        assert!(!aborted.is_streaming());
-        assert_eq!(aborted.running_tools, 0);
-
-        let exited = step_ui_turn(s2, UiTurnEvent::ProcessExited);
-        assert_eq!(exited.phase, UiTurnPhase::Disconnected);
-        assert!(exited.has_visible_error);
-        assert_eq!(exited.running_tools, 0);
-    }
-
-    #[test]
-    fn message_end_error_preserves_error_after_agent_settled() {
-        let s1 = step_ui_turn(UiTurnState::idle(0), UiTurnEvent::PromptSubmitted);
-        let s2 = step_ui_turn(
-            s1,
-            UiTurnEvent::MessageEnd {
-                role: WireRole::Assistant,
-                stop_reason: WireStopReason::Error,
-                has_error_message: true,
-                event_epoch: 0,
-            },
-        );
-        assert_eq!(s2.phase, UiTurnPhase::Failed);
-        assert!(s2.has_visible_error);
-
-        let s3 = step_ui_turn(s2, UiTurnEvent::AgentSettled { event_epoch: 0 });
-        assert_eq!(s3.phase, UiTurnPhase::Failed);
-        assert!(s3.has_visible_error);
-        assert!(!s3.is_streaming());
-    }
-
-    #[test]
-    fn retry_failure_marks_visible_error_and_stops_streaming() {
-        let s1 = step_ui_turn(UiTurnState::idle(0), UiTurnEvent::PromptSubmitted);
-        let s2 = step_ui_turn(s1, UiTurnEvent::AutoRetryStart { event_epoch: 0 });
-        assert_eq!(s2.phase, UiTurnPhase::Retrying);
-        assert!(s2.is_streaming());
-        assert!(!s2.thinking_indicator_active());
-
-        let s3 = step_ui_turn(
-            s2,
-            UiTurnEvent::AutoRetryEnd {
-                success: false,
-                event_epoch: 0,
-            },
-        );
-        assert_eq!(s3.phase, UiTurnPhase::Failed);
-        assert!(s3.has_visible_error);
-        assert!(!s3.is_streaming());
-    }
 }

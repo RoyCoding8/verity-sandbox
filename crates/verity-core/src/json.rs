@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn parses_real_openrouter_and_pi_jsonl_payload() {
-        let payload = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Deploying \uD83D\uDE80 to https:\/\/openrouter.ai\/api\/v1","partial":{"role":"assistant","provider":"openrouter","model":"anthropic\/claude-sonnet-4","usage":{"input":1240,"output":85,"cost":{"input":1.2e-06,"output":0.000425,"total":4.262e-4}}}}}"#;
+        let payload = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Deploying \uD83D\uDE80 to https:\/\/openrouter.ai\/api\/v1","partial":{"role":"assistant","provider":"openrouter","model":"anthropic\/claude-sonnet-5-5","usage":{"input":1240,"output":85,"cost":{"input":1.2e-06,"output":0.000425,"total":4.262e-4}}}}}"#;
 
         let val = parse_json(payload).unwrap();
         assert_eq!(val.get("type").and_then(JsonValue::as_str), Some("message_update"));

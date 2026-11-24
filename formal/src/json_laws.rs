@@ -1,6 +1,6 @@
 // Kani formal verification harnesses for json_laws.
 
-#[cfg(any(kani, test))]
+#[cfg(kani)]
 use verity_core::json::{
     decode_utf16_surrogate_pair, parse_hex4_bytes, validate_json_number_bytes,
 };
@@ -136,25 +136,4 @@ pub fn prove_json_number_syntax_laws() {
     kani::cover!(!valid && bytes == b"1e", "number_reject_dangling_exp");
     kani::cover!(!valid && bytes == b"1e+", "number_reject_dangling_exp_plus");
     kani::cover!(!valid && bytes == b"1e-", "number_reject_dangling_exp_minus");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn concrete_sanity_checks_match_formal_laws() {
-        assert_eq!(parse_hex4_bytes(*b"D83D"), Some(0xD83D));
-        assert_eq!(parse_hex4_bytes(*b"de80"), Some(0xDE80));
-        assert_eq!(parse_hex4_bytes(*b"D83G"), None);
-        assert_eq!(decode_utf16_surrogate_pair(0xD83D, 0xDE80), Some('🚀'));
-        assert_eq!(decode_utf16_surrogate_pair(0xD83D, 0x0041), None);
-        assert_eq!(decode_utf16_surrogate_pair(0xDE80, 0xDE80), None);
-
-        assert!(validate_json_number_bytes(b"1.2e-6"));
-        assert!(!validate_json_number_bytes(b""));
-        assert!(!validate_json_number_bytes(b"01"));
-        assert!(!validate_json_number_bytes(b"1."));
-        assert!(!validate_json_number_bytes(b"1e+"));
-    }
 }

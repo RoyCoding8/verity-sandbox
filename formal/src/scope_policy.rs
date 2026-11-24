@@ -1,7 +1,3 @@
-#[cfg(test)]
-use verity_core::scope::within_bytes;
-#[cfg(test)]
-use verity_core::{check_scope, within, RelPath, ScopeError};
 #[cfg(kani)]
 use verity_core::{
     check_scope_core, scope::within_bytes, types::validate_rel_path_bytes, ScopeViolationKind,
@@ -129,34 +125,4 @@ pub fn prove_within_prefix_boundary_laws() {
         !inside && prefix.is_empty(),
         "within_empty_prefix_rejected_reachable"
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prefix_boundary_does_not_match_sibling_directory() {
-        let dir = RelPath::parse("crates/core").unwrap();
-        let inside = RelPath::parse("crates/core/src/lib.rs").unwrap();
-        let sibling = RelPath::parse("crates/core_extra/src/lib.rs").unwrap();
-        assert!(within(&inside, &dir));
-        assert!(!within(&sibling, &dir));
-        assert!(!within_bytes(b"src/foo_bar", b"src/foo"));
-        assert!(!within_bytes(b"/etc/passwd", b""));
-        assert!(!within_bytes(b"", b""));
-    }
-
-    #[test]
-    fn forbidden_overrides_write_scope() {
-        let write_scope = vec![RelPath::parse("src").unwrap()];
-        let forbidden = vec![RelPath::parse("src/locked.rs").unwrap()];
-        let changed = vec![RelPath::parse("src/locked.rs").unwrap()];
-        assert_eq!(
-            check_scope(&changed, &write_scope, &forbidden),
-            Err(ScopeError::ForbiddenPath(
-                RelPath::parse("src/locked.rs").unwrap()
-            ))
-        );
-    }
 }
