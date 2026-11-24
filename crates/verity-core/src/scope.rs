@@ -36,22 +36,25 @@ impl fmt::Display for ScopeError {
 
 impl std::error::Error for ScopeError {}
 
-/// Allocation-free byte-level containment check: returns true if `path` equals
-/// `prefix` or sits directly beneath `prefix/`.
-pub fn within_str(path: &str, prefix: &str) -> bool {
-    let p = path.as_bytes();
-    let pre = prefix.as_bytes();
-    if p.len() < pre.len() {
+/// Allocation-free byte-level containment check: returns true if `prefix` is non-empty
+/// and `path` equals `prefix` or sits directly beneath `prefix/`.
+pub fn within_bytes(path: &[u8], prefix: &[u8]) -> bool {
+    if prefix.is_empty() || path.len() < prefix.len() {
         return false;
     }
     let mut i = 0usize;
-    while i < pre.len() {
-        if p[i] != pre[i] {
+    while i < prefix.len() {
+        if path[i] != prefix[i] {
             return false;
         }
         i += 1;
     }
-    p.len() == pre.len() || p[pre.len()] == b'/'
+    path.len() == prefix.len() || path[prefix.len()] == b'/'
+}
+
+/// Allocation-free string containment check delegating to `within_bytes`.
+pub fn within_str(path: &str, prefix: &str) -> bool {
+    within_bytes(path.as_bytes(), prefix.as_bytes())
 }
 
 /// Returns true if `path` equals `prefix` or sits directly beneath `prefix/`.
