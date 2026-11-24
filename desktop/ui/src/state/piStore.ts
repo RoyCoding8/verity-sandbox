@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   tauriApi,
   type DialogKind,
@@ -10,6 +10,7 @@ import {
   type PiBootstrapData,
   type PiChatMessage,
   type PiProject,
+  type PiRetryBanner,
   type PiSessionSummary,
   type PiToolCallState,
   type PiUiEvent,
@@ -24,11 +25,9 @@ import { applyMd3Theme, detectPreferredTheme, type ThemeMode } from "../theme/md
 // Pure State Types
 // ============================================================
 
-export interface RetryBannerState {
-  readonly attempt: number;
-  readonly maxAttempts: number;
-  readonly delayMs: number;
-}
+export type ConnectionState = "connecting" | "connected" | "degraded" | "disconnected";
+
+export interface RetryBannerState extends PiRetryBanner {}
 
 export interface QueuedExtensionDialog {
   readonly id: string;
@@ -65,6 +64,7 @@ export interface ComposerRecallState {
 
 export interface PiWorkspaceState {
   readonly theme: ThemeMode;
+  readonly connectionState: ConnectionState;
   readonly loading: boolean;
   readonly error: string | null;
   readonly projects: readonly PiProject[];
@@ -91,6 +91,8 @@ export interface PiWorkspaceState {
   readonly extensionWidgets: readonly ExtensionWidget[];
 }
 
+const THEME_STORAGE_KEY = "verity.desktop.theme";
+
 const FALLBACK_MODEL: ModelOption = {
   provider: "anthropic",
   modelId: "claude-sonnet-4-5",
@@ -105,6 +107,37 @@ const DEFAULT_THINKING_LEVELS: readonly ThinkingLevel[] = [
   "high",
   "xhigh",
 ];
+
+let clientIdCounter = 0;
+
+function nextClientId(prefix: string): string {
+  clientIdCounter += 1;
+  return `${prefix}-${clientIdCounter}`;
+}
+
+function readStoredTheme(): ThemeMode {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+      if (stored === "light" || stored === "dark") {
+        return stored;
+      }
+    }
+  } catch {
+    // Ignore storage access failures in restricted environments.
+  }
+  return detectPreferredTheme();
+}
+
+function persistTheme(theme: ThemeMode): void {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    }
+  } catch {
+    // Ignore storage access failures in restricted environments.
+  }
+}
 
 function modelKey(model: Pick<ModelOption, "provider" | "modelId">): string {
   return `${model.provider}::${model.modelId}`;
@@ -130,11 +163,10 @@ function providerProfilesToModels(
   return result;
 }
 
-export function normalizeModels(
+function collectModels(
   models: readonly ModelOption[],
-  selectedModel: ModelOption,
   providers: readonly PublicProviderProfile[] = []
-): readonly ModelOption[] {
+): ModelOption[] {
   const byKey = new Map<string, ModelOption>();
 
   for (const model of models) {
@@ -152,12 +184,20 @@ export function normalizeModels(
     }
   }
 
-  const selectedKey = modelKey(selectedModel);
-  if (!byKey.has(selectedKey)) {
-    byKey.set(selectedKey, selectedModel);
-  }
+  return Array.from(byKey.values());
+}
 
-  return byKey.size > 0 ? Array.from(byKey.values()) : [selectedModel];
+export function normalizeModels(
+  models: readonly ModelOption[],
+  selectedModel: ModelOption,
+  providers: readonly PublicProviderProfile[] = []
+): readonly ModelOption[] {
+  const collected = collectModels(models, providers);
+  const selectedKey = modelKey(selectedModel);
+  if (!collected.some((m) => modelKey(m) === selectedKey)) {
+    collected.push(selectedModel);
+  }
+  return collected.length > 0 ? collected : [selectedModel];
 }
 
 export function normalizeThinkingLevels(
@@ -185,7 +225,8 @@ function formatErrorMessage(err: unknown): string {
 
 export function createInitialPiState(): PiWorkspaceState {
   return {
-    theme: detectPreferredTheme(),
+    theme: readStoredTheme(),
+    connectionState: "connecting",
     loading: true,
     error: null,
     projects: [],
@@ -259,8 +300,10 @@ export function recallDown(
 // ============================================================
 
 export type PiAction =
+  | { readonly type: "bootstrap_start" }
   | { readonly type: "bootstrap_loaded"; readonly data: PiBootstrapData }
   | { readonly type: "set_error"; readonly error: string | null }
+  | { readonly type: "set_connection_state"; readonly connectionState: ConnectionState }
   | { readonly type: "toggle_theme" }
   | { readonly type: "select_project"; readonly projectId: string }
   | {
@@ -269,15 +312,26 @@ export type PiAction =
       readonly projectId: string;
       readonly messages: readonly PiChatMessage[];
     }
-  | { readonly type: "session_created"; readonly session: PiSessionSummary; readonly messages: readonly PiChatMessage[] }
+  | {
+      readonly type: "session_created";
+      readonly session: PiSessionSummary;
+      readonly messages: readonly PiChatMessage[];
+    }
   | { readonly type: "session_renamed"; readonly session: PiSessionSummary }
   | { readonly type: "set_draft"; readonly draft: string }
+  | { readonly type: "clear_composer" }
+  | {
+      readonly type: "restore_composer";
+      readonly draft: string;
+      readonly attachments: readonly PendingAttachment[];
+    }
   | { readonly type: "recall_up" }
   | { readonly type: "recall_down" }
   | { readonly type: "add_attachment"; readonly attachment: PendingAttachment }
   | { readonly type: "remove_attachment"; readonly filename: string }
   | { readonly type: "prompt_submitted"; readonly message: PiChatMessage }
   | { readonly type: "prompt_failed" }
+  | { readonly type: "turn_aborted" }
   | { readonly type: "model_selected"; readonly model: ModelOption }
   | { readonly type: "thinking_selected"; readonly level: ThinkingLevel }
   | { readonly type: "set_modal"; readonly modal: ActiveModal }
@@ -298,6 +352,110 @@ function nowTimeLabel(): string {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function mergeToolCalls(
+  existing: readonly PiToolCallState[] | undefined,
+  incoming: readonly PiToolCallState[]
+): readonly PiToolCallState[] | undefined {
+  if (incoming.length === 0) return existing;
+  if (!existing || existing.length === 0) return incoming;
+  const byId = new Map<string, PiToolCallState>();
+  for (const tool of existing) {
+    byId.set(tool.id, tool);
+  }
+  for (const tool of incoming) {
+    byId.set(tool.id, tool);
+  }
+  return Array.from(byId.values());
+}
+
+function settleRunningTools(tools: readonly PiToolCallState[]): readonly PiToolCallState[] {
+  return tools.map((t) => (t.status === "running" ? { ...t, status: "error" } : t));
+}
+
+function findLatestAssistantIndexInCurrentTurn(messages: readonly PiChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (msg.role === "assistant") {
+      return i;
+    }
+    if (msg.role === "user") {
+      return -1;
+    }
+  }
+  return -1;
+}
+
+function attachToolsAndClearStreaming(
+  messages: readonly PiChatMessage[],
+  toolsToAttach: readonly PiToolCallState[]
+): readonly PiChatMessage[] {
+  const latestAssistantIdx =
+    toolsToAttach.length > 0 ? findLatestAssistantIndexInCurrentTurn(messages) : -1;
+  return messages.map((m, idx) => {
+    const shouldAttach = idx === latestAssistantIdx;
+    if (!m.streaming && !shouldAttach) return m;
+    return {
+      ...m,
+      streaming: false,
+      toolCalls: shouldAttach ? mergeToolCalls(m.toolCalls, toolsToAttach) : m.toolCalls,
+    };
+  });
+}
+
+function attachErrorToActiveTurn(
+  messages: readonly PiChatMessage[],
+  liveTools: readonly PiToolCallState[],
+  isStreaming: boolean,
+  errorMessage: string
+): readonly PiChatMessage[] {
+  const settledTools = settleRunningTools(liveTools);
+  const latestAssistantIdx = findLatestAssistantIndexInCurrentTurn(messages);
+  if (latestAssistantIdx >= 0) {
+    const target = messages[latestAssistantIdx];
+    if (target.streaming || isStreaming) {
+      return messages.map((m, idx) => {
+        if (idx === latestAssistantIdx) {
+          return {
+            ...m,
+            streaming: false,
+            stopReason: "error",
+            errorMessage,
+            toolCalls: mergeToolCalls(m.toolCalls, settledTools),
+          };
+        }
+        return m.streaming ? { ...m, streaming: false } : m;
+      });
+    }
+  }
+  if (!isStreaming) {
+    return messages.map((m) => (m.streaming ? { ...m, streaming: false } : m));
+  }
+  const failedTurn: PiChatMessage = {
+    id: nextClientId("stream"),
+    role: "assistant",
+    content: "",
+    timestamp: nowTimeLabel(),
+    streaming: false,
+    stopReason: "error",
+    errorMessage,
+    toolCalls: settledTools.length > 0 ? settledTools : undefined,
+  };
+  return [
+    ...messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+    failedTurn,
+  ];
+}
+
+function isNonEmptyAssistantMessage(m: PiChatMessage): boolean {
+  if (m.role !== "assistant") return true;
+  const hasText = m.content.trim().length > 0;
+  const hasThinking = Boolean(m.thinking && m.thinking.trim().length > 0);
+  const hasTools = Boolean(m.toolCalls && m.toolCalls.length > 0);
+  const hasError =
+    m.stopReason === "error" || Boolean(m.errorMessage && m.errorMessage.trim().length > 0);
+  return hasText || hasThinking || hasTools || hasError;
 }
 
 type AssistantTarget =
@@ -337,10 +495,9 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
   switch (event.type) {
     case "message_start": {
       if (event.role === "user") {
-        // Optimistic user message was already appended on prompt_submitted.
         return state.isStreaming ? state : { ...state, isStreaming: true };
       }
-      const id = event.message_id ?? `stream-${Date.now()}`;
+      const id = event.message_id ?? nextClientId("stream");
       const existingIdx = state.messages.findIndex((m) => m.id === id);
       if (existingIdx >= 0) {
         const messages = state.messages.map((m, idx) =>
@@ -387,7 +544,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         return { ...state, isStreaming: true, messages };
       }
       const created: PiChatMessage = {
-        id: event.message_id ?? `stream-${Date.now()}`,
+        id: event.message_id ?? nextClientId("stream"),
         role: "assistant",
         content: delta,
         thinking: thinkingDelta || undefined,
@@ -403,8 +560,13 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
     }
 
     case "message_end": {
+      if (event.role === "user") {
+        return state;
+      }
       const finalText = event.text ?? null;
       const finalThinking = event.thinking ?? null;
+      const stopReason = event.stop_reason ?? null;
+      const errorMessage = event.error_message ?? null;
       const target = resolveAssistantTarget(state.messages, event.message_id);
       if (target.kind === "user_message") {
         return state;
@@ -422,31 +584,41 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
             content: hydratedContent,
             thinking: hydratedThinking,
             streaming: false,
-            toolCalls: state.liveTools.length > 0 ? state.liveTools : m.toolCalls,
+            stopReason: stopReason ?? m.stopReason,
+            errorMessage: errorMessage ?? m.errorMessage,
+            toolCalls: mergeToolCalls(m.toolCalls, state.liveTools),
           };
         });
-        return { ...state, messages };
+        return {
+          ...state,
+          messages,
+          liveTools: [],
+        };
       }
-      if (!finalText && !finalThinking) {
+      const hasError = stopReason === "error" || Boolean(errorMessage && errorMessage.trim().length > 0);
+      if (!finalText && !finalThinking && !hasError && state.liveTools.length === 0) {
         return state;
       }
       const completed: PiChatMessage = {
-        id: event.message_id ?? `stream-${Date.now()}`,
+        id: event.message_id ?? nextClientId("stream"),
         role: "assistant",
         content: finalText ?? "",
         thinking: finalThinking ?? undefined,
         timestamp: nowTimeLabel(),
         streaming: false,
+        stopReason,
+        errorMessage,
         toolCalls: state.liveTools.length > 0 ? state.liveTools : undefined,
       };
       return {
         ...state,
         messages: [...state.messages, completed],
+        liveTools: [],
       };
     }
 
     case "tool_execution_start": {
-      const id = event.tool_call_id ?? `tool-${Date.now()}`;
+      const id = event.tool_call_id ?? nextClientId("tool");
       const name = event.tool_name ?? "tool";
       const nextTool: PiToolCallState = { id, name, status: "running" };
       const exists = state.liveTools.some((t) => t.id === id);
@@ -459,10 +631,20 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
     case "tool_execution_end": {
       const id = event.tool_call_id;
       const nextStatus: PiToolCallState["status"] = event.is_error ? "error" : "done";
-      const liveTools = state.liveTools.map((t) =>
-        (id && t.id === id) || (!id && t.name === event.tool_name)
-          ? { ...t, status: nextStatus }
-          : t
+      if (id) {
+        const liveTools = state.liveTools.map((t) =>
+          t.id === id ? { ...t, status: nextStatus } : t
+        );
+        return { ...state, liveTools };
+      }
+      const matchIdx = state.liveTools.findIndex(
+        (t) => t.name === event.tool_name && t.status === "running"
+      );
+      if (matchIdx < 0) {
+        return state;
+      }
+      const liveTools = state.liveTools.map((t, idx) =>
+        idx === matchIdx ? { ...t, status: nextStatus } : t
       );
       return { ...state, liveTools };
     }
@@ -476,42 +658,97 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
     case "auto_retry_start":
       return {
         ...state,
+        isStreaming: true,
         retryBanner: {
           attempt: event.attempt ?? 1,
           maxAttempts: event.max_attempts ?? 3,
           delayMs: event.delay_ms ?? 2000,
+          errorMessage: event.error_message ?? null,
         },
       };
 
-    case "auto_retry_end":
+    case "auto_retry_end": {
+      if (event.success === false) {
+        const finalError = event.final_error?.trim() || "Auto-retry failed.";
+        const snackbar: ExtensionSnackbar = {
+          id: nextClientId("sb"),
+          message: finalError,
+          tone: "error",
+        };
+        return {
+          ...state,
+          isStreaming: false,
+          retryBanner: null,
+          extensionSnackbars: [...state.extensionSnackbars.slice(-3), snackbar],
+        };
+      }
       return { ...state, retryBanner: null };
+    }
+
+    case "error": {
+      const errMessage = event.message.trim() || "Unknown runtime error.";
+      const snackbar: ExtensionSnackbar = {
+        id: nextClientId("sb"),
+        message: errMessage,
+        tone: "error",
+      };
+      const messages = attachErrorToActiveTurn(
+        state.messages,
+        state.liveTools,
+        state.isStreaming,
+        errMessage
+      );
+      return {
+        ...state,
+        isStreaming: false,
+        retryBanner: null,
+        pendingQueueCount: 0,
+        liveTools: [],
+        messages,
+        extensionSnackbars: [...state.extensionSnackbars.slice(-3), snackbar],
+      };
+    }
+
+    case "process_exited": {
+      const tail = event.stderr_tail?.trim();
+      const exitLabel = event.exit_code !== null ? `code ${event.exit_code}` : "unknown code";
+      const errMessage = tail
+        ? `Pi process exited (${exitLabel}): ${tail}`
+        : `Pi process exited unexpectedly (${exitLabel}).`;
+      const snackbar: ExtensionSnackbar = {
+        id: nextClientId("sb"),
+        message: errMessage,
+        tone: "error",
+      };
+      const messages = attachErrorToActiveTurn(
+        state.messages,
+        state.liveTools,
+        state.isStreaming,
+        errMessage
+      );
+      return {
+        ...state,
+        connectionState: "disconnected",
+        isStreaming: false,
+        retryBanner: null,
+        pendingQueueCount: 0,
+        liveTools: [],
+        messages,
+        extensionSnackbars: [...state.extensionSnackbars.slice(-3), snackbar],
+      };
+    }
 
     case "agent_settled": {
-      const finalized = state.messages
-        .map((m) =>
-          m.streaming
-            ? {
-                ...m,
-                streaming: false,
-                toolCalls:
-                  state.liveTools.length > 0 && (!m.toolCalls || m.toolCalls.length === 0)
-                    ? state.liveTools
-                    : m.toolCalls,
-              }
-            : m
-        )
-        .filter((m) => {
-          if (m.role !== "assistant") return true;
-          const hasText = m.content.trim().length > 0;
-          const hasThinking = Boolean(m.thinking && m.thinking.trim().length > 0);
-          const hasTools = Boolean(m.toolCalls && m.toolCalls.length > 0);
-          return hasText || hasThinking || hasTools;
-        });
+      const settledTools = settleRunningTools(state.liveTools);
+      const finalized = attachToolsAndClearStreaming(state.messages, settledTools).filter(
+        isNonEmptyAssistantMessage
+      );
       return {
         ...state,
         isStreaming: false,
         liveTools: [],
         retryBanner: null,
+        pendingQueueCount: 0,
         messages: finalized,
       };
     }
@@ -572,11 +809,20 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
 
 export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspaceState {
   switch (action.type) {
+    case "bootstrap_start":
+      return {
+        ...state,
+        loading: true,
+        error: null,
+        connectionState: "connecting",
+      };
+
     case "bootstrap_loaded":
       return {
         ...state,
         loading: false,
         error: null,
+        connectionState: "connected",
         projects: action.data.projects,
         sessions: action.data.sessions,
         activeProjectId: action.data.activeProjectId,
@@ -598,13 +844,37 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
       };
 
     case "set_error":
-      return { ...state, error: action.error, loading: false };
+      return {
+        ...state,
+        error: action.error,
+        loading: false,
+        connectionState: action.error ? "disconnected" : state.connectionState,
+      };
+
+    case "set_connection_state":
+      return { ...state, connectionState: action.connectionState };
 
     case "toggle_theme":
       return { ...state, theme: state.theme === "dark" ? "light" : "dark" };
 
-    case "select_project":
-      return { ...state, activeProjectId: action.projectId };
+    case "select_project": {
+      const activeBelongsToProject = state.sessions.some(
+        (s) => s.id === state.activeSessionId && s.projectId === action.projectId
+      );
+      if (activeBelongsToProject) {
+        return { ...state, activeProjectId: action.projectId };
+      }
+      return {
+        ...state,
+        activeProjectId: action.projectId,
+        activeSessionId: "",
+        messages: [],
+        isStreaming: false,
+        liveTools: [],
+        retryBanner: null,
+        pendingQueueCount: 0,
+      };
+    }
 
     case "session_switched":
       return {
@@ -615,6 +885,7 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         isStreaming: false,
         liveTools: [],
         retryBanner: null,
+        pendingQueueCount: 0,
       };
 
     case "session_created": {
@@ -627,6 +898,8 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         messages: action.messages,
         isStreaming: false,
         liveTools: [],
+        retryBanner: null,
+        pendingQueueCount: 0,
         modal: { kind: "none" },
       };
     }
@@ -643,6 +916,22 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
       return {
         ...state,
         draft: action.draft,
+        recall: { ...state.recall, index: null },
+      };
+
+    case "clear_composer":
+      return {
+        ...state,
+        draft: "",
+        attachments: [],
+        recall: { ...state.recall, index: null },
+      };
+
+    case "restore_composer":
+      return {
+        ...state,
+        draft: action.draft,
+        attachments: action.attachments,
         recall: { ...state.recall, index: null },
       };
 
@@ -692,10 +981,24 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         ...state,
         isStreaming: false,
         liveTools: [],
+        retryBanner: null,
         messages: state.messages.map((m) =>
           m.streaming ? { ...m, streaming: false } : m
         ),
       };
+
+    case "turn_aborted": {
+      const settledTools = settleRunningTools(state.liveTools);
+      const messages = attachToolsAndClearStreaming(state.messages, settledTools);
+      return {
+        ...state,
+        isStreaming: false,
+        retryBanner: null,
+        pendingQueueCount: 0,
+        liveTools: [],
+        messages,
+      };
+    }
 
     case "model_selected":
       return {
@@ -717,14 +1020,22 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
     case "providers_updated": {
       const baseModels = action.refreshedModels ?? state.models;
       const deletedId = action.deletedProviderId;
-      const filteredBase =
+      const providerWasDeleted = Boolean(
         deletedId && !action.providers.some((p) => p.id === deletedId)
-          ? baseModels.filter((m) => m.provider !== deletedId)
-          : baseModels;
+      );
+      const filteredBase = providerWasDeleted
+        ? baseModels.filter((m) => m.provider !== deletedId)
+        : baseModels;
+      const remainingModels = collectModels(filteredBase, action.providers);
+      const nextSelectedModel =
+        providerWasDeleted && state.selectedModel.provider === deletedId
+          ? (remainingModels[0] ?? FALLBACK_MODEL)
+          : state.selectedModel;
       return {
         ...state,
         providers: action.providers,
-        models: normalizeModels(filteredBase, state.selectedModel, action.providers),
+        selectedModel: nextSelectedModel,
+        models: normalizeModels(filteredBase, nextSelectedModel, action.providers),
       };
     }
 
@@ -771,12 +1082,24 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
 
 export function usePiWorkspace() {
   const [state, dispatch] = useReducer(piReducer, undefined, createInitialPiState);
+  const [bootstrapNonce, setBootstrapNonce] = useState(0);
+
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
   const modelRequestIdRef = useRef(0);
   const thinkingRequestIdRef = useRef(0);
+  const sessionRequestIdRef = useRef(0);
+  const providerRequestIdRef = useRef(0);
+  const submittingRef = useRef(false);
 
-  // Sync dynamic MD3 tokens whenever theme changes
+  const lastConfirmedModelRef = useRef<ModelOption>(state.selectedModel);
+  const lastConfirmedThinkingRef = useRef<ThinkingLevel>(state.thinkingLevel);
+
+  // Sync dynamic MD3 tokens and persist theme preference whenever theme changes
   useEffect(() => {
     applyMd3Theme(state.theme);
+    persistTheme(state.theme);
   }, [state.theme]);
 
   // Bootstrap workspace data + subscribe to Pi JSONL stdout events
@@ -784,95 +1107,160 @@ export function usePiWorkspace() {
     let active = true;
     let unlisten: (() => void) | null = null;
 
+    dispatch({ type: "bootstrap_start" });
+
     void tauriApi
       .bootstrapPiWorkspace()
       .then((data) => {
-        if (active) dispatch({ type: "bootstrap_loaded", data });
+        if (!active) return;
+        lastConfirmedModelRef.current = data.selectedModel;
+        lastConfirmedThinkingRef.current = data.thinkingLevel;
+        dispatch({ type: "bootstrap_loaded", data });
       })
       .catch((err: unknown) => {
         if (active) {
           dispatch({
             type: "set_error",
-            error: err instanceof Error ? err.message : String(err),
+            error: formatErrorMessage(err),
           });
         }
       });
 
-    void tauriApi.listenPiEvents((event) => {
-      if (active) dispatch({ type: "pi_event", event });
-    }).then((fn) => {
-      if (active) {
-        unlisten = fn;
-      } else {
-        fn();
-      }
-    });
+    void tauriApi
+      .listenPiEvents((event) => {
+        if (active) dispatch({ type: "pi_event", event });
+      })
+      .then((fn) => {
+        if (active) {
+          unlisten = fn;
+        } else {
+          fn();
+        }
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        dispatch({ type: "set_connection_state", connectionState: "degraded" });
+        dispatch({
+          type: "push_snackbar",
+          snackbar: {
+            id: nextClientId("sb"),
+            message: `Event stream unavailable: ${formatErrorMessage(err)}`,
+            tone: "error",
+          },
+        });
+      });
 
     return () => {
       active = false;
       unlisten?.();
     };
-  }, []);
+  }, [bootstrapNonce]);
 
   const notify = useCallback((message: string, tone: "info" | "error" = "info") => {
     dispatch({
       type: "push_snackbar",
-      snackbar: { id: `sb-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, message, tone },
+      snackbar: { id: nextClientId("sb"), message, tone },
     });
+  }, []);
+
+  const retryBootstrap = useCallback(() => {
+    setBootstrapNonce((n) => n + 1);
   }, []);
 
   const selectProject = useCallback(
     async (projectId: string) => {
+      const reqId = ++sessionRequestIdRef.current;
       dispatch({ type: "select_project", projectId });
-      const firstSession = state.sessions.find((s) => s.projectId === projectId);
-      if (firstSession) {
+      const firstSession = stateRef.current.sessions.find((s) => s.projectId === projectId);
+      if (!firstSession) return;
+      try {
         const messages = await tauriApi.switchSession(firstSession.path, firstSession.id);
-        dispatch({
-          type: "session_switched",
-          sessionId: firstSession.id,
-          projectId,
-          messages,
-        });
+        if (reqId === sessionRequestIdRef.current) {
+          dispatch({
+            type: "session_switched",
+            sessionId: firstSession.id,
+            projectId,
+            messages,
+          });
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(`Failed to switch project session: ${formatErrorMessage(err)}`, "error");
+        }
       }
     },
-    [state.sessions]
+    [notify]
   );
 
-  const switchSession = useCallback(async (session: PiSessionSummary) => {
-    const messages = await tauriApi.switchSession(session.path, session.id);
-    dispatch({
-      type: "session_switched",
-      sessionId: session.id,
-      projectId: session.projectId,
-      messages,
-    });
-  }, []);
+  const switchSession = useCallback(
+    async (session: PiSessionSummary) => {
+      const reqId = ++sessionRequestIdRef.current;
+      try {
+        const messages = await tauriApi.switchSession(session.path, session.id);
+        if (reqId === sessionRequestIdRef.current) {
+          dispatch({
+            type: "session_switched",
+            sessionId: session.id,
+            projectId: session.projectId,
+            messages,
+          });
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(`Failed to switch session: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [notify]
+  );
 
   const createSession = useCallback(async () => {
-    const projectId = state.activeProjectId || state.projects[0]?.id || "proj-verity";
-    const session = await tauriApi.newSession(projectId);
-    dispatch({ type: "session_created", session, messages: [] });
-  }, [state.activeProjectId, state.projects]);
+    const reqId = ++sessionRequestIdRef.current;
+    const current = stateRef.current;
+    const projectId = current.activeProjectId || current.projects[0]?.id || "proj-verity";
+    try {
+      const session = await tauriApi.newSession(projectId);
+      if (reqId === sessionRequestIdRef.current) {
+        dispatch({ type: "session_created", session, messages: [] });
+      }
+    } catch (err: unknown) {
+      if (reqId === sessionRequestIdRef.current) {
+        notify(`Failed to create session: ${formatErrorMessage(err)}`, "error");
+      }
+    }
+  }, [notify]);
 
   const renameSession = useCallback(
     async (sessionId: string, name: string) => {
-      const updated = await tauriApi.renameSession(sessionId, name);
-      if (updated) {
-        dispatch({ type: "session_renamed", session: updated });
+      try {
+        const updated = await tauriApi.renameSession(sessionId, name);
+        if (updated) {
+          dispatch({ type: "session_renamed", session: updated });
+        }
+      } catch (err: unknown) {
+        notify(`Failed to rename session: ${formatErrorMessage(err)}`, "error");
       }
     },
-    []
+    [notify]
   );
 
   const openHistoryTree = useCallback(async () => {
-    const nodes = await tauriApi.getHistoryTree();
-    dispatch({ type: "set_modal", modal: { kind: "history_tree", nodes } });
-  }, []);
+    try {
+      const nodes = await tauriApi.getHistoryTree();
+      dispatch({ type: "set_modal", modal: { kind: "history_tree", nodes } });
+    } catch (err: unknown) {
+      notify(`Failed to load history tree: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify]);
 
   const openForkModal = useCallback(async () => {
-    const candidates = await tauriApi.getForkCandidates();
-    dispatch({ type: "set_modal", modal: { kind: "fork", candidates } });
-  }, []);
+    try {
+      const candidates = await tauriApi.getForkCandidates();
+      dispatch({ type: "set_modal", modal: { kind: "fork", candidates } });
+    } catch (err: unknown) {
+      notify(`Failed to load fork points: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify]);
 
   const openProvidersModal = useCallback(() => {
     dispatch({ type: "set_modal", modal: { kind: "providers" } });
@@ -884,44 +1272,77 @@ export function usePiWorkspace() {
 
   const forkAtEntry = useCallback(
     async (entryId: string) => {
-      const result = await tauriApi.forkSession(entryId);
-      dispatch({
-        type: "session_created",
-        session: result.session,
-        messages: result.messages,
-      });
-      notify(`Forked session "${result.session.name}"`);
+      const reqId = ++sessionRequestIdRef.current;
+      try {
+        const result = await tauriApi.forkSession(entryId);
+        if (reqId === sessionRequestIdRef.current) {
+          dispatch({
+            type: "session_created",
+            session: result.session,
+            messages: result.messages,
+          });
+          notify(`Forked session "${result.session.name}"`);
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(`Failed to fork session: ${formatErrorMessage(err)}`, "error");
+        }
+      }
     },
     [notify]
   );
 
   const cloneCurrentSession = useCallback(async () => {
-    const result = await tauriApi.cloneSession();
-    dispatch({
-      type: "session_created",
-      session: result.session,
-      messages: result.messages,
-    });
-    notify(`Cloned session "${result.session.name}"`);
+    const reqId = ++sessionRequestIdRef.current;
+    try {
+      const result = await tauriApi.cloneSession();
+      if (reqId === sessionRequestIdRef.current) {
+        dispatch({
+          type: "session_created",
+          session: result.session,
+          messages: result.messages,
+        });
+        notify(`Cloned session "${result.session.name}"`);
+      }
+    } catch (err: unknown) {
+      if (reqId === sessionRequestIdRef.current) {
+        notify(`Failed to clone session: ${formatErrorMessage(err)}`, "error");
+      }
+    }
   }, [notify]);
 
   const exportSessionHtml = useCallback(async () => {
-    const exported = await tauriApi.exportSessionHtml();
-    if (!tauriApi.isDesktop() && typeof document !== "undefined") {
-      const blob = new Blob([exported.html], { type: "text/html;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `${state.activeSessionId || "pi-session"}.html`;
-      link.click();
-      URL.revokeObjectURL(url);
+    try {
+      const exported = await tauriApi.exportSessionHtml();
+      if (!tauriApi.isDesktop() && typeof document !== "undefined") {
+        const blob = new Blob([exported.html], { type: "text/html;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${stateRef.current.activeSessionId || "pi-session"}.html`;
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+      notify(`Exported HTML to ${exported.path}`);
+    } catch (err: unknown) {
+      notify(`Failed to export HTML: ${formatErrorMessage(err)}`, "error");
     }
-    notify(`Exported HTML to ${exported.path}`);
-  }, [notify, state.activeSessionId]);
+  }, [notify]);
+
+  const compactSession = useCallback(async () => {
+    try {
+      await tauriApi.compactSession();
+      notify("Compacted session context.");
+    } catch (err: unknown) {
+      notify(`Failed to compact session: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify]);
 
   const sendPrompt = useCallback(async () => {
-    const text = state.draft.trim();
-    if (!text && state.attachments.length === 0) return;
+    if (submittingRef.current || stateRef.current.isStreaming) return;
+    const text = stateRef.current.draft.trim();
+    const attachments = stateRef.current.attachments;
+    if (!text && attachments.length === 0) return;
 
     if (text === "/tree") {
       dispatch({ type: "set_draft", draft: "" });
@@ -938,13 +1359,18 @@ export function usePiWorkspace() {
       await exportSessionHtml();
       return;
     }
+    if (text === "/compact" || text.startsWith("/compact ")) {
+      dispatch({ type: "set_draft", draft: "" });
+      await compactSession();
+      return;
+    }
 
-    const attachments = state.attachments;
+    submittingRef.current = true;
     const optimisticMsg: PiChatMessage = {
-      id: `local-${Date.now()}`,
+      id: nextClientId("local"),
       role: "user",
       content: text,
-      timestamp: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+      timestamp: nowTimeLabel(),
       attachments: attachments.length > 0 ? attachments : undefined,
     };
     dispatch({ type: "prompt_submitted", message: optimisticMsg });
@@ -953,42 +1379,91 @@ export function usePiWorkspace() {
     } catch (err: unknown) {
       dispatch({ type: "prompt_failed" });
       notify(`Failed to send prompt: ${formatErrorMessage(err)}`, "error");
+    } finally {
+      submittingRef.current = false;
     }
-  }, [state.draft, state.attachments, openHistoryTree, openForkModal, exportSessionHtml, notify]);
+  }, [openHistoryTree, openForkModal, exportSessionHtml, compactSession, notify]);
 
   const steerPrompt = useCallback(async () => {
-    const text = state.draft.trim();
+    if (submittingRef.current) return;
+    const prevDraft = stateRef.current.draft;
+    const prevAttachments = stateRef.current.attachments;
+    const text = prevDraft.trim();
     if (!text) return;
-    const attachments = state.attachments;
-    dispatch({ type: "set_draft", draft: "" });
-    await tauriApi.steer(text, attachments);
-  }, [state.draft, state.attachments]);
+
+    submittingRef.current = true;
+    dispatch({ type: "clear_composer" });
+    try {
+      await tauriApi.steer(text, prevAttachments);
+    } catch (err: unknown) {
+      dispatch({ type: "restore_composer", draft: prevDraft, attachments: prevAttachments });
+      notify(`Failed to send steering instruction: ${formatErrorMessage(err)}`, "error");
+    } finally {
+      submittingRef.current = false;
+    }
+  }, [notify]);
 
   const followUpPrompt = useCallback(async () => {
-    const text = state.draft.trim();
+    if (submittingRef.current) return;
+    const prevDraft = stateRef.current.draft;
+    const prevAttachments = stateRef.current.attachments;
+    const text = prevDraft.trim();
     if (!text) return;
-    const attachments = state.attachments;
-    dispatch({ type: "set_draft", draft: "" });
-    await tauriApi.followUp(text, attachments);
-  }, [state.draft, state.attachments]);
+
+    submittingRef.current = true;
+    dispatch({ type: "clear_composer" });
+    try {
+      await tauriApi.followUp(text, prevAttachments);
+    } catch (err: unknown) {
+      dispatch({ type: "restore_composer", draft: prevDraft, attachments: prevAttachments });
+      notify(`Failed to queue follow-up: ${formatErrorMessage(err)}`, "error");
+    } finally {
+      submittingRef.current = false;
+    }
+  }, [notify]);
 
   const clearQueue = useCallback(async () => {
-    await tauriApi.clearQueue();
-  }, []);
+    try {
+      await tauriApi.clearQueue();
+    } catch (err: unknown) {
+      notify(`Failed to clear queue: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify]);
 
   const abortTurn = useCallback(async () => {
-    await tauriApi.abort();
-  }, []);
+    try {
+      if (stateRef.current.retryBanner) {
+        const results = await Promise.allSettled([tauriApi.abort(), tauriApi.abortRetry()]);
+        const rejected = results.find(
+          (r): r is PromiseRejectedResult => r.status === "rejected"
+        );
+        if (rejected) {
+          notify(`Failed to abort turn: ${formatErrorMessage(rejected.reason)}`, "error");
+        }
+      } else {
+        await tauriApi.abort();
+      }
+    } catch (err: unknown) {
+      notify(`Failed to abort turn: ${formatErrorMessage(err)}`, "error");
+    } finally {
+      dispatch({ type: "turn_aborted" });
+    }
+  }, [notify]);
 
   const abortRetry = useCallback(async () => {
-    await tauriApi.abortRetry();
-  }, []);
+    try {
+      await tauriApi.abortRetry();
+    } catch (err: unknown) {
+      notify(`Failed to cancel retry: ${formatErrorMessage(err)}`, "error");
+    } finally {
+      dispatch({ type: "turn_aborted" });
+    }
+  }, [notify]);
 
   const selectModel = useCallback(
     async (provider: string, modelId: string) => {
-      const previousModel = state.selectedModel;
       const optimisticModel =
-        state.models.find((m) => m.provider === provider && m.modelId === modelId) ?? {
+        stateRef.current.models.find((m) => m.provider === provider && m.modelId === modelId) ?? {
           provider,
           modelId,
           label: modelId,
@@ -998,69 +1473,97 @@ export function usePiWorkspace() {
       try {
         const model = await tauriApi.setModel(provider, modelId);
         if (reqId === modelRequestIdRef.current) {
+          lastConfirmedModelRef.current = model;
           dispatch({ type: "model_selected", model });
         }
       } catch (err: unknown) {
         if (reqId === modelRequestIdRef.current) {
-          dispatch({ type: "model_selected", model: previousModel });
+          dispatch({ type: "model_selected", model: lastConfirmedModelRef.current });
           notify(`Failed to switch model: ${formatErrorMessage(err)}`, "error");
         }
       }
     },
-    [notify, state.models, state.selectedModel]
+    [notify]
   );
 
   const selectThinkingLevel = useCallback(
     async (level: ThinkingLevel) => {
-      const previousLevel = state.thinkingLevel;
       const reqId = ++thinkingRequestIdRef.current;
       dispatch({ type: "thinking_selected", level });
       try {
         const next = await tauriApi.setThinkingLevel(level);
         if (reqId === thinkingRequestIdRef.current) {
+          lastConfirmedThinkingRef.current = next;
           dispatch({ type: "thinking_selected", level: next });
         }
       } catch (err: unknown) {
         if (reqId === thinkingRequestIdRef.current) {
-          dispatch({ type: "thinking_selected", level: previousLevel });
+          dispatch({ type: "thinking_selected", level: lastConfirmedThinkingRef.current });
           notify(`Failed to update thinking level: ${formatErrorMessage(err)}`, "error");
         }
       }
     },
-    [notify, state.thinkingLevel]
+    [notify]
   );
 
   const upsertProvider = useCallback(
     async (input: ProviderProfileInput) => {
-      await tauriApi.upsertProvider(input);
-      const [list, refreshed] = await Promise.all([
-        tauriApi.listProviders(),
-        tauriApi.bootstrapPiWorkspace().catch(() => null),
-      ]);
-      dispatch({
-        type: "providers_updated",
-        providers: list,
-        refreshedModels: refreshed?.models,
-      });
-      notify(`Saved provider "${input.name}"`);
+      const reqId = ++providerRequestIdRef.current;
+      try {
+        await tauriApi.upsertProvider(input);
+        const [list, refreshed] = await Promise.all([
+          tauriApi.listProviders(),
+          tauriApi.bootstrapPiWorkspace().catch(() => null),
+        ]);
+        if (reqId === providerRequestIdRef.current) {
+          dispatch({
+            type: "providers_updated",
+            providers: list,
+            refreshedModels: refreshed?.models,
+          });
+          notify(`Saved provider "${input.name}"`);
+        }
+      } catch (err: unknown) {
+        if (reqId === providerRequestIdRef.current) {
+          notify(`Failed to save provider: ${formatErrorMessage(err)}`, "error");
+        }
+      }
     },
     [notify]
   );
 
   const deleteProvider = useCallback(
     async (id: string) => {
-      await tauriApi.deleteProvider(id);
-      const [list, refreshed] = await Promise.all([
-        tauriApi.listProviders(),
-        tauriApi.bootstrapPiWorkspace().catch(() => null),
-      ]);
-      dispatch({
-        type: "providers_updated",
-        providers: list,
-        refreshedModels: refreshed?.models,
-        deletedProviderId: id,
-      });
-      notify(`Deleted provider "${id}"`);
+      const reqId = ++providerRequestIdRef.current;
+      try {
+        await tauriApi.deleteProvider(id);
+        const [list, refreshed] = await Promise.all([
+          tauriApi.listProviders(),
+          tauriApi.bootstrapPiWorkspace().catch(() => null),
+        ]);
+        if (reqId === providerRequestIdRef.current) {
+          const baseModels = refreshed?.models ?? stateRef.current.models;
+          const filteredBase = baseModels.filter((m) => m.provider !== id);
+          const remainingModels = collectModels(filteredBase, list);
+          if (
+            lastConfirmedModelRef.current.provider === id &&
+            !list.some((p) => p.id === id)
+          ) {
+            lastConfirmedModelRef.current = remainingModels[0] ?? FALLBACK_MODEL;
+          }
+          dispatch({
+            type: "providers_updated",
+            providers: list,
+            refreshedModels: refreshed?.models,
+            deletedProviderId: id,
+          });
+          notify(`Deleted provider "${id}"`);
+        }
+      } catch (err: unknown) {
+        if (reqId === providerRequestIdRef.current) {
+          notify(`Failed to delete provider: ${formatErrorMessage(err)}`, "error");
+        }
+      }
     },
     [notify]
   );
@@ -1068,9 +1571,13 @@ export function usePiWorkspace() {
   const respondExtensionDialog = useCallback(
     async (dialogId: string, answer: ExtensionUiAnswer) => {
       dispatch({ type: "shift_extension_dialog", dialogId });
-      await tauriApi.respondExtensionUi(dialogId, answer);
+      try {
+        await tauriApi.respondExtensionUi(dialogId, answer);
+      } catch (err: unknown) {
+        notify(`Failed to send dialog response: ${formatErrorMessage(err)}`, "error");
+      }
     },
-    []
+    [notify]
   );
 
   const projectSessions = useMemo(
@@ -1092,6 +1599,7 @@ export function usePiWorkspace() {
     activeSession,
     actions: {
       toggleTheme: () => dispatch({ type: "toggle_theme" }),
+      retryBootstrap,
       selectProject,
       switchSession,
       createSession,
@@ -1103,6 +1611,7 @@ export function usePiWorkspace() {
       forkAtEntry,
       cloneCurrentSession,
       exportSessionHtml,
+      compactSession,
       setDraft: (draft: string) => dispatch({ type: "set_draft", draft }),
       recallUp: () => dispatch({ type: "recall_up" }),
       recallDown: () => dispatch({ type: "recall_down" }),

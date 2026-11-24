@@ -85,6 +85,15 @@ export interface PiChatMessage {
   readonly streaming?: boolean;
   readonly attachments?: readonly PendingAttachment[];
   readonly toolCalls?: readonly PiToolCallState[];
+  readonly stopReason?: string | null;
+  readonly errorMessage?: string | null;
+}
+
+export interface PiRetryBanner {
+  readonly attempt: number;
+  readonly maxAttempts: number;
+  readonly delayMs: number;
+  readonly errorMessage?: string | null;
 }
 
 export interface HistoryTreeNode {
@@ -124,8 +133,10 @@ export type PiUiEvent =
       readonly type: "message_end";
       readonly message_id: string | null;
       readonly stop_reason: string | null;
+      readonly role?: string | null;
       readonly text?: string | null;
       readonly thinking?: string | null;
+      readonly error_message?: string | null;
     }
   | {
       readonly type: "tool_execution_start";
@@ -144,8 +155,20 @@ export type PiUiEvent =
       readonly attempt: number | null;
       readonly max_attempts: number | null;
       readonly delay_ms: number | null;
+      readonly error_message?: string | null;
     }
-  | { readonly type: "auto_retry_end"; readonly attempt: number | null; readonly success: boolean | null }
+  | {
+      readonly type: "auto_retry_end";
+      readonly attempt: number | null;
+      readonly success: boolean | null;
+      readonly final_error?: string | null;
+    }
+  | { readonly type: "error"; readonly message: string }
+  | {
+      readonly type: "process_exited";
+      readonly exit_code: number | null;
+      readonly stderr_tail: string | null;
+    }
   | {
       readonly type: "extension_ui_request";
       readonly id: string;
@@ -348,7 +371,7 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
       let delta = readString(raw, "delta");
       let thinkingDelta =
         readString(raw, "thinking_delta") ?? readString(raw, "thinkingDelta");
-      if (delta === null && thinkingDelta === null) {
+      if (!delta && !thinkingDelta) {
         const rawJson = parseRawJsonRecord(raw);
         const assistantEvent =
           rawJson && isRecord(rawJson["assistantMessageEvent"])
@@ -373,22 +396,55 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
     }
     case "message_end": {
       const messageId = readString(raw, "message_id") ?? readString(raw, "messageId");
-      const stopReason = readString(raw, "stop_reason") ?? readString(raw, "stopReason");
+      let stopReason = readString(raw, "stop_reason") ?? readString(raw, "stopReason");
+      let role = readString(raw, "role");
       let text = readString(raw, "text");
       let thinking = readString(raw, "thinking");
-      if (text === null || thinking === null) {
+      let errorMessage = readString(raw, "error_message") ?? readString(raw, "errorMessage");
+      if (
+        text === null ||
+        thinking === null ||
+        role === null ||
+        errorMessage === null ||
+        stopReason === null
+      ) {
         const rawJson = parseRawJsonRecord(raw);
         const nestedMsg = rawJson && isRecord(rawJson["message"]) ? rawJson["message"] : null;
         const extracted = extractMessageContentParts(nestedMsg);
         if (text === null) text = extracted.text;
         if (thinking === null) thinking = extracted.thinking;
+        if (role === null) {
+          role =
+            (nestedMsg ? readString(nestedMsg, "role") : null) ??
+            (rawJson ? readString(rawJson, "role") : null);
+        }
+        if (errorMessage === null) {
+          errorMessage =
+            (nestedMsg
+              ? readString(nestedMsg, "errorMessage") ?? readString(nestedMsg, "error_message")
+              : null) ??
+            (rawJson
+              ? readString(rawJson, "errorMessage") ?? readString(rawJson, "error_message")
+              : null);
+        }
+        if (stopReason === null) {
+          stopReason =
+            (nestedMsg
+              ? readString(nestedMsg, "stopReason") ?? readString(nestedMsg, "stop_reason")
+              : null) ??
+            (rawJson
+              ? readString(rawJson, "stopReason") ?? readString(rawJson, "stop_reason")
+              : null);
+        }
       }
       return {
         type,
         message_id: messageId,
         stop_reason: stopReason,
+        role,
         text,
         thinking,
+        error_message: errorMessage,
       };
     }
     case "tool_execution_start":
@@ -406,18 +462,52 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
       };
     case "queue_update":
       return { type, pending_count: readNumber(raw, "pending_count") };
-    case "auto_retry_start":
+    case "auto_retry_start": {
+      let errorMessage = readString(raw, "error_message") ?? readString(raw, "errorMessage");
+      if (errorMessage === null) {
+        const rawJson = parseRawJsonRecord(raw);
+        errorMessage = rawJson
+          ? readString(rawJson, "errorMessage") ?? readString(rawJson, "error_message")
+          : null;
+      }
       return {
         type,
         attempt: readNumber(raw, "attempt"),
         max_attempts: readNumber(raw, "max_attempts"),
         delay_ms: readNumber(raw, "delay_ms"),
+        error_message: errorMessage,
       };
-    case "auto_retry_end":
+    }
+    case "auto_retry_end": {
+      let finalError = readString(raw, "final_error") ?? readString(raw, "finalError");
+      if (finalError === null) {
+        const rawJson = parseRawJsonRecord(raw);
+        finalError = rawJson
+          ? readString(rawJson, "finalError") ?? readString(rawJson, "final_error")
+          : null;
+      }
       return {
         type,
         attempt: readNumber(raw, "attempt"),
         success: readBool(raw, "success"),
+        final_error: finalError,
+      };
+    }
+    case "error": {
+      const message =
+        readString(raw, "message") ??
+        readString(raw, "error") ??
+        readString(raw, "detail");
+      return {
+        type,
+        message: message && message.trim().length > 0 ? message : "Unknown error",
+      };
+    }
+    case "process_exited":
+      return {
+        type,
+        exit_code: readNumber(raw, "exit_code") ?? readNumber(raw, "exitCode"),
+        stderr_tail: readString(raw, "stderr_tail") ?? readString(raw, "stderrTail"),
       };
     case "extension_ui_request": {
       const id = readString(raw, "id");
@@ -504,8 +594,9 @@ type EventListener = (event: PiUiEvent) => void;
 
 class BrowserPreviewRuntime {
   private listeners = new Set<EventListener>();
-  private timers: number[] = [];
+  private timers: ReturnType<typeof setTimeout>[] = [];
   private seq = 100;
+  private streamGeneration = 0;
   private streaming = false;
   private retrying = false;
   private pendingQueue: string[] = [];
@@ -679,7 +770,7 @@ class BrowserPreviewRuntime {
   }
 
   private schedule(fn: () => void, ms: number): void {
-    const id = window.setTimeout(() => {
+    const id = globalThis.setTimeout(() => {
       this.timers = this.timers.filter((t) => t !== id);
       fn();
     }, ms);
@@ -688,9 +779,17 @@ class BrowserPreviewRuntime {
 
   private clearTimers(): void {
     for (const id of this.timers) {
-      window.clearTimeout(id);
+      globalThis.clearTimeout(id);
     }
     this.timers = [];
+  }
+
+  private cancelInFlightWork(): void {
+    this.streamGeneration += 1;
+    this.clearTimers();
+    this.streaming = false;
+    this.retrying = false;
+    this.pendingQueue = [];
   }
 
   private nowLabel(): string {
@@ -714,6 +813,7 @@ class BrowserPreviewRuntime {
   }
 
   switchSession(sessionId: string): readonly PiChatMessage[] {
+    this.cancelInFlightWork();
     const found = this.sessions.find((s) => s.id === sessionId);
     if (found) {
       this.activeSessionId = found.id;
@@ -723,6 +823,7 @@ class BrowserPreviewRuntime {
   }
 
   newSession(projectId: string, parentSessionId?: string): PiSessionSummary {
+    this.cancelInFlightWork();
     const id = `sess-${++this.seq}`;
     const created: PiSessionSummary = {
       id,
@@ -889,15 +990,17 @@ class BrowserPreviewRuntime {
     }
 
     if (trimmed.startsWith("/retry-demo")) {
+      const generation = ++this.streamGeneration;
       this.retrying = true;
       this.emit({
         type: "auto_retry_start",
         attempt: 1,
         max_attempts: 3,
         delay_ms: 4000,
+        error_message: "Transient rate limit (preview)",
       });
       this.schedule(() => {
-        if (!this.retrying) return;
+        if (!this.retrying || generation !== this.streamGeneration) return;
         this.retrying = false;
         this.emit({ type: "auto_retry_end", attempt: 1, success: true });
         this.streamAssistantReply(trimmed, images.length);
@@ -909,6 +1012,8 @@ class BrowserPreviewRuntime {
   }
 
   private streamAssistantReply(promptText: string, imageCount: number): void {
+    const generation = ++this.streamGeneration;
+    const targetSessionId = this.activeSessionId;
     this.streaming = true;
     const msgId = `msg-${++this.seq}`;
     const toolId = `tc-${++this.seq}`;
@@ -935,7 +1040,7 @@ class BrowserPreviewRuntime {
     let fullThinking = "";
     thinkingChunks.forEach((chunk, index) => {
       this.schedule(() => {
-        if (!this.streaming) return;
+        if (!this.streaming || generation !== this.streamGeneration) return;
         fullThinking += chunk;
         this.emit({
           type: "message_update",
@@ -947,7 +1052,7 @@ class BrowserPreviewRuntime {
     });
 
     this.schedule(() => {
-      if (!this.streaming) return;
+      if (!this.streaming || generation !== this.streamGeneration) return;
       this.emit({
         type: "tool_execution_end",
         tool_call_id: toolId,
@@ -960,17 +1065,17 @@ class BrowserPreviewRuntime {
     let fullText = "";
     chunks.forEach((chunk, index) => {
       this.schedule(() => {
-        if (!this.streaming) return;
+        if (!this.streaming || generation !== this.streamGeneration) return;
         fullText += chunk;
         this.emit({ type: "message_update", message_id: msgId, delta: chunk });
       }, textStartMs + index * 220);
     });
 
     this.schedule(() => {
-      if (!this.streaming) return;
+      if (!this.streaming || generation !== this.streamGeneration) return;
       this.streaming = false;
-      const list = this.messagesBySession.get(this.activeSessionId) ?? [];
-      this.messagesBySession.set(this.activeSessionId, [
+      const list = this.messagesBySession.get(targetSessionId) ?? [];
+      this.messagesBySession.set(targetSessionId, [
         ...list,
         {
           id: msgId,
@@ -981,7 +1086,7 @@ class BrowserPreviewRuntime {
           toolCalls: [{ id: toolId, name: "read", status: "done" }],
         },
       ]);
-      this.updateSessionCount(this.activeSessionId);
+      this.updateSessionCount(targetSessionId);
       this.emit({
         type: "message_end",
         message_id: msgId,
@@ -1023,15 +1128,29 @@ class BrowserPreviewRuntime {
   }
 
   abort(): void {
-    this.clearTimers();
-    this.streaming = false;
+    this.cancelInFlightWork();
+    this.emit({ type: "queue_update", pending_count: 0 });
     this.emit({ type: "agent_settled", summary: "Aborted by user" });
   }
 
   abortRetry(): void {
-    this.clearTimers();
-    this.retrying = false;
-    this.emit({ type: "auto_retry_end", attempt: 1, success: false });
+    this.cancelInFlightWork();
+    this.emit({
+      type: "auto_retry_end",
+      attempt: 1,
+      success: false,
+      final_error: "Retry aborted by user",
+    });
+    this.emit({ type: "agent_settled", summary: "Retry aborted by user" });
+  }
+
+  compactSession(): void {
+    this.emit({
+      type: "extension_snackbar",
+      id: `sb-${++this.seq}`,
+      message: "Compacted session history.",
+      tone: "info",
+    });
   }
 
   respondExtensionUi(dialogId: string, answer: ExtensionUiAnswer): void {
@@ -1139,7 +1258,7 @@ export const tauriApi = {
     }
     const [providers, state] = await Promise.all([
       invoke<PublicProviderProfile[]>("list_providers"),
-      invoke<PiBootstrapData>("pi_bootstrap").catch(() => previewRuntime.bootstrap()),
+      invoke<PiBootstrapData>("pi_bootstrap"),
     ]);
     return { ...state, providers };
   },
@@ -1273,6 +1392,24 @@ export const tauriApi = {
       return;
     }
     await invoke<void>("pi_abort_retry");
+  },
+
+  async compactSession(): Promise<void> {
+    if (!isTauriRuntime()) {
+      previewRuntime.compactSession();
+      return;
+    }
+    await invoke<void>("pi_compact");
+  },
+
+  async openExternalUrl(url: string): Promise<void> {
+    if (!isTauriRuntime()) {
+      if (typeof window !== "undefined") {
+        window.open(url, "_blank", "noopener,noreferrer");
+      }
+      return;
+    }
+    await invoke<void>("pi_open_external_url", { url });
   },
 
   async respondExtensionUi(dialogId: string, answer: ExtensionUiAnswer): Promise<void> {
