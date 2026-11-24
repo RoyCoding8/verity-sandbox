@@ -874,7 +874,8 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
     case "message_update": {
       const delta = event.delta ?? "";
       const thinkingDelta = event.thinking_delta ?? "";
-      if (!delta && !thinkingDelta) {
+      const textEndContent = event.content ?? "";
+      if (!delta && !thinkingDelta && !textEndContent) {
         return state.isStreaming ? state : { ...state, isStreaming: true };
       }
       const target = resolveAssistantTarget(state.messages, event.message_id);
@@ -884,9 +885,14 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
       if (target.kind === "found") {
         const messages = state.messages.map((m, idx) => {
           if (idx !== target.index) return m;
+          const nextContent = delta
+            ? m.content + delta
+            : m.content.length === 0 && textEndContent
+              ? textEndContent
+              : m.content;
           return {
             ...m,
-            content: delta ? m.content + delta : m.content,
+            content: nextContent,
             thinking: thinkingDelta ? (m.thinking ?? "") + thinkingDelta : m.thinking,
             streaming: true,
           };
@@ -896,7 +902,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
       const created: PiChatMessage = {
         id: event.message_id ?? nextClientId("stream"),
         role: "assistant",
-        content: delta,
+        content: delta || textEndContent,
         thinking: thinkingDelta || undefined,
         timestamp: nowTimeLabel(),
         streaming: true,
@@ -1896,41 +1902,40 @@ export function usePiWorkspace() {
 
     dispatch({ type: "bootstrap_start" });
 
-    void tauriApi
-      .bootstrapPiWorkspace()
-      .then((data) => {
+    void (async () => {
+      try {
+        const fn = await tauriApi.listenPiEvents((event) => {
+          if (active) dispatch({ type: "pi_event", event });
+        });
+        if (active) {
+          unlisten = fn;
+        } else {
+          fn();
+          return;
+        }
+      } catch (err: unknown) {
+        if (!active) return;
+        dispatch({
+          type: "event_stream_failed",
+          error: formatErrorMessage(err),
+        });
+      }
+
+      try {
+        const data = await tauriApi.bootstrapPiWorkspace();
         if (!active) return;
         lastConfirmedModelRef.current = data.selectedModel;
         lastConfirmedThinkingRef.current = data.thinkingLevel;
         dispatch({ type: "bootstrap_loaded", data });
-      })
-      .catch((err: unknown) => {
+      } catch (err: unknown) {
         if (active) {
           dispatch({
             type: "set_error",
             error: formatErrorMessage(err),
           });
         }
-      });
-
-    void tauriApi
-      .listenPiEvents((event) => {
-        if (active) dispatch({ type: "pi_event", event });
-      })
-      .then((fn) => {
-        if (active) {
-          unlisten = fn;
-        } else {
-          fn();
-        }
-      })
-      .catch((err: unknown) => {
-        if (!active) return;
-        dispatch({
-          type: "event_stream_failed",
-          error: formatErrorMessage(err),
-        });
-      });
+      }
+    })();
 
     return () => {
       active = false;
@@ -2049,21 +2054,52 @@ export function usePiWorkspace() {
     [notify]
   );
 
-  const createSession = useCallback(async () => {
-    const reqId = ++sessionRequestIdRef.current;
-    const current = stateRef.current;
-    const projectId = current.activeProjectId || current.projects[0]?.id || "proj-verity";
-    try {
-      const session = await tauriApi.newSession(projectId);
-      if (reqId === sessionRequestIdRef.current) {
-        dispatch({ type: "session_created", session, messages: [] });
+  const pushToast = useCallback(
+    (message: string, notifyType: ExtensionToastItem["notifyType"] = "info") => {
+      const id = nextClientId("toast");
+      dispatch({
+        type: "push_toast",
+        toast: { id, message, notifyType, timestamp: nowTimeLabel() },
+      });
+      dispatch({
+        type: "push_snackbar",
+        snackbar: { id, message, tone: notifyType === "error" ? "error" : "info" },
+      });
+    },
+    []
+  );
+
+  const createSession = useCallback(
+    async (projectPathOrId?: string) => {
+      const reqId = ++sessionRequestIdRef.current;
+      const current = stateRef.current;
+      let projectId = current.activeProjectId || current.projects[0]?.id || "proj-verity";
+      try {
+        if (projectPathOrId) {
+          const matched = current.projects.find(
+            (p) => p.path === projectPathOrId || p.id === projectPathOrId
+          );
+          if (matched && matched.id !== current.activeProjectId) {
+            const switched = await tauriApi.piSwitchProject(matched.path);
+            if (reqId !== sessionRequestIdRef.current) return;
+            hydrateBootstrap(switched);
+            projectId = switched.activeProjectId || matched.id;
+          } else if (matched) {
+            projectId = matched.id;
+          }
+        }
+        const session = await tauriApi.newSession(projectId);
+        if (reqId === sessionRequestIdRef.current) {
+          dispatch({ type: "session_created", session, messages: [] });
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(`Failed to create session: ${formatErrorMessage(err)}`, "error");
+        }
       }
-    } catch (err: unknown) {
-      if (reqId === sessionRequestIdRef.current) {
-        notify(`Failed to create session: ${formatErrorMessage(err)}`, "error");
-      }
-    }
-  }, [notify]);
+    },
+    [hydrateBootstrap, notify]
+  );
 
   const renameSession = useCallback(
     async (sessionId: string, name: string) => {
@@ -2077,6 +2113,45 @@ export function usePiWorkspace() {
       }
     },
     [notify]
+  );
+
+  const archiveSession = useCallback(
+    async (sessionId: string, archived: boolean) => {
+      const reqId = ++sessionRequestIdRef.current;
+      try {
+        const data = await tauriApi.piArchiveSession(sessionId, archived);
+        if (reqId === sessionRequestIdRef.current) {
+          hydrateBootstrap(data);
+          pushToast(archived ? "Chat archived." : "Chat restored.");
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(
+            `Failed to ${archived ? "archive" : "restore"} chat: ${formatErrorMessage(err)}`,
+            "error"
+          );
+        }
+      }
+    },
+    [hydrateBootstrap, notify, pushToast]
+  );
+
+  const deleteSession = useCallback(
+    async (sessionId: string) => {
+      const reqId = ++sessionRequestIdRef.current;
+      try {
+        const data = await tauriApi.piDeleteSession(sessionId);
+        if (reqId === sessionRequestIdRef.current) {
+          hydrateBootstrap(data);
+          pushToast("Chat deleted.");
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(`Failed to delete chat: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [hydrateBootstrap, notify, pushToast]
   );
 
   const openHistoryTree = useCallback(async () => {
@@ -2163,21 +2238,6 @@ export function usePiWorkspace() {
       notify(`Failed to export HTML: ${formatErrorMessage(err)}`, "error");
     }
   }, [notify]);
-
-  const pushToast = useCallback(
-    (message: string, notifyType: ExtensionToastItem["notifyType"] = "info") => {
-      const id = nextClientId("toast");
-      dispatch({
-        type: "push_toast",
-        toast: { id, message, notifyType, timestamp: nowTimeLabel() },
-      });
-      dispatch({
-        type: "push_snackbar",
-        snackbar: { id, message, tone: notifyType === "error" ? "error" : "info" },
-      });
-    },
-    []
-  );
 
   const compactSession = useCallback(
     async (customInstructions?: string) => {
@@ -2695,6 +2755,7 @@ export function usePiWorkspace() {
     }
 
     submittingRef.current = true;
+    sessionRequestIdRef.current += 1;
     const optimisticMsg: PiChatMessage = {
       id: nextClientId("local"),
       role: "user",
@@ -2831,6 +2892,8 @@ export function usePiWorkspace() {
       switchSession,
       createSession,
       renameSession,
+      archiveSession,
+      deleteSession,
       openHistoryTree,
       openForkModal,
       openProvidersModal,

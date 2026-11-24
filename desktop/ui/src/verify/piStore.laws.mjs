@@ -1168,6 +1168,198 @@ async function main() {
       },
     ]);
 
+    // ------------------------------------------------------------
+    // Scenario 19: Incremental message_update streaming deltas including
+    // whitespace chunks (" ", "\n"), snake_case assistant_message_event,
+    // Anthropic content_block_delta, and text_end hydration before message_end
+    // ------------------------------------------------------------
+    scenarios.push([
+      "Incremental message_update streaming deltas (whitespace, snake_case, content_block_delta, text_end)",
+      () => {
+        let s = createInitialPiState();
+        s = dispatchAction(
+          s,
+          {
+            type: "prompt_submitted",
+            message: { id: "u-19", role: "user", content: "Stream incrementally", timestamp: "10:19" },
+          },
+          "S19.prompt"
+        );
+        // message_start with role: null still creates the streaming assistant message
+        s = dispatchEvent(
+          s,
+          { type: "message_start", message_id: "m-19", role: null },
+          "S19.start"
+        );
+        assert.equal(s.isStreaming, true);
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.streaming, true);
+
+        // Anthropic-style content_block_delta for thinking
+        s = dispatchEvent(
+          s,
+          {
+            type: "content_block_delta",
+            message_id: "m-19",
+            delta: { type: "thinking_delta", thinking: "Step 1" },
+          },
+          "S19.thinking_cbd"
+        );
+        // snake_case assistant_message_event for thinking whitespace + continuation
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_update",
+            message_id: "m-19",
+            assistant_message_event: { type: "thinking_delta", delta: "\nStep 2" },
+          },
+          "S19.thinking_snake"
+        );
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.thinking, "Step 1\nStep 2");
+
+        // Incremental text deltas including whitespace-only " " and "\n" BEFORE message_end
+        s = dispatchEvent(s, { type: "message_update", message_id: "m-19", delta: "Hello" }, "S19.d1");
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello");
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.streaming, true);
+        assert.equal(s.isStreaming, true);
+
+        s = dispatchEvent(s, { type: "message_update", message_id: "m-19", delta: " " }, "S19.d2_space");
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello ");
+
+        s = dispatchEvent(
+          s,
+          {
+            type: "content_block_delta",
+            message_id: "m-19",
+            delta: { type: "text_delta", text: "world" },
+          },
+          "S19.d3_cbd"
+        );
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello world");
+
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_update",
+            message_id: "m-19",
+            assistant_message_event: { type: "text_delta", delta: "\n" },
+          },
+          "S19.d4_newline"
+        );
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello world\n");
+
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_update",
+            message_id: "m-19",
+            delta: { type: "text_delta", text: "Line 2" },
+          },
+          "S19.d5_nested_delta"
+        );
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello world\nLine 2");
+
+        // text_end after deltas must NOT duplicate or overwrite streamed content
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_update",
+            message_id: "m-19",
+            assistantMessageEvent: { type: "text_end", content: "SHOULD_NOT_OVERWRITE" },
+          },
+          "S19.text_end_noop"
+        );
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello world\nLine 2");
+        assert.equal(s.isStreaming, true);
+
+        s = dispatchEvent(
+          s,
+          { type: "message_end", message_id: "m-19", role: "assistant", stop_reason: "stop" },
+          "S19.end"
+        );
+        assert.equal(s.isStreaming, false);
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.streaming, false);
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello world\nLine 2");
+
+        // text_end when NO prior text deltas arrived hydrates cleanly
+        s = dispatchAction(
+          s,
+          {
+            type: "prompt_submitted",
+            message: { id: "u-19b", role: "user", content: "Text end only", timestamp: "10:20" },
+          },
+          "S19b.prompt"
+        );
+        s = dispatchEvent(s, { type: "message_start", message_id: "m-19b", role: "assistant" }, "S19b.start");
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_update",
+            message_id: "m-19b",
+            assistant_message_event: { type: "text_end", content: "Hydrated via text_end" },
+          },
+          "S19b.text_end"
+        );
+        assert.equal(s.messages.find((m) => m.id === "m-19b")?.content, "Hydrated via text_end");
+        assert.equal(s.messages.find((m) => m.id === "m-19b")?.streaming, true);
+      },
+    ]);
+
+    // ------------------------------------------------------------
+    // Scenario 20: Session archive/unarchive, delete active fallback,
+    // and per-project chat grouping
+    // ------------------------------------------------------------
+    scenarios.push([
+      "Session archive/unarchive, delete active fallback, and project grouping",
+      async () => {
+        const initial = await tauriApi.bootstrapPiWorkspace();
+        let s = createInitialPiState();
+        s = dispatchAction(s, { type: "bootstrap_loaded", data: initial }, "S20.bootstrap");
+
+        // Verify sessions group cleanly by projectId
+        const activeProj = s.projects[0];
+        assert.ok(activeProj, "S20: expected at least one project");
+        const projSessionsBefore = s.sessions.filter(
+          (sess) => sess.projectId === activeProj.id && !sess.archived
+        );
+        assert.ok(projSessionsBefore.length >= 2, "S20: expected >= 2 sessions in first project");
+
+        const targetId = s.activeSessionId;
+        assert.ok(targetId, "S20: expected an activeSessionId");
+
+        // Archive the active session -> moves to archived and falls back activeSessionId
+        const afterArchive = await tauriApi.piArchiveSession(targetId, true);
+        s = dispatchAction(s, { type: "bootstrap_loaded", data: afterArchive }, "S20.archive");
+        const archivedEntry = s.sessions.find((sess) => sess.id === targetId);
+        assert.equal(archivedEntry?.archived, true, "S20: target session must be marked archived");
+        assert.notEqual(
+          s.activeSessionId,
+          targetId,
+          "S20: archiving active session must fall back to another non-archived session"
+        );
+        const visibleInProj = s.sessions.filter(
+          (sess) => sess.projectId === activeProj.id && !sess.archived
+        );
+        assert.equal(visibleInProj.some((sess) => sess.id === targetId), false);
+        assert.equal(s.sessions.filter((sess) => Boolean(sess.archived)).length, 1);
+
+        // Unarchive (restore) the session -> returns to project group
+        const afterRestore = await tauriApi.piArchiveSession(targetId, false);
+        s = dispatchAction(s, { type: "bootstrap_loaded", data: afterRestore }, "S20.restore");
+        assert.equal(s.sessions.find((sess) => sess.id === targetId)?.archived, false);
+        assert.equal(s.sessions.filter((sess) => Boolean(sess.archived)).length, 0);
+
+        // Delete the currently active session -> removed from sessions + active fallback
+        const toDeleteId = s.activeSessionId;
+        const countBeforeDelete = s.sessions.length;
+        const afterDelete = await tauriApi.piDeleteSession(toDeleteId);
+        s = dispatchAction(s, { type: "bootstrap_loaded", data: afterDelete }, "S20.delete");
+        assert.equal(s.sessions.length, countBeforeDelete - 1, "S20: deleted session must be removed");
+        assert.equal(s.sessions.some((sess) => sess.id === toDeleteId), false);
+        assert.notEqual(s.activeSessionId, toDeleteId, "S20: deleting active session must fall back");
+        assert.ok(s.activeSessionId.length > 0, "S20: fallback activeSessionId must be non-empty");
+      },
+    ]);
+
     let scenariosPassed = 0;
     for (const [name, fn] of scenarios) {
       await fn();
