@@ -115,14 +115,16 @@ export interface PiWorkspaceState {
   readonly bashOutput: string;
   readonly settingsModalOpen: boolean;
   readonly settingsModalTab: SettingsModalTab;
+  readonly canRedoRevert: boolean;
+  readonly lastRevertedFiles: readonly string[];
 }
 
 const THEME_STORAGE_KEY = "verity.desktop.theme";
 
 const FALLBACK_MODEL: ModelOption = {
   provider: "anthropic",
-  modelId: "claude-sonnet-4-5",
-  label: "Claude Sonnet 4.5",
+  modelId: "claude-sonnet-5-5",
+  label: "Claude Sonnet 5.5",
 };
 
 const DEFAULT_THINKING_LEVELS: readonly ThinkingLevel[] = [
@@ -249,6 +251,164 @@ function formatErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readNonEmptyString(obj: Record<string, unknown>, key: string): string | null {
+  const value = obj[key];
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function parseThinkingLevelValue(raw: string | null): ThinkingLevel | undefined {
+  if (
+    raw === "off" ||
+    raw === "minimal" ||
+    raw === "low" ||
+    raw === "medium" ||
+    raw === "high" ||
+    raw === "xhigh"
+  ) {
+    return raw;
+  }
+  return undefined;
+}
+
+export type ResolveCycledModelResult =
+  | {
+      readonly kind: "cycled";
+      readonly model: ModelOption;
+      readonly thinkingLevel?: ThinkingLevel;
+    }
+  | {
+      readonly kind: "fallback_set_model";
+      readonly model: ModelOption;
+    }
+  | {
+      readonly kind: "single_model";
+    };
+
+export function resolveCycledModel(
+  models: readonly ModelOption[],
+  selectedModel: ModelOption,
+  wirePayload: unknown
+): ResolveCycledModelResult {
+  let parsedProvider: string | null = null;
+  let parsedModelId: string | null = null;
+  let parsedLabel: string | null = null;
+  let parsedThinkingLevel: ThinkingLevel | undefined;
+
+  if (isPlainRecord(wirePayload)) {
+    const nested = isPlainRecord(wirePayload["model"]) ? wirePayload["model"] : null;
+    parsedProvider =
+      (nested ? readNonEmptyString(nested, "provider") : null) ??
+      readNonEmptyString(wirePayload, "provider");
+    parsedModelId =
+      (nested
+        ? readNonEmptyString(nested, "modelId") ?? readNonEmptyString(nested, "id")
+        : null) ??
+      readNonEmptyString(wirePayload, "modelId") ??
+      readNonEmptyString(wirePayload, "id");
+    parsedLabel =
+      (nested
+        ? readNonEmptyString(nested, "label") ?? readNonEmptyString(nested, "name")
+        : null) ??
+      readNonEmptyString(wirePayload, "label") ??
+      readNonEmptyString(wirePayload, "name");
+    const rawThinking =
+      readNonEmptyString(wirePayload, "thinkingLevel") ??
+      readNonEmptyString(wirePayload, "thinking_level") ??
+      (nested
+        ? readNonEmptyString(nested, "thinkingLevel") ??
+          readNonEmptyString(nested, "thinking_level")
+        : null);
+    parsedThinkingLevel = parseThinkingLevelValue(rawThinking);
+  }
+
+  if (parsedModelId && !parsedProvider) {
+    const byId = models.find((m) => m.modelId === parsedModelId);
+    parsedProvider = byId?.provider ?? selectedModel.provider;
+  }
+
+  if (
+    !parsedProvider ||
+    !parsedModelId ||
+    (parsedProvider === selectedModel.provider && parsedModelId === selectedModel.modelId)
+  ) {
+    if (models.length >= 2) {
+      const currentIdx = models.findIndex(
+        (m) => m.provider === selectedModel.provider && m.modelId === selectedModel.modelId
+      );
+      const nextIdx = (currentIdx + 1) % models.length;
+      return { kind: "fallback_set_model", model: models[nextIdx] };
+    }
+    return { kind: "single_model" };
+  }
+
+  const existing = models.find(
+    (m) => m.provider === parsedProvider && m.modelId === parsedModelId
+  );
+  const matchedOrNewModel: ModelOption = existing ?? {
+    provider: parsedProvider,
+    modelId: parsedModelId,
+    label: parsedLabel ?? parsedModelId,
+  };
+
+  return parsedThinkingLevel
+    ? { kind: "cycled", model: matchedOrNewModel, thinkingLevel: parsedThinkingLevel }
+    : { kind: "cycled", model: matchedOrNewModel };
+}
+
+export type ResolveCycledThinkingResult =
+  | { readonly kind: "cycled"; readonly level: ThinkingLevel }
+  | { readonly kind: "fallback_set_thinking"; readonly level: ThinkingLevel }
+  | { readonly kind: "single_level" };
+
+export function resolveCycledThinkingLevel(
+  thinkingLevels: readonly ThinkingLevel[],
+  currentLevel: ThinkingLevel,
+  wirePayload: unknown
+): ResolveCycledThinkingResult {
+  let parsedLevel: ThinkingLevel | undefined;
+  if (isPlainRecord(wirePayload)) {
+    const raw =
+      readNonEmptyString(wirePayload, "level") ??
+      readNonEmptyString(wirePayload, "thinkingLevel") ??
+      readNonEmptyString(wirePayload, "thinking_level");
+    parsedLevel = parseThinkingLevelValue(raw);
+  }
+
+  if (!parsedLevel || parsedLevel === currentLevel) {
+    if (thinkingLevels.length >= 2) {
+      const currentIdx = thinkingLevels.indexOf(currentLevel);
+      const nextIdx = (currentIdx + 1) % thinkingLevels.length;
+      return { kind: "fallback_set_thinking", level: thinkingLevels[nextIdx] };
+    }
+    return { kind: "single_level" };
+  }
+
+  return { kind: "cycled", level: parsedLevel };
+}
+
+export function formatChatTranscriptMarkdown(messages: readonly PiChatMessage[]): string {
+  const sections: string[] = [];
+  for (const msg of messages) {
+    const content = msg.content.trim();
+    if (!content) continue;
+    const heading =
+      msg.role === "user"
+        ? "## You"
+        : msg.role === "assistant"
+          ? "## Verity"
+          : "## System";
+    sections.push(`${heading}
+${content}`);
+  }
+  return sections.join("\n\n");
+}
+
 export function createInitialPiState(): PiWorkspaceState {
   return {
     theme: readStoredTheme(),
@@ -292,6 +452,8 @@ export function createInitialPiState(): PiWorkspaceState {
     bashOutput: "",
     settingsModalOpen: false,
     settingsModalTab: "behavior",
+    canRedoRevert: false,
+    lastRevertedFiles: [],
   };
 }
 
@@ -404,7 +566,16 @@ export type PiAction =
   | { readonly type: "bash_aborted" }
   | { readonly type: "open_settings_modal"; readonly tab?: SettingsModalTab }
   | { readonly type: "close_settings_modal" }
-  | { readonly type: "consume_editor_prefill" };
+  | { readonly type: "consume_editor_prefill" }
+  | {
+      readonly type: "turn_reverted";
+      readonly session: PiSessionSummary;
+      readonly messages: readonly PiChatMessage[];
+      readonly restoredPrompt: string | null;
+      readonly canRedo: boolean;
+      readonly revertedFiles: readonly string[];
+    }
+  | { readonly type: "revert_redone" };
 
 function nowTimeLabel(): string {
   return new Date().toLocaleTimeString([], {
@@ -1287,6 +1458,8 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         thinkingLevel: action.data.thinkingLevel,
         commands: action.data.commands,
         providers: action.data.providers,
+        canRedoRevert: false,
+        lastRevertedFiles: [],
       };
     }
 
@@ -1376,6 +1549,8 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         liveTools: [],
         retryBanner: null,
         pendingQueueCount: 0,
+        canRedoRevert: false,
+        lastRevertedFiles: [],
       };
 
     case "session_created": {
@@ -1392,6 +1567,8 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         retryBanner: null,
         pendingQueueCount: 0,
         modal: { kind: "none" },
+        canRedoRevert: false,
+        lastRevertedFiles: [],
       };
     }
 
@@ -1465,6 +1642,8 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
         draft: "",
         attachments: [],
         recall: { history: nextHistory, index: null, draftSnapshot: "" },
+        canRedoRevert: false,
+        lastRevertedFiles: [],
       };
     }
 
@@ -1645,6 +1824,36 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
       return {
         ...state,
         editorPrefillText: null,
+      };
+
+    case "turn_reverted": {
+      const hasSession = state.sessions.some((s) => s.id === action.session.id);
+      const nextSessions = hasSession
+        ? state.sessions.map((s) => (s.id === action.session.id ? action.session : s))
+        : [action.session, ...state.sessions];
+      return {
+        ...state,
+        sessions: nextSessions,
+        activeProjectId: action.session.projectId || state.activeProjectId,
+        activeSessionId: action.session.id,
+        messages: action.messages,
+        isStreaming: false,
+        ignoreStaleTurnEvents: true,
+        liveTools: [],
+        retryBanner: null,
+        pendingQueueCount: 0,
+        canRedoRevert: action.canRedo,
+        lastRevertedFiles: action.revertedFiles,
+        editorPrefillText:
+          action.restoredPrompt !== null ? action.restoredPrompt : state.editorPrefillText,
+      };
+    }
+
+    case "revert_redone":
+      return {
+        ...state,
+        canRedoRevert: false,
+        lastRevertedFiles: [],
       };
 
     default: {
@@ -2073,47 +2282,190 @@ export function usePiWorkspace() {
     [notify]
   );
 
-  const cycleModel = useCallback(async () => {
-    try {
-      const cycled = await tauriApi.piCycleModel();
-      if (cycled && (cycled.provider || cycled.id)) {
-        const provider = cycled.provider ?? stateRef.current.selectedModel.provider;
-        const modelId = cycled.id ?? stateRef.current.selectedModel.modelId;
-        const existing = stateRef.current.models.find(
-          (m) => m.provider === provider && m.modelId === modelId
-        );
-        const nextModel: ModelOption = existing ?? {
+  const selectModel = useCallback(
+    async (provider: string, modelId: string) => {
+      const optimisticModel =
+        stateRef.current.models.find((m) => m.provider === provider && m.modelId === modelId) ?? {
           provider,
           modelId,
           label: modelId,
         };
-        lastConfirmedModelRef.current = nextModel;
-        dispatch({ type: "model_selected", model: nextModel });
-        pushToast(`Switched model to ${nextModel.label}`);
+      const reqId = ++modelRequestIdRef.current;
+      dispatch({ type: "model_selected", model: optimisticModel });
+      try {
+        const model = await tauriApi.setModel(provider, modelId);
+        if (reqId === modelRequestIdRef.current) {
+          lastConfirmedModelRef.current = model;
+          dispatch({ type: "model_selected", model });
+        }
+      } catch (err: unknown) {
+        if (reqId === modelRequestIdRef.current) {
+          dispatch({ type: "model_selected", model: lastConfirmedModelRef.current });
+          notify(`Failed to switch model: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [notify]
+  );
+
+  const selectThinkingLevel = useCallback(
+    async (level: ThinkingLevel) => {
+      const reqId = ++thinkingRequestIdRef.current;
+      dispatch({ type: "thinking_selected", level });
+      try {
+        const next = await tauriApi.setThinkingLevel(level);
+        if (reqId === thinkingRequestIdRef.current) {
+          lastConfirmedThinkingRef.current = next;
+          dispatch({ type: "thinking_selected", level: next });
+        }
+      } catch (err: unknown) {
+        if (reqId === thinkingRequestIdRef.current) {
+          dispatch({ type: "thinking_selected", level: lastConfirmedThinkingRef.current });
+          notify(`Failed to update thinking level: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [notify]
+  );
+
+  const cycleModel = useCallback(async () => {
+    try {
+      const cycled = await tauriApi.piCycleModel();
+      const current = stateRef.current;
+      const resolution = resolveCycledModel(current.models, current.selectedModel, cycled);
+      switch (resolution.kind) {
+        case "cycled":
+          lastConfirmedModelRef.current = resolution.model;
+          dispatch({ type: "model_selected", model: resolution.model });
+          if (resolution.thinkingLevel) {
+            lastConfirmedThinkingRef.current = resolution.thinkingLevel;
+            dispatch({ type: "thinking_selected", level: resolution.thinkingLevel });
+          }
+          pushToast(`Switched model to ${resolution.model.label}`);
+          return;
+        case "fallback_set_model":
+          await selectModel(resolution.model.provider, resolution.model.modelId);
+          if (
+            lastConfirmedModelRef.current.provider === resolution.model.provider &&
+            lastConfirmedModelRef.current.modelId === resolution.model.modelId
+          ) {
+            pushToast(`Switched model to ${resolution.model.label}`);
+          }
+          return;
+        case "single_model":
+          pushToast(
+            "Only one model is configured. Add more models in Provider Settings.",
+            "warning"
+          );
+          return;
+        default: {
+          const _exhaustive: never = resolution;
+          return _exhaustive;
+        }
       }
     } catch (err: unknown) {
       notify(`Failed to cycle model: ${formatErrorMessage(err)}`, "error");
     }
-  }, [notify, pushToast]);
+  }, [notify, pushToast, selectModel]);
 
   const cycleThinkingLevel = useCallback(async () => {
     try {
       const cycled = await tauriApi.piCycleThinkingLevel();
-      const rawLevel = cycled?.level;
-      if (
-        rawLevel === "off" ||
-        rawLevel === "minimal" ||
-        rawLevel === "low" ||
-        rawLevel === "medium" ||
-        rawLevel === "high" ||
-        rawLevel === "xhigh"
-      ) {
-        lastConfirmedThinkingRef.current = rawLevel;
-        dispatch({ type: "thinking_selected", level: rawLevel });
-        pushToast(`Thinking level set to ${rawLevel}`);
+      const current = stateRef.current;
+      const resolution = resolveCycledThinkingLevel(
+        current.thinkingLevels,
+        current.thinkingLevel,
+        cycled
+      );
+      switch (resolution.kind) {
+        case "cycled":
+          lastConfirmedThinkingRef.current = resolution.level;
+          dispatch({ type: "thinking_selected", level: resolution.level });
+          pushToast(`Thinking level set to ${resolution.level}`);
+          return;
+        case "fallback_set_thinking":
+          await selectThinkingLevel(resolution.level);
+          if (lastConfirmedThinkingRef.current === resolution.level) {
+            pushToast(`Thinking level set to ${resolution.level}`);
+          }
+          return;
+        case "single_level":
+          return;
+        default: {
+          const _exhaustive: never = resolution;
+          return _exhaustive;
+        }
       }
     } catch (err: unknown) {
       notify(`Failed to cycle thinking level: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify, pushToast, selectThinkingLevel]);
+
+  const revertTurn = useCallback(
+    async (entryId: string, revertCode: boolean, fallbackPromptText?: string) => {
+      const reqId = ++sessionRequestIdRef.current;
+      try {
+        const result = await tauriApi.piRevertTurn(entryId, revertCode);
+        if (reqId !== sessionRequestIdRef.current) return;
+        const restoredPrompt = result.restoredPrompt ?? fallbackPromptText ?? null;
+        dispatch({
+          type: "turn_reverted",
+          session: result.session,
+          messages: result.messages,
+          restoredPrompt,
+          canRedo: result.canRedo,
+          revertedFiles: result.revertedFiles,
+        });
+        if (revertCode && !result.codeReverted) {
+          pushToast(
+            result.codeRevertNote?.trim() || "Reverted chat only (no code snapshot available).",
+            "warning"
+          );
+        } else if (result.codeReverted) {
+          const count = result.revertedFiles.length;
+          pushToast(
+            count === 1 ? "Reverted chat and 1 file." : `Reverted chat and ${count} files.`
+          );
+        } else {
+          pushToast("Reverted chat only.");
+        }
+      } catch (err: unknown) {
+        if (reqId === sessionRequestIdRef.current) {
+          notify(`Failed to revert turn: ${formatErrorMessage(err)}`, "error");
+        }
+      }
+    },
+    [notify, pushToast]
+  );
+
+  const redoRevert = useCallback(async () => {
+    try {
+      const result = await tauriApi.piRedoRevert();
+      dispatch({ type: "revert_redone" });
+      const count = result.restoredFiles.length;
+      pushToast(
+        count === 1 ? "Restored 1 reverted file." : `Restored ${count} reverted files.`
+      );
+    } catch (err: unknown) {
+      notify(`Failed to restore reverted files: ${formatErrorMessage(err)}`, "error");
+    }
+  }, [notify, pushToast]);
+
+  const copyFullChat = useCallback(async () => {
+    try {
+      const markdown = formatChatTranscriptMarkdown(stateRef.current.messages);
+      if (!markdown) {
+        pushToast("No messages available to copy.", "warning");
+        return;
+      }
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(markdown);
+        pushToast("Copied full chat to clipboard.");
+      } else {
+        pushToast("Clipboard API unavailable in this environment.", "warning");
+      }
+    } catch (err: unknown) {
+      notify(`Failed to copy chat: ${formatErrorMessage(err)}`, "error");
     }
   }, [notify, pushToast]);
 
@@ -2236,52 +2588,6 @@ export function usePiWorkspace() {
       dispatch({ type: "turn_aborted" });
     }
   }, [notify]);
-
-  const selectModel = useCallback(
-    async (provider: string, modelId: string) => {
-      const optimisticModel =
-        stateRef.current.models.find((m) => m.provider === provider && m.modelId === modelId) ?? {
-          provider,
-          modelId,
-          label: modelId,
-        };
-      const reqId = ++modelRequestIdRef.current;
-      dispatch({ type: "model_selected", model: optimisticModel });
-      try {
-        const model = await tauriApi.setModel(provider, modelId);
-        if (reqId === modelRequestIdRef.current) {
-          lastConfirmedModelRef.current = model;
-          dispatch({ type: "model_selected", model });
-        }
-      } catch (err: unknown) {
-        if (reqId === modelRequestIdRef.current) {
-          dispatch({ type: "model_selected", model: lastConfirmedModelRef.current });
-          notify(`Failed to switch model: ${formatErrorMessage(err)}`, "error");
-        }
-      }
-    },
-    [notify]
-  );
-
-  const selectThinkingLevel = useCallback(
-    async (level: ThinkingLevel) => {
-      const reqId = ++thinkingRequestIdRef.current;
-      dispatch({ type: "thinking_selected", level });
-      try {
-        const next = await tauriApi.setThinkingLevel(level);
-        if (reqId === thinkingRequestIdRef.current) {
-          lastConfirmedThinkingRef.current = next;
-          dispatch({ type: "thinking_selected", level: next });
-        }
-      } catch (err: unknown) {
-        if (reqId === thinkingRequestIdRef.current) {
-          dispatch({ type: "thinking_selected", level: lastConfirmedThinkingRef.current });
-          notify(`Failed to update thinking level: ${formatErrorMessage(err)}`, "error");
-        }
-      }
-    },
-    [notify]
-  );
 
   const sendPrompt = useCallback(async () => {
     if (submittingRef.current || stateRef.current.isStreaming) return;
@@ -2560,6 +2866,9 @@ export function usePiWorkspace() {
       setFollowUpMode,
       cycleModel,
       cycleThinkingLevel,
+      revertTurn,
+      redoRevert,
+      copyFullChat,
       copyLastAssistantText,
       dismissToast,
       openSettingsModal,

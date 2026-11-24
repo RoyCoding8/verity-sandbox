@@ -171,6 +171,11 @@
   transform: scale(0.98);
 }
 
+.verity-topbar-pill:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 :root[data-theme="light"] .verity-topbar-pill {
   background: #ffffff;
   border-color: var(--verity-hairline);
