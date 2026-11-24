@@ -58,14 +58,32 @@ function buildModels(rawModels) {
   return models;
 }
 
-function resolveApiKeyConfig(entry) {
+function isLocalhostBaseUrl(baseUrl) {
+  try {
+    const parsed = new URL(baseUrl);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "::1" ||
+      host === "[::1]"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function resolveApiKeyConfig(entry, baseUrl) {
   if (typeof entry.api_key_env === "string") {
     const envName = entry.api_key_env.trim();
     if (envName) {
       return `$${envName}`;
     }
   }
-  return KEYLESS_FALLBACK_API_KEY;
+  if (isLocalhostBaseUrl(baseUrl)) {
+    return KEYLESS_FALLBACK_API_KEY;
+  }
+  return undefined;
 }
 
 /**
@@ -86,7 +104,8 @@ export default function verityProvidersExtension(pi) {
   let providers;
   try {
     providers = JSON.parse(raw);
-  } catch {
+  } catch (err) {
+    console.error("[verity-providers] failed to parse VERITY_DESKTOP_PROVIDERS:", err);
     return;
   }
 
@@ -115,9 +134,13 @@ export default function verityProvidersExtension(pi) {
     const config = {
       name,
       baseUrl,
-      apiKey: resolveApiKeyConfig(entry),
       api: resolvePiApi(entry.api),
     };
+
+    const apiKey = resolveApiKeyConfig(entry, baseUrl);
+    if (apiKey !== undefined) {
+      config.apiKey = apiKey;
+    }
 
     if (models.length > 0) {
       config.models = models;
@@ -125,8 +148,8 @@ export default function verityProvidersExtension(pi) {
 
     try {
       pi.registerProvider(id, config);
-    } catch {
-      // Ignore a single invalid provider entry so other custom providers still load.
+    } catch (err) {
+      console.error(`[verity-providers] failed to register provider "${id}":`, err);
     }
   }
 }

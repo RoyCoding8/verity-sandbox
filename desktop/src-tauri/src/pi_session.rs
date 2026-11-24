@@ -4,7 +4,7 @@ use crate::extension_ui::{
     ExtensionUiResponse, ExtensionUiTracker,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use verity_core::json::{parse_json, to_json_string, JsonValue};
 use verity_core::session::{transition_session, SessionActivity, SessionCommand, SessionError};
+
+const MAX_STDERR_LINES: usize = 32;
+const MAX_STDERR_LINE_BYTES: usize = 512;
+const ABORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Branded request correlation ID for Pi JSONL RPC commands.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -55,7 +59,8 @@ pub struct PiSessionConfig {
 
 /// Resolves the Pi CLI executable name across platforms.
 /// On Windows, npm global shims are `.cmd` files, so the default `"pi"` program
-/// resolves to `pi.cmd` (or `pi.exe` if present on `PATH`).
+/// resolves to `pi.exe` / `pi.cmd` on `PATH` or `%APPDATA%\npm\pi.cmd` before
+/// falling back to `"pi.cmd"`.
 pub fn resolve_pi_program(program: &str) -> String {
     #[cfg(windows)]
     {
@@ -70,6 +75,12 @@ pub fn resolve_pi_program(program: &str) -> String {
                     if cmd.is_file() {
                         return cmd.to_string_lossy().to_string();
                     }
+                }
+            }
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                let npm_cmd = PathBuf::from(appdata).join("npm").join("pi.cmd");
+                if npm_cmd.is_file() {
+                    return npm_cmd.to_string_lossy().to_string();
                 }
             }
             return "pi.cmd".to_string();
@@ -116,8 +127,11 @@ pub enum PiSessionError {
     Timeout {
         request_id: RequestId,
         command: String,
+        stderr_tail: Option<String>,
     },
-    ProcessExited,
+    ProcessExited {
+        stderr_tail: Option<String>,
+    },
     AlreadyShutdown,
     Protocol(String),
 }
@@ -135,12 +149,23 @@ impl fmt::Display for PiSessionError {
             Self::Timeout {
                 request_id,
                 command,
-            } => write!(
-                f,
-                "pi rpc '{}' (id={}) timed out waiting for response",
-                command, request_id
-            ),
-            Self::ProcessExited => write!(f, "pi rpc process exited unexpectedly"),
+                stderr_tail,
+            } => match stderr_tail {
+                Some(tail) => write!(
+                    f,
+                    "pi rpc '{}' (id={}) timed out waiting for response; stderr: {}",
+                    command, request_id, tail
+                ),
+                None => write!(
+                    f,
+                    "pi rpc '{}' (id={}) timed out waiting for response",
+                    command, request_id
+                ),
+            },
+            Self::ProcessExited { stderr_tail } => match stderr_tail {
+                Some(tail) => write!(f, "pi rpc process exited unexpectedly; stderr: {}", tail),
+                None => write!(f, "pi rpc process exited unexpectedly"),
+            },
             Self::AlreadyShutdown => write!(f, "pi rpc supervisor has already shut down"),
             Self::Protocol(m) => write!(f, "pi rpc protocol error: {}", m),
         }
@@ -379,7 +404,7 @@ fn attachments_to_json(images: &[PendingAttachment]) -> JsonValue {
     JsonValue::Array(items)
 }
 
-/// All 10 Pi JSONL stdout events forwarded to the Tauri UI via `app.emit("pi:event", ...)`.
+/// Pi JSONL stdout events forwarded to the Tauri UI via `app.emit("pi:event", ...)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PiUiEvent {
@@ -401,7 +426,11 @@ pub enum PiUiEvent {
     },
     MessageEnd {
         message_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
         stop_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -427,11 +456,15 @@ pub enum PiUiEvent {
         attempt: Option<u64>,
         max_attempts: Option<u64>,
         delay_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
         raw_json: String,
     },
     AutoRetryEnd {
         attempt: Option<u64>,
         success: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        final_error: Option<String>,
         raw_json: String,
     },
     ExtensionUiRequest {
@@ -441,6 +474,15 @@ pub enum PiUiEvent {
         options: Vec<String>,
         timeout_ms: Option<u64>,
         raw_json: String,
+    },
+    Error {
+        message: String,
+        raw_json: String,
+    },
+    ProcessExited {
+        exit_code: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stderr_tail: Option<String>,
     },
 }
 
@@ -472,7 +514,13 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
             let (text, thinking) = extract_message_end_content(val);
             Some(PiUiEvent::MessageEnd {
                 message_id: opt_str_or_nested(val, "message", &["messageId", "message_id", "id"]),
+                role: opt_str_or_nested(val, "message", &["role"]),
                 stop_reason: opt_str_or_nested(val, "message", &["stopReason", "stop_reason"]),
+                error_message: opt_str_or_nested(
+                    val,
+                    "message",
+                    &["errorMessage", "error_message", "error"],
+                ),
                 text,
                 thinking,
                 raw_json,
@@ -501,11 +549,22 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
             attempt: opt_u64(val, &["attempt"]),
             max_attempts: opt_u64(val, &["maxAttempts", "max_attempts"]),
             delay_ms: opt_u64(val, &["delayMs", "delay_ms"]),
+            error_message: opt_str(val, &["errorMessage", "error_message", "error", "reason"]),
             raw_json,
         }),
         "auto_retry_end" => Some(PiUiEvent::AutoRetryEnd {
             attempt: opt_u64(val, &["attempt"]),
             success: val.get("success").and_then(JsonValue::as_bool),
+            final_error: opt_str(
+                val,
+                &[
+                    "finalError",
+                    "final_error",
+                    "errorMessage",
+                    "error_message",
+                    "error",
+                ],
+            ),
             raw_json,
         }),
         "extension_ui_request" => {
@@ -519,6 +578,14 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
                 timeout_ms,
                 raw_json,
             })
+        }
+        "error" | "extension_error" => {
+            let message = opt_str(
+                val,
+                &["error", "message", "errorMessage", "error_message", "reason"],
+            )
+            .unwrap_or_else(|| "Pi reported an error".to_string());
+            Some(PiUiEvent::Error { message, raw_json })
         }
         _ => None,
     }
@@ -642,12 +709,13 @@ fn parse_rpc_response(val: &JsonValue) -> Option<PiRpcResponse> {
         .and_then(JsonValue::as_str)
         .and_then(|s| RequestId::parse(s).ok())?;
     let command = opt_str(val, &["command"]);
+    let error = opt_str(val, &["error", "errorMessage", "error_message"]);
     let success = val
         .get("success")
         .and_then(JsonValue::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false)
+        && error.is_none();
     let data_json = val.get("data").map(to_json_string);
-    let error = opt_str(val, &["error"]);
     Some(PiRpcResponse {
         id,
         command,
@@ -657,12 +725,67 @@ fn parse_rpc_response(val: &JsonValue) -> Option<PiRpcResponse> {
     })
 }
 
+fn parse_idless_response_error(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
+    if val.get("type").and_then(JsonValue::as_str) != Some("response") {
+        return None;
+    }
+    let has_valid_id = val
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .and_then(|s| RequestId::parse(s).ok())
+        .is_some();
+    if has_valid_id {
+        return None;
+    }
+    let error = opt_str(val, &["error", "errorMessage", "error_message", "message"]);
+    let explicit_failure = val.get("success").and_then(JsonValue::as_bool) == Some(false);
+    if error.is_some() || explicit_failure {
+        Some(PiUiEvent::Error {
+            message: error.unwrap_or_else(|| "Pi RPC response error".to_string()),
+            raw_json: raw_json.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+fn push_stderr_line(buf: &Mutex<VecDeque<String>>, line: String) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let clipped = if trimmed.len() > MAX_STDERR_LINE_BYTES {
+        let mut end = MAX_STDERR_LINE_BYTES;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &trimmed[..end])
+    } else {
+        trimmed.to_string()
+    };
+    let mut guard = buf.lock().expect("stderr_buf lock poisoned");
+    if guard.len() >= MAX_STDERR_LINES {
+        guard.pop_front();
+    }
+    guard.push_back(clipped);
+}
+
+fn format_stderr_tail(buf: &Mutex<VecDeque<String>>) -> Option<String> {
+    let guard = buf.lock().expect("stderr_buf lock poisoned");
+    if guard.is_empty() {
+        None
+    } else {
+        let lines: Vec<&str> = guard.iter().map(String::as_str).collect();
+        Some(lines.join("\n"))
+    }
+}
+
 /// Event callback sink so `main.rs` can wire `app.emit("pi:event", event)` without
 /// coupling `pi_session` to Tauri runtime types.
 pub type EventSink = Arc<dyn Fn(PiUiEvent) + Send + Sync>;
 
 /// Callback invoked when a provider reload executes (either immediately while idle
-/// or deferred upon `agent_settled`).
+/// or deferred upon `agent_settled` / `abort`).
 pub type ReloadHook = Arc<dyn Fn() + Send + Sync>;
 
 type PendingMap = HashMap<RequestId, mpsc::Sender<Result<PiRpcResponse, PiSessionError>>>;
@@ -679,7 +802,11 @@ fn apply_no_window(cmd: &mut Command) {
 fn kill_tree(pid: u32) {
     #[cfg(unix)]
     {
+        let pgid_arg = format!("-{}", pid);
         let pid_str = pid.to_string();
+        let _ = Command::new("kill")
+            .args(["-9", "--", &pgid_arg])
+            .status();
         let _ = Command::new("pkill").args(["-9", "-P", &pid_str]).status();
         let _ = Command::new("kill").args(["-9", &pid_str]).status();
     }
@@ -700,19 +827,22 @@ fn kill_tree(pid: u32) {
 /// Long-lived supervisor managing a `pi --mode rpc --no-session` child process.
 pub struct PiSessionSupervisor {
     config: PiSessionConfig,
-    child: Mutex<Option<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
     stdin: Mutex<Option<ChildStdin>>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
+    stderr_handle: Mutex<Option<JoinHandle<()>>>,
+    stderr_buf: Arc<Mutex<VecDeque<String>>>,
     activity: Arc<Mutex<SessionActivity>>,
     pending: Arc<Mutex<PendingMap>>,
     extension_ui: Arc<Mutex<ExtensionUiTracker>>,
+    event_sink: EventSink,
     reload_hook: ReloadHook,
     next_id: AtomicU64,
     shutdown_flag: Arc<AtomicBool>,
 }
 
 impl PiSessionSupervisor {
-    /// Spawns the configured Pi JSONL RPC child process and starts its background stdout reader.
+    /// Spawns the configured Pi JSONL RPC child process and starts its background stdout and stderr readers.
     pub fn spawn(
         config: PiSessionConfig,
         event_sink: EventSink,
@@ -725,7 +855,12 @@ impl PiSessionSupervisor {
             .envs(config.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         #[cfg(windows)]
         apply_no_window(&mut cmd);
         let mut child = cmd
@@ -740,19 +875,50 @@ impl PiSessionSupervisor {
             .stdout
             .take()
             .ok_or_else(|| PiSessionError::Io("missing child stdout pipe".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| PiSessionError::Io("missing child stderr pipe".to_string()))?;
 
+        let child_arc = Arc::new(Mutex::new(Some(child)));
+        let stderr_buf = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_STDERR_LINES)));
         let activity = Arc::new(Mutex::new(SessionActivity::Idle));
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let extension_ui = Arc::new(Mutex::new(ExtensionUiTracker::new()));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
+        let s_buf = Arc::clone(&stderr_buf);
+        let stderr_handle = std::thread::Builder::new()
+            .name("pi-rpc-stderr".to_string())
+            .spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line_res in reader.lines() {
+                    let line = match line_res {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                    push_stderr_line(&s_buf, line);
+                }
+            })
+            .map_err(|e| {
+                if let Some(mut c) = child_arc.lock().expect("child lock poisoned").take() {
+                    kill_tree(c.id());
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                PiSessionError::SpawnFailed(e.to_string())
+            })?;
+
+        let r_child = Arc::clone(&child_arc);
+        let r_stderr = Arc::clone(&stderr_buf);
         let r_activity = Arc::clone(&activity);
         let r_pending = Arc::clone(&pending);
         let r_ext_ui = Arc::clone(&extension_ui);
         let r_reload = Arc::clone(&reload_hook);
         let r_sink = Arc::clone(&event_sink);
+        let r_shutdown = Arc::clone(&shutdown_flag);
 
-        let reader_handle = std::thread::Builder::new()
+        let reader_handle = match std::thread::Builder::new()
             .name("pi-rpc-stdout".to_string())
             .spawn(move || {
                 let reader = BufReader::new(stdout);
@@ -778,6 +944,11 @@ impl PiSessionSupervisor {
                         if let Some(tx) = waiter {
                             let _ = tx.send(Ok(resp));
                         }
+                        continue;
+                    }
+
+                    if let Some(err_event) = parse_idless_response_error(&val, trimmed) {
+                        r_sink(err_event);
                         continue;
                     }
 
@@ -810,27 +981,71 @@ impl PiSessionSupervisor {
                     }
                 }
 
-                // Fail any still-waiting callers so nobody hangs when the child exits.
-                let mut map = r_pending.lock().expect("pending lock poisoned");
-                for (_, tx) in map.drain() {
-                    let _ = tx.send(Err(PiSessionError::ProcessExited));
+                let was_shutdown = r_shutdown.load(Ordering::Acquire);
+                let tail = format_stderr_tail(&r_stderr);
+
+                if !was_shutdown {
+                    {
+                        let mut act = r_activity.lock().expect("activity lock poisoned");
+                        if let Ok(tr) = transition_session(*act, SessionCommand::ProcessExited) {
+                            *act = tr.activity;
+                        }
+                    }
+                    {
+                        let mut tracker = r_ext_ui.lock().expect("extension_ui lock poisoned");
+                        *tracker = ExtensionUiTracker::new();
+                    }
                 }
-            })
-            .map_err(|e| {
-                kill_tree(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-                PiSessionError::SpawnFailed(e.to_string())
-            })?;
+
+                // Fail any still-waiting callers so nobody hangs when the child exits.
+                {
+                    let mut map = r_pending.lock().expect("pending lock poisoned");
+                    for (_, tx) in map.drain() {
+                        let _ = tx.send(Err(PiSessionError::ProcessExited {
+                            stderr_tail: tail.clone(),
+                        }));
+                    }
+                }
+
+                if !was_shutdown {
+                    let exit_code = r_child
+                        .try_lock()
+                        .ok()
+                        .and_then(|mut guard| {
+                            guard
+                                .as_mut()
+                                .and_then(|c| c.try_wait().ok().flatten())
+                                .and_then(|status| status.code())
+                        });
+                    r_sink(PiUiEvent::ProcessExited {
+                        exit_code,
+                        stderr_tail: tail,
+                    });
+                }
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                if let Some(mut c) = child_arc.lock().expect("child lock poisoned").take() {
+                    kill_tree(c.id());
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                let _ = stderr_handle.join();
+                return Err(PiSessionError::SpawnFailed(e.to_string()));
+            }
+        };
 
         Ok(Self {
             config,
-            child: Mutex::new(Some(child)),
+            child: child_arc,
             stdin: Mutex::new(Some(stdin)),
             reader_handle: Mutex::new(Some(reader_handle)),
+            stderr_handle: Mutex::new(Some(stderr_handle)),
+            stderr_buf,
             activity,
             pending,
             extension_ui,
+            event_sink,
             reload_hook,
             next_id: AtomicU64::new(1),
             shutdown_flag,
@@ -854,6 +1069,11 @@ impl PiSessionSupervisor {
         }
     }
 
+    /// Returns the recent captured stderr lines from the Pi child process, if any.
+    pub fn stderr_tail(&self) -> Option<String> {
+        format_stderr_tail(&self.stderr_buf)
+    }
+
     /// Returns the number of currently open Extension UI dialogs.
     pub fn open_dialog_count(&self) -> usize {
         self.extension_ui
@@ -862,7 +1082,7 @@ impl PiSessionSupervisor {
             .open_count()
     }
 
-    /// Requests a provider reload: runs immediately if `Idle`, defers until `agent_settled`
+    /// Requests a provider reload: runs immediately if `Idle`, defers until `agent_settled`/`abort`
     /// if `Streaming`, or returns `SessionError::Busy` while compacting/switching.
     pub fn request_provider_reload(&self) -> Result<ReloadDisposition, PiSessionError> {
         let run_now = {
@@ -895,6 +1115,105 @@ impl PiSessionSupervisor {
         Ok(expired)
     }
 
+    /// Rolls back a pre-send state transition on error without clobbering `Idle` or `reload_deferred`.
+    fn rollback_pre_transition(&self, cmd: &PiRpcCommand, previous: SessionActivity) {
+        let mut trigger_reload = false;
+        {
+            let mut act = self.activity.lock().expect("activity lock poisoned");
+            if act.is_idle() {
+                return;
+            }
+            match cmd {
+                PiRpcCommand::Prompt { .. } => {
+                    if let SessionActivity::Streaming {
+                        reload_deferred, ..
+                    } = *act
+                    {
+                        *act = SessionActivity::Idle;
+                        trigger_reload = reload_deferred;
+                    }
+                }
+                PiRpcCommand::Steer { .. } | PiRpcCommand::FollowUp { .. } => {
+                    if let SessionActivity::Streaming {
+                        pending_queue,
+                        reload_deferred,
+                    } = *act
+                    {
+                        *act = SessionActivity::Streaming {
+                            pending_queue: pending_queue.saturating_sub(1),
+                            reload_deferred,
+                        };
+                    }
+                }
+                PiRpcCommand::ClearQueue => {
+                    if let (
+                        SessionActivity::Streaming {
+                            reload_deferred, ..
+                        },
+                        SessionActivity::Streaming {
+                            pending_queue: prev_queue,
+                            reload_deferred: prev_reload,
+                        },
+                    ) = (*act, previous)
+                    {
+                        *act = SessionActivity::Streaming {
+                            pending_queue: prev_queue,
+                            reload_deferred: reload_deferred || prev_reload,
+                        };
+                    }
+                }
+                PiRpcCommand::Compact { .. } => {
+                    if let Ok(tr) = transition_session(*act, SessionCommand::FinishCompacting) {
+                        *act = tr.activity;
+                    }
+                }
+                PiRpcCommand::SwitchSession { .. }
+                | PiRpcCommand::NewSession { .. }
+                | PiRpcCommand::Fork { .. }
+                | PiRpcCommand::Clone { .. } => {
+                    if let Ok(tr) = transition_session(*act, SessionCommand::FinishSwitch) {
+                        *act = tr.activity;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if trigger_reload {
+            (self.reload_hook)();
+        }
+    }
+
+    /// Forces recovery from a wedged or dead Pi process during `Abort`:
+    /// kills the process tree, transitions activity to `Idle`, clears open dialogs,
+    /// emits synthetic `AgentSettled`, and runs any deferred provider reload.
+    fn force_abort_recovery(&self) {
+        self.shutdown();
+        let trigger_reload = {
+            let mut act = self.activity.lock().expect("activity lock poisoned");
+            if let Ok(tr) = transition_session(*act, SessionCommand::Abort) {
+                *act = tr.activity;
+                tr.run_provider_reload
+            } else {
+                *act = SessionActivity::Idle;
+                false
+            }
+        };
+        {
+            let mut tracker = self
+                .extension_ui
+                .lock()
+                .expect("extension_ui lock poisoned");
+            *tracker = ExtensionUiTracker::new();
+        }
+        (self.event_sink)(PiUiEvent::AgentSettled {
+            summary: Some("aborted".to_string()),
+            raw_json: r#"{"type":"agent_settled","summary":"aborted"}"#.to_string(),
+        });
+        if trigger_reload {
+            (self.reload_hook)();
+        }
+    }
+
     /// Sends any of the 24 typed Pi RPC commands, enforcing `verity_core::session::transition_session`
     /// and awaiting the correlated RPC response (except `extension_ui_response`, which is fire-and-forget).
     pub fn send_command(&self, cmd: PiRpcCommand) -> Result<Option<PiRpcResponse>, PiSessionError> {
@@ -915,6 +1234,9 @@ impl PiSessionSupervisor {
             PiRpcCommand::ClearQueue => Some(SessionCommand::ClearQueue),
             PiRpcCommand::Compact { .. } => Some(SessionCommand::Compact),
             PiRpcCommand::SwitchSession { .. } => Some(SessionCommand::SwitchSession),
+            PiRpcCommand::NewSession { .. } => Some(SessionCommand::NewSession),
+            PiRpcCommand::Fork { .. } => Some(SessionCommand::Fork),
+            PiRpcCommand::Clone { .. } => Some(SessionCommand::CloneSession),
             _ => None,
         };
 
@@ -942,13 +1264,29 @@ impl PiSessionSupervisor {
                 .lock()
                 .expect("pending lock poisoned")
                 .remove(&request_id);
+            if matches!(cmd, PiRpcCommand::Abort) {
+                self.force_abort_recovery();
+                return Ok(Some(PiRpcResponse {
+                    id: request_id,
+                    command: Some("abort".to_string()),
+                    success: true,
+                    data_json: None,
+                    error: None,
+                }));
+            }
             if let Some(prev) = previous_activity {
-                *self.activity.lock().expect("activity lock poisoned") = prev;
+                self.rollback_pre_transition(&cmd, prev);
             }
             return Err(err);
         }
 
-        let wait_result = rx.recv_timeout(self.config.command_timeout);
+        let timeout = match &cmd {
+            PiRpcCommand::Abort | PiRpcCommand::AbortRetry => {
+                self.config.command_timeout.min(ABORT_COMMAND_TIMEOUT)
+            }
+            _ => self.config.command_timeout,
+        };
+        let wait_result = rx.recv_timeout(timeout);
 
         // Complete synchronous exclusive transitions (Compacting / SwitchingSession) regardless of outcome.
         match &cmd {
@@ -958,7 +1296,10 @@ impl PiSessionSupervisor {
                     *act = tr.activity;
                 }
             }
-            PiRpcCommand::SwitchSession { .. } => {
+            PiRpcCommand::SwitchSession { .. }
+            | PiRpcCommand::NewSession { .. }
+            | PiRpcCommand::Fork { .. }
+            | PiRpcCommand::Clone { .. } => {
                 let mut act = self.activity.lock().expect("activity lock poisoned");
                 if let Ok(tr) = transition_session(*act, SessionCommand::FinishSwitch) {
                     *act = tr.activity;
@@ -970,8 +1311,8 @@ impl PiSessionSupervisor {
         match wait_result {
             Ok(Ok(resp)) => {
                 if !resp.success {
-                    if let (Some(prev), PiRpcCommand::Prompt { .. }) = (previous_activity, &cmd) {
-                        *self.activity.lock().expect("activity lock poisoned") = prev;
+                    if let Some(prev) = previous_activity {
+                        self.rollback_pre_transition(&cmd, prev);
                     }
                     return Err(PiSessionError::RpcError {
                         command: cmd.command_type().to_string(),
@@ -980,20 +1321,80 @@ impl PiSessionSupervisor {
                             .unwrap_or_else(|| "unknown pi rpc error".to_string()),
                     });
                 }
+                if matches!(cmd, PiRpcCommand::Abort) {
+                    let trigger_reload = {
+                        let mut act = self.activity.lock().expect("activity lock poisoned");
+                        if let Ok(tr) = transition_session(*act, SessionCommand::Abort) {
+                            *act = tr.activity;
+                            tr.run_provider_reload
+                        } else {
+                            false
+                        }
+                    };
+                    if trigger_reload {
+                        (self.reload_hook)();
+                    }
+                }
                 Ok(Some(resp))
             }
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                if matches!(cmd, PiRpcCommand::Abort) {
+                    self.force_abort_recovery();
+                    return Ok(Some(PiRpcResponse {
+                        id: request_id,
+                        command: Some("abort".to_string()),
+                        success: true,
+                        data_json: None,
+                        error: None,
+                    }));
+                }
+                if let Some(prev) = previous_activity {
+                    self.rollback_pre_transition(&cmd, prev);
+                }
+                Err(e)
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.pending
                     .lock()
                     .expect("pending lock poisoned")
                     .remove(&request_id);
+                if matches!(cmd, PiRpcCommand::Abort) {
+                    self.force_abort_recovery();
+                    return Ok(Some(PiRpcResponse {
+                        id: request_id,
+                        command: Some("abort".to_string()),
+                        success: true,
+                        data_json: None,
+                        error: None,
+                    }));
+                }
+                if let Some(prev) = previous_activity {
+                    self.rollback_pre_transition(&cmd, prev);
+                }
                 Err(PiSessionError::Timeout {
                     request_id,
                     command: cmd.command_type().to_string(),
+                    stderr_tail: self.stderr_tail(),
                 })
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(PiSessionError::ProcessExited),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if matches!(cmd, PiRpcCommand::Abort) {
+                    self.force_abort_recovery();
+                    return Ok(Some(PiRpcResponse {
+                        id: request_id,
+                        command: Some("abort".to_string()),
+                        success: true,
+                        data_json: None,
+                        error: None,
+                    }));
+                }
+                if let Some(prev) = previous_activity {
+                    self.rollback_pre_transition(&cmd, prev);
+                }
+                Err(PiSessionError::ProcessExited {
+                    stderr_tail: self.stderr_tail(),
+                })
+            }
         }
     }
 
@@ -1164,7 +1565,7 @@ impl PiSessionSupervisor {
     }
 
     /// Idempotently shuts down the Pi child process tree, closes stdin, drains waiters,
-    /// and joins the background reader thread.
+    /// and joins the background stdout and stderr reader threads.
     pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Release);
 
@@ -1198,6 +1599,17 @@ impl PiSessionSupervisor {
                 .reader_handle
                 .lock()
                 .expect("reader_handle lock poisoned");
+            if let Some(handle) = handle_guard.take() {
+                let _ = handle.join();
+            }
+        }
+
+        // Join stderr reader thread.
+        {
+            let mut handle_guard = self
+                .stderr_handle
+                .lock()
+                .expect("stderr_handle lock poisoned");
             if let Some(handle) = handle_guard.take() {
                 let _ = handle.join();
             }
@@ -1377,8 +1789,8 @@ mod tests {
             r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"read"}"#,
             r#"{"type":"tool_execution_end","toolCallId":"t1","toolName":"read","isError":false}"#,
             r#"{"type":"queue_update","pendingCount":2}"#,
-            r#"{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":500}"#,
-            r#"{"type":"auto_retry_end","attempt":1,"success":true}"#,
+            r#"{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":500,"errorMessage":"rate limited"}"#,
+            r#"{"type":"auto_retry_end","attempt":1,"success":false,"finalError":"quota exceeded"}"#,
             r#"{"type":"extension_ui_request","id":"ui-1","method":"confirm","title":"Sure?"}"#,
         ];
 
@@ -1391,11 +1803,53 @@ mod tests {
     }
 
     #[test]
+    fn parses_error_events_and_rejects_missing_success_in_rpc_response() {
+        let err_raw = r#"{"type":"error","error":"provider auth failed"}"#;
+        let err_ev = parse_pi_ui_event(&parse_json(err_raw).unwrap(), err_raw).unwrap();
+        assert_eq!(
+            err_ev,
+            PiUiEvent::Error {
+                message: "provider auth failed".to_string(),
+                raw_json: err_raw.to_string(),
+            }
+        );
+
+        let ext_err_raw = r#"{"type":"extension_error","message":"extension crashed"}"#;
+        let ext_err_ev =
+            parse_pi_ui_event(&parse_json(ext_err_raw).unwrap(), ext_err_raw).unwrap();
+        assert_eq!(
+            ext_err_ev,
+            PiUiEvent::Error {
+                message: "extension crashed".to_string(),
+                raw_json: ext_err_raw.to_string(),
+            }
+        );
+
+        // Missing `success` must NOT default to true.
+        let missing_success =
+            parse_json(r#"{"type":"response","id":"req-1","error":"bad params"}"#).unwrap();
+        let resp = parse_rpc_response(&missing_success).unwrap();
+        assert!(!resp.success);
+        assert_eq!(resp.error.as_deref(), Some("bad params"));
+
+        let empty_resp = parse_json(r#"{"type":"response","id":"req-2"}"#).unwrap();
+        assert!(!parse_rpc_response(&empty_resp).unwrap().success);
+
+        // Id-less parse-error response routes to PiUiEvent::Error.
+        let idless_raw = r#"{"type":"response","success":false,"error":"invalid json line"}"#;
+        let idless_val = parse_json(idless_raw).unwrap();
+        assert!(parse_rpc_response(&idless_val).is_none());
+        assert_eq!(
+            parse_idless_response_error(&idless_val, idless_raw),
+            Some(PiUiEvent::Error {
+                message: "invalid json line".to_string(),
+                raw_json: idless_raw.to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn mock_sh_prompt_streaming_steer_followup_deferred_reload_and_clean_shutdown() {
-        // Mock Pi JSONL RPC subprocess implemented in POSIX /bin/sh:
-        // - Responds to get_state, prompt, steer, follow_up, clear_queue, abort.
-        // - On prompt: emits response, message_start, message_update, tool_execution_start/end,
-        //   and waits for a follow_up command before emitting message_end + agent_settled.
         let script = r#"
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -1541,6 +1995,84 @@ done
     }
 
     #[test]
+    fn unexpected_child_exit_captures_stderr_resets_activity_and_emits_process_exited() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  if [ "$typ" = "prompt" ]; then
+    printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+    printf 'fatal provider crash\n' >&2
+    exit 42
+  fi
+done
+"#;
+
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |ev| {
+            if let PiUiEvent::ProcessExited {
+                exit_code,
+                stderr_tail,
+            } = ev
+            {
+                let _ = exit_tx.send((exit_code, stderr_tail));
+            }
+        });
+        let sup = PiSessionSupervisor::spawn(mock_sh_config(script), sink, Arc::new(|| {}))
+            .expect("spawn mock pi");
+
+        sup.prompt("boom", vec![]).expect("prompt");
+        let (_exit_code, stderr_tail) = exit_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("must emit ProcessExited on unexpected EOF");
+        assert_eq!(sup.activity(), SessionActivity::Idle);
+        assert!(
+            stderr_tail
+                .as_deref()
+                .is_some_and(|s| s.contains("fatal provider crash"))
+                || sup
+                    .stderr_tail()
+                    .as_deref()
+                    .is_some_and(|s| s.contains("fatal provider crash"))
+        );
+        sup.shutdown();
+    }
+
+    #[test]
+    fn abort_timeout_kills_wedged_process_resets_idle_and_emits_agent_settled() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  if [ "$typ" = "prompt" ]; then
+    printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+  elif [ "$typ" = "abort" ]; then
+    sleep 30
+  fi
+done
+"#;
+        let mut cfg = mock_sh_config(script);
+        cfg.command_timeout = Duration::from_millis(300);
+
+        let (settled_tx, settled_rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |ev| {
+            if matches!(ev, PiUiEvent::AgentSettled { .. }) {
+                let _ = settled_tx.send(());
+            }
+        });
+        let sup = PiSessionSupervisor::spawn(cfg, sink, Arc::new(|| {})).expect("spawn mock pi");
+        sup.prompt("hang", vec![]).expect("prompt");
+        assert!(sup.activity().is_streaming());
+
+        sup.abort().expect("wedged abort must recover cleanly");
+        assert_eq!(sup.activity(), SessionActivity::Idle);
+        assert!(!sup.is_alive());
+        settled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("synthetic AgentSettled must be emitted on abort timeout");
+    }
+
+    #[test]
     fn parses_nested_pi_rpc_streaming_events_and_agent_end() {
         let start_raw =
             r#"{"type":"message_start","message":{"id":"msg-42","role":"assistant","content":[]}}"#;
@@ -1625,14 +2157,16 @@ done
             }
         );
 
-        // Nested message_end with thinking + text + toolCall content blocks.
-        let end_raw = r#"{"type":"message_end","message":{"id":"msg-42","role":"assistant","stopReason":"stop","content":[{"type":"thinking","thinking":"First thought"},{"type":"thinking","thinking":"Second thought"},{"type":"toolCall","id":"tc-1","name":"read"},{"type":"text","text":"Final answer"}]}}"#;
+        // Nested message_end with thinking + text + toolCall content blocks + errorMessage.
+        let end_raw = r#"{"type":"message_end","message":{"id":"msg-42","role":"assistant","stopReason":"stop","errorMessage":"partial warning","content":[{"type":"thinking","thinking":"First thought"},{"type":"thinking","thinking":"Second thought"},{"type":"toolCall","id":"tc-1","name":"read"},{"type":"text","text":"Final answer"}]}}"#;
         let end_ev = parse_pi_ui_event(&parse_json(end_raw).unwrap(), end_raw).unwrap();
         assert_eq!(
             end_ev,
             PiUiEvent::MessageEnd {
                 message_id: Some("msg-42".to_string()),
+                role: Some("assistant".to_string()),
                 stop_reason: Some("stop".to_string()),
+                error_message: Some("partial warning".to_string()),
                 text: Some("Final answer".to_string()),
                 thinking: Some("First thought\nSecond thought".to_string()),
                 raw_json: end_raw.to_string(),
@@ -1722,11 +2256,12 @@ done
         assert!(recorded.iter().any(|e| matches!(
             e,
             PiUiEvent::MessageEnd {
+                role: Some(role),
                 stop_reason: Some(sr),
                 text: Some(txt),
                 thinking: Some(th),
                 ..
-            } if sr == "stop" && txt == "done" && th == "hmm"
+            } if role == "assistant" && sr == "stop" && txt == "done" && th == "hmm"
         )));
         drop(recorded);
         sup.shutdown();
