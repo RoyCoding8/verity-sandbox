@@ -167,3 +167,5 @@ mod tests {
         assert!(s5.run_provider_reload);
     }
 }
+
+pub mod pi_wire;

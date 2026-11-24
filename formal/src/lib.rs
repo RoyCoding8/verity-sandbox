@@ -6,3 +6,6 @@ pub mod session_laws;
 pub mod state_machine;
 #[cfg(any(kani, test))]
 pub mod verdict_gate;
+pub mod json_laws;
+pub mod types_laws;
+pub mod pi_event_laws;
