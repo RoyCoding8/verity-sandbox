@@ -218,6 +218,106 @@ pub fn parse_extension_ui_request(
     })
 }
 
+/// Fire-and-forget Extension UI effect (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionUiEffectPayload {
+    pub method: String,
+    pub message: Option<String>,
+    pub notify_type: Option<String>,
+    pub status_key: Option<String>,
+    pub status_text: Option<String>,
+    pub widget_key: Option<String>,
+    pub widget_lines: Option<Vec<String>>,
+    pub title: Option<String>,
+    pub text: Option<String>,
+}
+
+fn opt_str_field(val: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| val.get(k).and_then(JsonValue::as_str))
+        .map(ToString::to_string)
+}
+
+/// Parses a fire-and-forget Pi `extension_ui_request` effect (`notify`, `setStatus`,
+/// `setWidget`, `setTitle`, `set_editor_text`) so it can be forwarded to the UI instead of dropped.
+pub fn parse_extension_ui_effect(val: &JsonValue) -> Option<ExtensionUiEffectPayload> {
+    let raw_method = val
+        .get("method")
+        .or_else(|| val.get("kind"))
+        .and_then(JsonValue::as_str)?;
+
+    match raw_method {
+        "notify" => Some(ExtensionUiEffectPayload {
+            method: "notify".to_string(),
+            message: opt_str_field(val, &["message", "text"]),
+            notify_type: opt_str_field(val, &["notifyType", "notify_type", "level"]),
+            status_key: None,
+            status_text: None,
+            widget_key: None,
+            widget_lines: None,
+            title: opt_str_field(val, &["title"]),
+            text: None,
+        }),
+        "setStatus" | "set_status" => Some(ExtensionUiEffectPayload {
+            method: raw_method.to_string(),
+            message: None,
+            notify_type: None,
+            status_key: opt_str_field(val, &["statusKey", "status_key", "key"]),
+            status_text: opt_str_field(val, &["statusText", "status_text", "text", "value"]),
+            widget_key: None,
+            widget_lines: None,
+            title: None,
+            text: None,
+        }),
+        "setWidget" | "set_widget" => {
+            let widget_lines = val
+                .get("widgetLines")
+                .or_else(|| val.get("widget_lines"))
+                .or_else(|| val.get("lines"))
+                .and_then(JsonValue::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(ToString::to_string))
+                        .collect()
+                });
+            Some(ExtensionUiEffectPayload {
+                method: raw_method.to_string(),
+                message: None,
+                notify_type: None,
+                status_key: None,
+                status_text: None,
+                widget_key: opt_str_field(val, &["widgetKey", "widget_key", "key"]),
+                widget_lines,
+                title: None,
+                text: None,
+            })
+        }
+        "setTitle" | "set_title" => Some(ExtensionUiEffectPayload {
+            method: raw_method.to_string(),
+            message: None,
+            notify_type: None,
+            status_key: None,
+            status_text: None,
+            widget_key: None,
+            widget_lines: None,
+            title: opt_str_field(val, &["title", "value"]),
+            text: None,
+        }),
+        "set_editor_text" | "setEditorText" => Some(ExtensionUiEffectPayload {
+            method: raw_method.to_string(),
+            message: None,
+            notify_type: None,
+            status_key: None,
+            status_text: None,
+            widget_key: None,
+            widget_lines: None,
+            title: None,
+            text: opt_str_field(val, &["text", "value"]),
+        }),
+        _ => None,
+    }
+}
+
 /// Tracks open Pi Extension UI dialogs (`select`/`confirm`/`input`/`editor`) with optional
 /// timeout deadlines and produces validated `extension_ui_response` payloads.
 #[derive(Debug, Default)]
@@ -560,5 +660,61 @@ mod tests {
         assert_eq!(dialog.title.as_deref(), Some("Choose"));
         assert_eq!(dialog.options, vec!["a".to_string(), "b".to_string()]);
         assert!(dialog.deadline.is_some());
+    }
+
+    #[test]
+    fn parses_all_five_fire_and_forget_extension_ui_effects() {
+        let notify = parse_json(
+            r#"{"type":"extension_ui_request","id":"e1","method":"notify","message":"Saved!","notifyType":"info"}"#,
+        )
+        .unwrap();
+        let eff = parse_extension_ui_effect(&notify).unwrap();
+        assert_eq!(eff.method, "notify");
+        assert_eq!(eff.message.as_deref(), Some("Saved!"));
+        assert_eq!(eff.notify_type.as_deref(), Some("info"));
+
+        let status = parse_json(
+            r#"{"type":"extension_ui_request","id":"e2","method":"setStatus","statusKey":"git","statusText":"main"}"#,
+        )
+        .unwrap();
+        let eff = parse_extension_ui_effect(&status).unwrap();
+        assert_eq!(eff.method, "setStatus");
+        assert_eq!(eff.status_key.as_deref(), Some("git"));
+        assert_eq!(eff.status_text.as_deref(), Some("main"));
+
+        let widget = parse_json(
+            r#"{"type":"extension_ui_request","id":"e3","method":"setWidget","widgetKey":"tests","widgetLines":["3 passed","0 failed"]}"#,
+        )
+        .unwrap();
+        let eff = parse_extension_ui_effect(&widget).unwrap();
+        assert_eq!(eff.method, "setWidget");
+        assert_eq!(eff.widget_key.as_deref(), Some("tests"));
+        assert_eq!(
+            eff.widget_lines,
+            Some(vec!["3 passed".to_string(), "0 failed".to_string()])
+        );
+
+        let title = parse_json(
+            r#"{"type":"extension_ui_request","id":"e4","method":"setTitle","title":"Verity - Auth"}"#,
+        )
+        .unwrap();
+        let eff = parse_extension_ui_effect(&title).unwrap();
+        assert_eq!(eff.method, "setTitle");
+        assert_eq!(eff.title.as_deref(), Some("Verity - Auth"));
+
+        let editor_text = parse_json(
+            r#"{"type":"extension_ui_request","id":"e5","method":"set_editor_text","text":"/compact focus on auth"}"#,
+        )
+        .unwrap();
+        let eff = parse_extension_ui_effect(&editor_text).unwrap();
+        assert_eq!(eff.method, "set_editor_text");
+        assert_eq!(eff.text.as_deref(), Some("/compact focus on auth"));
+
+        // Interactive dialog methods are NOT fire-and-forget effects.
+        let confirm = parse_json(
+            r#"{"type":"extension_ui_request","id":"d1","method":"confirm","title":"Sure?"}"#,
+        )
+        .unwrap();
+        assert!(parse_extension_ui_effect(&confirm).is_none());
     }
 }

@@ -4,6 +4,11 @@ use crate::pi_session::{
     EventSink, PiRpcResponse, PiSessionConfig, PiSessionSupervisor, PiUiEvent, ReloadDisposition,
     ReloadHook,
 };
+pub use crate::projects::{PiProject, PiSessionSummary};
+use crate::projects::{
+    default_projects_store_path, load_or_init_projects, merge_live_and_disk_sessions,
+    project_from_path, scan_project_sessions, ProjectRegistry,
+};
 use crate::providers::{
     build_pi_provider_env, default_store_path, ensure_verity_pi_extension_path, ProviderStore,
     PublicProviderProfile,
@@ -88,27 +93,21 @@ pub struct SlashOrSkillCommand {
     pub name: String,
     pub description: String,
     pub insert_text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PiProject {
-    pub id: String,
-    pub name: String,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PiSessionSummary {
-    pub id: String,
-    pub project_id: String,
-    pub name: String,
-    pub path: String,
-    pub updated_at: String,
-    pub message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_session_id: Option<String>,
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiCommandInfo {
+    pub name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +176,7 @@ pub struct PiBootstrapData {
     pub projects: Vec<PiProject>,
     pub sessions: Vec<PiSessionSummary>,
     pub active_project_id: String,
+    pub active_project_path: String,
     pub active_session_id: String,
     pub messages: Vec<PiChatMessage>,
     pub models: Vec<ModelOption>,
@@ -641,14 +641,48 @@ pub fn parse_commands_list(val: &JsonValue) -> Vec<SlashOrSkillCommand> {
             let description = opt_str(item, &["description"]).unwrap_or_default();
             let insert_text = opt_str(item, &["insertText", "insert_text"])
                 .unwrap_or_else(|| format!("{}{} ", trigger, name));
+            let source = opt_str(item, &["source"]);
+            let location = opt_str(item, &["location", "path"]);
             Some(SlashOrSkillCommand {
                 trigger,
                 name,
                 description,
                 insert_text,
+                source,
+                location,
             })
         })
         .collect()
+}
+
+pub fn parse_command_info_list(val: &JsonValue) -> Vec<PiCommandInfo> {
+    parse_commands_list(val)
+        .into_iter()
+        .map(|cmd| PiCommandInfo {
+            name: cmd.name,
+            description: cmd.description,
+            source: cmd.source,
+            location: cmd.location,
+        })
+        .collect()
+}
+
+fn rpc_response_to_serde_value(resp: &PiRpcResponse) -> serde_json::Value {
+    resp.data_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn validate_queue_mode(field: &str, mode: &str) -> Result<String, String> {
+    let trimmed = mode.trim();
+    match trimmed {
+        "all" | "one-at-a-time" => Ok(trimmed.to_string()),
+        other => Err(format!(
+            "{} must be 'all' or 'one-at-a-time' (got '{}')",
+            field, other
+        )),
+    }
 }
 
 pub fn parse_export_html(val: &JsonValue, fallback_path: Option<&str>) -> ExportHtmlResult {
@@ -663,30 +697,6 @@ pub fn parse_export_html(val: &JsonValue, fallback_path: Option<&str>) -> Export
         }
     });
     ExportHtmlResult { path, html }
-}
-
-fn project_from_path(path: &Path) -> PiProject {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("workspace")
-        .to_string();
-    let slug: String = name
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() {
-                (b as char).to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    PiProject {
-        id: format!("proj-{}", slug),
-        name,
-        path: path.to_string_lossy().to_string(),
-    }
 }
 
 fn models_from_providers(providers: &[PublicProviderProfile]) -> Vec<ModelOption> {
@@ -889,7 +899,9 @@ fn require_non_empty(field: &str, value: &str) -> Result<String, String> {
 
 struct PiAppStateInner {
     supervisor: Mutex<Option<Arc<PiSessionSupervisor>>>,
-    project_path: Mutex<PathBuf>,
+    default_cwd: PathBuf,
+    projects_store_path: PathBuf,
+    registry: Mutex<ProjectRegistry>,
     provider_store_path: PathBuf,
     base_config: Option<PiSessionConfig>,
     selected_model: Mutex<Option<ModelOption>>,
@@ -926,13 +938,17 @@ pub struct PiAppState {
 }
 
 impl PiAppState {
-    /// Creates default desktop state using the current working directory and standard provider store.
+    /// Creates default desktop state using the persisted project registry and standard provider store.
     pub fn new_default() -> Self {
-        let project_path = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let default_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let projects_store_path = default_projects_store_path();
+        let registry = load_or_init_projects(&projects_store_path, &default_cwd);
         Self {
             inner: Arc::new(PiAppStateInner {
                 supervisor: Mutex::new(None),
-                project_path: Mutex::new(project_path),
+                default_cwd,
+                projects_store_path,
+                registry: Mutex::new(registry),
                 provider_store_path: default_store_path(),
                 base_config: None,
                 selected_model: Mutex::new(None),
@@ -950,10 +966,14 @@ impl PiAppState {
         provider_store_path: PathBuf,
         base_config: PiSessionConfig,
     ) -> Self {
+        let projects_store_path = provider_store_path.with_file_name("projects.json");
+        let registry = load_or_init_projects(&projects_store_path, &project_path);
         Self {
             inner: Arc::new(PiAppStateInner {
                 supervisor: Mutex::new(None),
-                project_path: Mutex::new(project_path),
+                default_cwd: project_path,
+                projects_store_path,
+                registry: Mutex::new(registry),
                 provider_store_path,
                 base_config: Some(base_config),
                 selected_model: Mutex::new(None),
@@ -967,11 +987,24 @@ impl PiAppState {
 
     /// Returns the active project path.
     pub fn project_path(&self) -> PathBuf {
-        self.inner
-            .project_path
-            .lock()
-            .expect("project_path lock poisoned")
-            .clone()
+        let guard = self.inner.registry.lock().expect("registry lock poisoned");
+        guard
+            .active_project()
+            .map(|p| PathBuf::from(&p.path))
+            .unwrap_or_else(|| self.inner.default_cwd.clone())
+    }
+
+    fn snapshot_projects(&self) -> (Vec<PiProject>, PiProject) {
+        let guard = self.inner.registry.lock().expect("registry lock poisoned");
+        if guard.projects.is_empty() {
+            let fallback = project_from_path(&self.inner.default_cwd);
+            return (vec![fallback.clone()], fallback);
+        }
+        let active = guard
+            .active_project()
+            .cloned()
+            .unwrap_or_else(|| guard.projects[0].clone());
+        (guard.projects.clone(), active)
     }
 
     /// Lazily spawns (or reuses an existing live) `PiSessionSupervisor` wired to `app.emit("pi:event", ...)`.
@@ -1062,7 +1095,11 @@ impl PiAppState {
         let launch_env = build_pi_launch_env(&store, verity_bin.as_deref());
 
         let mut config = match &self.inner.base_config {
-            Some(cfg) => cfg.clone(),
+            Some(cfg) => {
+                let mut cloned = cfg.clone();
+                cloned.cwd = project_path;
+                cloned
+            }
             None => {
                 let ext_path = ensure_verity_pi_extension_path().ok();
                 build_default_pi_config(project_path, ext_path.as_deref())
@@ -1178,7 +1215,8 @@ impl PiAppState {
     // --- Pure/Testable IPC Operation Implementations ---
 
     pub fn bootstrap_with_sink(&self, event_sink: EventSink) -> PiBootstrapData {
-        let project = project_from_path(&self.project_path());
+        let (projects, project) = self.snapshot_projects();
+        let disk_sessions = scan_project_sessions(&project.id, Path::new(&project.path));
         let store = ProviderStore::load(&self.inner.provider_store_path).unwrap_or_default();
         let providers = store.public_profiles();
         let provider_models = models_from_providers(&providers);
@@ -1198,11 +1236,16 @@ impl PiAppState {
                 .thinking_level
                 .lock()
                 .expect("thinking_level lock poisoned");
+            let active_session_id = disk_sessions
+                .first()
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
             return PiBootstrapData {
                 active_project_id: project.id.clone(),
-                projects: vec![project],
-                sessions: Vec::new(),
-                active_session_id: String::new(),
+                active_project_path: project.path.clone(),
+                projects,
+                sessions: disk_sessions,
+                active_session_id,
                 messages: Vec::new(),
                 models,
                 selected_model,
@@ -1293,10 +1336,12 @@ impl PiAppState {
             });
 
         let active_session_id = session.id.clone();
+        let sessions = merge_live_and_disk_sessions(disk_sessions, Some(session));
         PiBootstrapData {
             active_project_id: project.id.clone(),
-            projects: vec![project],
-            sessions: vec![session],
+            active_project_path: project.path.clone(),
+            projects,
+            sessions,
             active_session_id,
             messages,
             models,
@@ -1306,6 +1351,54 @@ impl PiAppState {
             commands,
             providers,
         }
+    }
+
+    pub fn add_project_with_sink(
+        &self,
+        event_sink: EventSink,
+        path: String,
+    ) -> Result<PiBootstrapData, String> {
+        let trimmed = require_non_empty("path", &path)?;
+        {
+            let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
+            reg.add_project(Path::new(&trimmed))?;
+            reg.save_atomic(&self.inner.projects_store_path)?;
+        }
+        self.shutdown();
+        Ok(self.bootstrap_with_sink(event_sink))
+    }
+
+    pub fn remove_project_with_sink(
+        &self,
+        event_sink: EventSink,
+        path: String,
+    ) -> Result<PiBootstrapData, String> {
+        let trimmed = require_non_empty("path", &path)?;
+        let active_changed = {
+            let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
+            let (_removed, active_was_removed, _next) = reg.remove_project(Path::new(&trimmed))?;
+            reg.save_atomic(&self.inner.projects_store_path)?;
+            active_was_removed
+        };
+        if active_changed {
+            self.shutdown();
+        }
+        Ok(self.bootstrap_with_sink(event_sink))
+    }
+
+    pub fn switch_project_with_sink(
+        &self,
+        event_sink: EventSink,
+        path: String,
+    ) -> Result<PiBootstrapData, String> {
+        let trimmed = require_non_empty("path", &path)?;
+        {
+            let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
+            reg.set_active_project(Path::new(&trimmed))?;
+            reg.save_atomic(&self.inner.projects_store_path)?;
+        }
+        self.shutdown();
+        Ok(self.bootstrap_with_sink(event_sink))
     }
 
     pub fn switch_session_with_sink(
@@ -1364,10 +1457,39 @@ impl PiAppState {
         event_sink: EventSink,
         session_id: String,
         name: String,
+        session_path: Option<String>,
     ) -> Result<PiSessionSummary, String> {
         let session_id = require_non_empty("sessionId", &session_id)?;
         let name = require_non_empty("name", &name)?;
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
+
+        if let Some(target_path) = session_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let current_path = sup
+                .get_state()
+                .ok()
+                .and_then(|r| parse_data_json(&r))
+                .and_then(|v| {
+                    opt_str(
+                        &v,
+                        &[
+                            "path",
+                            "sessionPath",
+                            "session_path",
+                            "sessionFile",
+                            "session_file",
+                        ],
+                    )
+                });
+            if current_path.as_deref() != Some(target_path) {
+                sup.switch_session(target_path)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
         let resp = sup.set_session_name(&name).map_err(|e| e.to_string())?;
         let project_id = project_from_path(&self.project_path()).id;
         Ok(parse_data_json(&resp)
@@ -1376,7 +1498,7 @@ impl PiAppState {
                 id: session_id,
                 project_id,
                 name,
-                path: String::new(),
+                path: session_path.unwrap_or_default(),
                 updated_at: "Just now".to_string(),
                 message_count: 0,
                 parent_session_id: None,
@@ -1624,6 +1746,139 @@ impl PiAppState {
         Ok(())
     }
 
+    pub fn bash_with_sink(
+        &self,
+        event_sink: EventSink,
+        command: String,
+    ) -> Result<serde_json::Value, String> {
+        let command = require_non_empty("command", &command)?;
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.bash(command).map_err(|e| e.to_string())?;
+        Ok(rpc_response_to_serde_value(&resp))
+    }
+
+    pub fn abort_bash_with_sink(&self, event_sink: EventSink) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.abort_bash().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_session_stats_with_sink(
+        &self,
+        event_sink: EventSink,
+    ) -> Result<serde_json::Value, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.get_session_stats().map_err(|e| e.to_string())?;
+        Ok(rpc_response_to_serde_value(&resp))
+    }
+
+    pub fn get_last_assistant_text_with_sink(
+        &self,
+        event_sink: EventSink,
+    ) -> Result<Option<String>, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.get_last_assistant_text().map_err(|e| e.to_string())?;
+        Ok(parse_data_json(&resp).and_then(|v| match v {
+            JsonValue::String(s) => Some(s),
+            JsonValue::Object(_) => opt_str(&v, &["text", "content", "message"]),
+            _ => None,
+        }))
+    }
+
+    pub fn set_auto_compaction_with_sink(
+        &self,
+        event_sink: EventSink,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.set_auto_compaction(enabled)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn set_auto_retry_with_sink(
+        &self,
+        event_sink: EventSink,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.set_auto_retry(enabled).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn set_steering_mode_with_sink(
+        &self,
+        event_sink: EventSink,
+        mode: String,
+    ) -> Result<(), String> {
+        let mode = validate_queue_mode("steeringMode", &mode)?;
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.set_steering_mode(mode).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn set_follow_up_mode_with_sink(
+        &self,
+        event_sink: EventSink,
+        mode: String,
+    ) -> Result<(), String> {
+        let mode = validate_queue_mode("followUpMode", &mode)?;
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        sup.set_follow_up_mode(mode).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn cycle_model_with_sink(&self, event_sink: EventSink) -> Result<serde_json::Value, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.cycle_model().map_err(|e| e.to_string())?;
+        if let Some(val) = parse_data_json(&resp) {
+            if val.get("model").is_some()
+                || val.get("modelId").is_some()
+                || val.get("model_id").is_some()
+            {
+                let parsed = parse_model_option(&val, "default", "default");
+                if parsed.model_id != "default" {
+                    *self
+                        .inner
+                        .selected_model
+                        .lock()
+                        .expect("selected_model lock poisoned") = Some(parsed);
+                }
+            }
+        }
+        Ok(rpc_response_to_serde_value(&resp))
+    }
+
+    pub fn cycle_thinking_level_with_sink(
+        &self,
+        event_sink: EventSink,
+    ) -> Result<serde_json::Value, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.cycle_thinking_level().map_err(|e| e.to_string())?;
+        if let Some(level) = parse_data_json(&resp)
+            .and_then(|v| opt_str(&v, &["level", "thinkingLevel", "thinking_level"]))
+            .and_then(|raw| ThinkingLevel::parse(&raw))
+        {
+            *self
+                .inner
+                .thinking_level
+                .lock()
+                .expect("thinking_level lock poisoned") = level;
+        }
+        Ok(rpc_response_to_serde_value(&resp))
+    }
+
+    pub fn get_commands_with_sink(
+        &self,
+        event_sink: EventSink,
+    ) -> Result<Vec<PiCommandInfo>, String> {
+        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let resp = sup.get_commands().map_err(|e| e.to_string())?;
+        Ok(parse_data_json(&resp)
+            .map(|v| parse_command_info_list(&v))
+            .unwrap_or_default())
+    }
+
     fn parse_session_with_messages(
         &self,
         sup: &PiSessionSupervisor,
@@ -1722,11 +1977,12 @@ pub async fn pi_set_session_name(
     state: State<'_, PiAppState>,
     session_id: String,
     name: String,
+    session_path: Option<String>,
 ) -> Result<PiSessionSummary, String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        app_state.set_session_name_with_sink(sink, session_id, name)
+        app_state.set_session_name_with_sink(sink, session_id, name, session_path)
     })
     .await
     .map_err(|e| format!("blocking task failed: {}", e))?
@@ -1937,6 +2193,194 @@ pub async fn pi_open_external_url(url: String) -> Result<(), String> {
         .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
+#[tauri::command]
+pub async fn pi_pick_project_folder(app: AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let picked = app.dialog().file().blocking_pick_folder();
+        Ok(picked
+            .and_then(|fp| fp.into_path().ok())
+            .map(|p| p.to_string_lossy().to_string()))
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_add_project(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    path: String,
+) -> Result<PiBootstrapData, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.add_project_with_sink(sink, path))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_remove_project(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    path: String,
+) -> Result<PiBootstrapData, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.remove_project_with_sink(sink, path))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_switch_project(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    path: String,
+) -> Result<PiBootstrapData, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.switch_project_with_sink(sink, path))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_bash(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    command: String,
+) -> Result<serde_json::Value, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.bash_with_sink(sink, command))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_abort_bash(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.abort_bash_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_get_session_stats(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<serde_json::Value, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.get_session_stats_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_get_last_assistant_text(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<Option<String>, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.get_last_assistant_text_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_set_auto_compaction(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.set_auto_compaction_with_sink(sink, enabled)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_set_auto_retry(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.set_auto_retry_with_sink(sink, enabled))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_set_steering_mode(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    mode: String,
+) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.set_steering_mode_with_sink(sink, mode))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_set_follow_up_mode(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    mode: String,
+) -> Result<(), String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.set_follow_up_mode_with_sink(sink, mode))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_cycle_model(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<serde_json::Value, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.cycle_model_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_cycle_thinking_level(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<serde_json::Value, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.cycle_thinking_level_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_get_commands(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<Vec<PiCommandInfo>, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || app_state.get_commands_with_sink(sink))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1967,6 +2411,7 @@ mod tests {
             cwd,
             env: Vec::new(),
             command_timeout: Duration::from_secs(5),
+            no_session: false,
         }
     }
 
@@ -2101,6 +2546,7 @@ mod tests {
             cwd: dir.clone(),
             env: Vec::new(),
             command_timeout: Duration::from_secs(1),
+            no_session: false,
         };
         let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
 
@@ -2150,6 +2596,7 @@ mod tests {
             cwd: dir.clone(),
             env: Vec::new(),
             command_timeout: Duration::from_secs(1),
+            no_session: false,
         };
         let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
         let sink: EventSink = Arc::new(|_| {});
@@ -2327,6 +2774,7 @@ done
                 Arc::clone(&sink),
                 "sess-2".to_string(),
                 "Renamed Session".to_string(),
+                None,
             )
             .unwrap();
         assert_eq!(renamed.name, "Renamed Session");
@@ -2473,10 +2921,10 @@ done
             .switch_session_with_sink(Arc::clone(&sink), "   ".to_string())
             .is_err());
         assert!(state
-            .set_session_name_with_sink(Arc::clone(&sink), "".to_string(), "ok".to_string())
+            .set_session_name_with_sink(Arc::clone(&sink), "".to_string(), "ok".to_string(), None)
             .is_err());
         assert!(state
-            .set_session_name_with_sink(Arc::clone(&sink), "s1".to_string(), "  ".to_string())
+            .set_session_name_with_sink(Arc::clone(&sink), "s1".to_string(), "  ".to_string(), None)
             .is_err());
         assert!(state
             .fork_with_sink(Arc::clone(&sink), "".to_string())
@@ -2532,6 +2980,7 @@ done
             cwd: dir.clone(),
             env: Vec::new(),
             command_timeout: Duration::from_secs(1),
+            no_session: false,
         };
         let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
         let sink: EventSink = Arc::new(|_| {});
@@ -2565,6 +3014,7 @@ done
             cwd: dir.clone(),
             env: Vec::new(),
             command_timeout: Duration::from_secs(1),
+            no_session: false,
         };
         let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
         let sink: EventSink = Arc::new(|_| {});
@@ -2591,6 +3041,7 @@ done
             cwd: dir.clone(),
             env: Vec::new(),
             command_timeout: Duration::from_secs(1),
+            no_session: false,
         };
         let state = PiAppState::with_config(dir.clone(), store_path, missing_cfg);
         let sink: EventSink = Arc::new(|_| {});
@@ -2660,19 +3111,20 @@ done
     fn build_default_pi_config_attaches_extension_flag_when_present() {
         let ext = PathBuf::from("/Users/alice/.verity/extensions/verity-providers.js");
         let with_ext = build_default_pi_config(PathBuf::from("/tmp/repo"), Some(&ext));
+        assert!(!with_ext.no_session);
         assert_eq!(
             with_ext.args,
             vec![
                 "--mode",
                 "rpc",
-                "--no-session",
                 "--extension",
                 "/Users/alice/.verity/extensions/verity-providers.js",
             ]
         );
 
         let without_ext = build_default_pi_config(PathBuf::from("/tmp/repo"), None);
-        assert_eq!(without_ext.args, vec!["--mode", "rpc", "--no-session"]);
+        assert!(!without_ext.no_session);
+        assert_eq!(without_ext.args, vec!["--mode", "rpc"]);
     }
 
     #[test]
@@ -2794,11 +3246,258 @@ done
             "core:event:allow-listen",
             "core:event:allow-unlisten",
             "core:event:allow-emit",
+            "dialog:allow-open",
         ] {
             assert!(
                 permissions.contains(&required),
                 "capabilities/default.json missing required permission {required}"
             );
         }
+    }
+
+    #[test]
+    fn preserves_command_source_and_location_metadata() {
+        let cmds_val = parse_json(
+            r#"{"commands":[{"trigger":"/","name":"review","description":"Code review","source":"skill","location":"/home/user/.pi/skills/review/SKILL.md"},{"trigger":"/","name":"plan","description":"Plan task","source":"prompt","location":"/repo/.pi/prompts/plan.md"},{"trigger":"/","name":"deploy","description":"Deploy ext","source":"extension"}]}"#,
+        )
+        .unwrap();
+
+        let cmds = parse_commands_list(&cmds_val);
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0].source.as_deref(), Some("skill"));
+        assert_eq!(
+            cmds[0].location.as_deref(),
+            Some("/home/user/.pi/skills/review/SKILL.md")
+        );
+        assert_eq!(cmds[1].source.as_deref(), Some("prompt"));
+        assert_eq!(
+            cmds[1].location.as_deref(),
+            Some("/repo/.pi/prompts/plan.md")
+        );
+        assert_eq!(cmds[2].source.as_deref(), Some("extension"));
+        assert_eq!(cmds[2].location, None);
+
+        let infos = parse_command_info_list(&cmds_val);
+        assert_eq!(infos.len(), 3);
+        assert_eq!(infos[0].name, "review");
+        assert_eq!(infos[0].source.as_deref(), Some("skill"));
+        assert_eq!(
+            infos[0].location.as_deref(),
+            Some("/home/user/.pi/skills/review/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn multi_project_add_switch_remove_respawns_pi_in_new_cwd() {
+        let root = unique_temp_dir("multi-proj");
+        let proj_a = root.join("proj-a");
+        let proj_b = root.join("proj-b");
+        fs::create_dir_all(&proj_a).unwrap();
+        fs::create_dir_all(&proj_b).unwrap();
+        let store_path = root.join("providers.json");
+        let cwd_log = root.join("cwd.log");
+
+        let script = format!(
+            r#"
+pwd >> "{cwd_log}"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    get_state)
+      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"id":"sess-live","name":"Active","path":"/tmp/live.jsonl"}}}}\n' "$id"
+      ;;
+    *)
+      printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#,
+            cwd_log = cwd_log.display()
+        );
+
+        let state = PiAppState::with_config(
+            proj_a.clone(),
+            store_path,
+            mock_sh_config(proj_a.clone(), &script),
+        );
+        let sink: EventSink = Arc::new(|_| {});
+
+        let boot_a = state.bootstrap_with_sink(Arc::clone(&sink));
+        assert_eq!(boot_a.projects.len(), 1);
+        assert_eq!(
+            PathBuf::from(&boot_a.active_project_path),
+            fs::canonicalize(&proj_a).unwrap()
+        );
+
+        // Add project B -> persists both, switches active, respawns Pi in proj_b.
+        let boot_b = state
+            .add_project_with_sink(Arc::clone(&sink), proj_b.to_string_lossy().to_string())
+            .unwrap();
+        assert_eq!(boot_b.projects.len(), 2);
+        assert_eq!(
+            PathBuf::from(&boot_b.active_project_path),
+            fs::canonicalize(&proj_b).unwrap()
+        );
+
+        // Switch back to project A -> respawns Pi in proj_a.
+        let boot_back = state
+            .switch_project_with_sink(Arc::clone(&sink), proj_a.to_string_lossy().to_string())
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(&boot_back.active_project_path),
+            fs::canonicalize(&proj_a).unwrap()
+        );
+
+        // Remove active project A -> falls back to project B and respawns in proj_b.
+        let boot_removed = state
+            .remove_project_with_sink(Arc::clone(&sink), proj_a.to_string_lossy().to_string())
+            .unwrap();
+        assert_eq!(boot_removed.projects.len(), 1);
+        assert_eq!(
+            PathBuf::from(&boot_removed.active_project_path),
+            fs::canonicalize(&proj_b).unwrap()
+        );
+
+        let logged_cwds: Vec<PathBuf> = fs::read_to_string(&cwd_log)
+            .unwrap()
+            .lines()
+            .map(PathBuf::from)
+            .collect();
+        let canon_a = fs::canonicalize(&proj_a).unwrap();
+        let canon_b = fs::canonicalize(&proj_b).unwrap();
+        assert_eq!(
+            logged_cwds,
+            vec![canon_a.clone(), canon_b.clone(), canon_a, canon_b]
+        );
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_session_name_switches_session_when_path_differs_and_new_rpc_commands_work() {
+        let dir = unique_temp_dir("new-rpcs");
+        let store_path = dir.join("providers.json");
+        let cmd_log = dir.join("cmds.log");
+
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  printf '%s\n' "$typ" >> "{cmd_log}"
+  case "$typ" in
+    get_state)
+      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"id":"s-cur","path":"/tmp/current.jsonl"}}}}\n' "$id"
+      ;;
+    bash)
+      printf '{{"type":"response","id":"%s","command":"bash","success":true,"data":{{"output":"hello","exitCode":0}}}}\n' "$id"
+      ;;
+    get_session_stats)
+      printf '{{"type":"response","id":"%s","command":"get_session_stats","success":true,"data":{{"totalTokens":1234,"cost":0.02}}}}\n' "$id"
+      ;;
+    get_last_assistant_text)
+      printf '{{"type":"response","id":"%s","command":"get_last_assistant_text","success":true,"data":{{"text":"Last reply"}}}}\n' "$id"
+      ;;
+    cycle_model)
+      printf '{{"type":"response","id":"%s","command":"cycle_model","success":true,"data":{{"model":{{"provider":"anthropic","modelId":"claude-opus-4-5","label":"Claude Opus 4.5"}}}}}}\n' "$id"
+      ;;
+    cycle_thinking_level)
+      printf '{{"type":"response","id":"%s","command":"cycle_thinking_level","success":true,"data":{{"level":"high"}}}}\n' "$id"
+      ;;
+    get_commands)
+      printf '{{"type":"response","id":"%s","command":"get_commands","success":true,"data":{{"commands":[{{"name":"review","description":"Review code","source":"skill","location":"/skills/review.md"}}]}}}}\n' "$id"
+      ;;
+    *)
+      printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#,
+            cmd_log = cmd_log.display()
+        );
+
+        let state = PiAppState::with_config(
+            dir.clone(),
+            store_path,
+            mock_sh_config(dir.clone(), &script),
+        );
+        let sink: EventSink = Arc::new(|_| {});
+
+        // Renaming a different session_path must issue switch_session before set_session_name.
+        state
+            .set_session_name_with_sink(
+                Arc::clone(&sink),
+                "s-other".to_string(),
+                "Renamed Other".to_string(),
+                Some("/tmp/other.jsonl".to_string()),
+            )
+            .unwrap();
+
+        let bash_res = state
+            .bash_with_sink(Arc::clone(&sink), "echo hello".to_string())
+            .unwrap();
+        assert_eq!(bash_res["output"], "hello");
+        assert_eq!(bash_res["exitCode"], 0);
+
+        state.abort_bash_with_sink(Arc::clone(&sink)).unwrap();
+
+        let stats = state
+            .get_session_stats_with_sink(Arc::clone(&sink))
+            .unwrap();
+        assert_eq!(stats["totalTokens"], 1234);
+
+        let last = state
+            .get_last_assistant_text_with_sink(Arc::clone(&sink))
+            .unwrap();
+        assert_eq!(last.as_deref(), Some("Last reply"));
+
+        state
+            .set_auto_compaction_with_sink(Arc::clone(&sink), true)
+            .unwrap();
+        state
+            .set_auto_retry_with_sink(Arc::clone(&sink), false)
+            .unwrap();
+        state
+            .set_steering_mode_with_sink(Arc::clone(&sink), "one-at-a-time".to_string())
+            .unwrap();
+        assert!(state
+            .set_steering_mode_with_sink(Arc::clone(&sink), "invalid".to_string())
+            .is_err());
+        state
+            .set_follow_up_mode_with_sink(Arc::clone(&sink), "all".to_string())
+            .unwrap();
+
+        let cycled_model = state.cycle_model_with_sink(Arc::clone(&sink)).unwrap();
+        assert_eq!(cycled_model["model"]["modelId"], "claude-opus-4-5");
+
+        let cycled_thinking = state
+            .cycle_thinking_level_with_sink(Arc::clone(&sink))
+            .unwrap();
+        assert_eq!(cycled_thinking["level"], "high");
+
+        let cmds = state.get_commands_with_sink(Arc::clone(&sink)).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].source.as_deref(), Some("skill"));
+        assert_eq!(cmds[0].location.as_deref(), Some("/skills/review.md"));
+
+        let log_lines: Vec<String> = fs::read_to_string(&cmd_log)
+            .unwrap()
+            .lines()
+            .map(ToString::to_string)
+            .collect();
+        let sw_idx = log_lines.iter().position(|c| c == "switch_session").unwrap();
+        let rn_idx = log_lines
+            .iter()
+            .position(|c| c == "set_session_name")
+            .unwrap();
+        assert!(
+            sw_idx < rn_idx,
+            "switch_session must happen before set_session_name"
+        );
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
     }
 }
