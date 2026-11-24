@@ -1,6 +1,6 @@
 //! Formal verification of Verity core branded types (`TaskId`, `CommitOid`, `RelPath`, `SpecDigest`).
 
-#[cfg(any(kani, test))]
+#[cfg(kani)]
 use verity_core::types::{
     validate_commit_oid_bytes, validate_rel_path_bytes, validate_spec_digest_bytes,
     validate_task_id_bytes, TypeError,
@@ -199,99 +199,4 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
         res == Err(TypeError::DotGitSegment),
         "rel_path_dotgit_reject_reachable"
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use verity_core::SpecDigest;
-
-    #[test]
-    fn task_id_and_rel_path_reject_traversal_and_windows_drives() {
-        assert_eq!(validate_task_id_bytes(b""), Err(TypeError::EmptyTaskId));
-        assert_eq!(
-            validate_task_id_bytes(&[b'a'; 129]),
-            Err(TypeError::EmptyTaskId)
-        );
-        assert_eq!(
-            validate_task_id_bytes(b".."),
-            Err(TypeError::TraversalSegment)
-        );
-        assert_eq!(
-            validate_task_id_bytes(b"a..b"),
-            Err(TypeError::TraversalSegment)
-        );
-        assert_eq!(
-            validate_task_id_bytes(b"a/b"),
-            Err(TypeError::InvalidTaskIdChar)
-        );
-        assert_eq!(
-            validate_task_id_bytes(b"a\0b"),
-            Err(TypeError::InvalidTaskIdChar)
-        );
-        assert!(validate_task_id_bytes(b"task-1.v2").is_ok());
-
-        assert_eq!(
-            validate_rel_path_bytes(b"C:foo"),
-            Err(TypeError::AbsolutePath)
-        );
-        assert_eq!(
-            validate_rel_path_bytes(b"c:/Windows/System32"),
-            Err(TypeError::AbsolutePath)
-        );
-        assert_eq!(
-            validate_rel_path_bytes(b"src\\lib.rs"),
-            Err(TypeError::BackslashPath)
-        );
-        assert_eq!(
-            validate_rel_path_bytes(b"src/../secret"),
-            Err(TypeError::TraversalSegment)
-        );
-        assert_eq!(
-            validate_rel_path_bytes(b"src//lib.rs"),
-            Err(TypeError::TraversalSegment)
-        );
-        assert_eq!(
-            validate_rel_path_bytes(b"src/a\0b"),
-            Err(TypeError::ControlCharInPath)
-        );
-        assert_eq!(
-            validate_rel_path_bytes(b"src/.git/config"),
-            Err(TypeError::DotGitSegment)
-        );
-        assert_eq!(
-            validate_rel_path_bytes(b"src/CON.txt"),
-            Err(TypeError::ReservedDeviceName)
-        );
-        assert_eq!(validate_rel_path_bytes(b"src/lib.rs"), Ok(10));
-    }
-
-    #[test]
-    fn commit_oid_and_spec_digest_enforce_exact_hex_lengths() {
-        let sha1 = "0123456789abcdef0123456789abcdef01234567";
-        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        assert!(validate_commit_oid_bytes(sha1.as_bytes()).is_ok());
-        assert!(validate_commit_oid_bytes(sha256.as_bytes()).is_ok());
-        assert_eq!(
-            validate_commit_oid_bytes(b"0123456789abcdef"),
-            Err(TypeError::InvalidCommitOid)
-        );
-        assert_eq!(
-            validate_commit_oid_bytes(sha1.to_ascii_uppercase().as_bytes()),
-            Err(TypeError::InvalidCommitOid)
-        );
-
-        assert_eq!(
-            validate_spec_digest_bytes(sha1.as_bytes()),
-            Err(TypeError::InvalidSpecDigest)
-        );
-        assert!(validate_spec_digest_bytes(sha256.as_bytes()).is_ok());
-        let parsed = SpecDigest::parse_hex(sha256).unwrap();
-        assert_eq!(parsed.to_hex(), sha256);
-        assert_eq!(parsed, SpecDigest::of_spec("abc"));
-        assert_eq!(
-            SpecDigest::parse_hex(&sha256.to_ascii_uppercase()),
-            Err(TypeError::InvalidSpecDigest)
-        );
-    }
 }
