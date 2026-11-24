@@ -34,8 +34,35 @@ export interface ChatTranscriptProps {
   readonly liveTools: readonly PiToolCallState[];
   readonly retryBanner: RetryBannerState | null;
   readonly isCompacting?: boolean;
+  readonly canRedoRevert?: boolean;
+  readonly lastRevertedFiles?: readonly string[];
   readonly onAbortRetry: () => void;
   readonly onPickStarterPrompt?: (prompt: string) => void;
+  readonly onRevertTurn?: (
+    entryId: string,
+    revertCode: boolean,
+    fallbackPromptText?: string
+  ) => void;
+  readonly onRedoRevert?: () => void;
+}
+
+function RevertArrowIcon({ size = 13 }: { readonly size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.85}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M9 14 4 9l5-5" />
+      <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11" />
+    </svg>
+  );
 }
 
 // ============================================================
@@ -1199,12 +1226,70 @@ export function ChatTranscript({
   liveTools,
   retryBanner,
   isCompacting = false,
+  canRedoRevert = false,
+  lastRevertedFiles = [],
   onAbortRetry,
   onPickStarterPrompt,
+  onRevertTurn,
+  onRedoRevert,
 }: ChatTranscriptProps) {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const isPinnedToBottomRef = useRef(true);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [revertPopoverMessageId, setRevertPopoverMessageId] = useState<string | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isStreaming && revertPopoverMessageId !== null) {
+      setRevertPopoverMessageId(null);
+    }
+  }, [isStreaming, revertPopoverMessageId]);
+
+  useEffect(() => {
+    if (revertPopoverMessageId === null) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setRevertPopoverMessageId(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [revertPopoverMessageId]);
+
+  async function handleCopyMessage(messageId: string, text: string): Promise<void> {
+    let succeeded = false;
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        succeeded = true;
+      } catch {
+        succeeded = copyWithExecCommand(text);
+      }
+    } else {
+      succeeded = copyWithExecCommand(text);
+    }
+    if (!succeeded) return;
+    setCopiedMessageId(messageId);
+    if (typeof window !== "undefined") {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopiedMessageId(null);
+        copyTimerRef.current = null;
+      }, 1800);
+    }
+  }
   const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
   const lastContentLength = lastMessage?.content.length ?? 0;
   const lastThinkingLength = lastMessage?.thinking?.length ?? 0;
@@ -1390,6 +1475,108 @@ export function ChatTranscript({
                     {message.toolCalls && message.toolCalls.length > 0 && (
                       <ToolCallList tools={message.toolCalls} />
                     )}
+
+                    {(message.role === "user" || message.role === "assistant") &&
+                      !isAssistantStreaming && (
+                        <div
+                          className={`pi-message-actions ${message.role}${
+                            revertPopoverMessageId === message.id
+                              ? " pi-message-actions--open"
+                              : ""
+                          }`}
+                        >
+                          {hasContent && (
+                            <button
+                              type="button"
+                              className={`pi-msg-action-btn${
+                                copiedMessageId === message.id ? " copied" : ""
+                              }`}
+                              onClick={() => void handleCopyMessage(message.id, message.content)}
+                              aria-label={
+                                copiedMessageId === message.id
+                                  ? "Copied message"
+                                  : "Copy message"
+                              }
+                              title="Copy message markdown"
+                            >
+                              {copiedMessageId === message.id ? (
+                                <CheckIcon size={13} />
+                              ) : (
+                                <CopyIcon size={13} />
+                              )}
+                              <span>{copiedMessageId === message.id ? "Copied" : "Copy"}</span>
+                            </button>
+                          )}
+
+                          {message.role === "user" && onRevertTurn && (
+                            <button
+                              type="button"
+                              className={`pi-msg-action-btn${
+                                revertPopoverMessageId === message.id ? " active" : ""
+                              }`}
+                              disabled={isStreaming}
+                              aria-expanded={revertPopoverMessageId === message.id}
+                              aria-haspopup="menu"
+                              onClick={() =>
+                                setRevertPopoverMessageId((prev) =>
+                                  prev === message.id ? null : message.id
+                                )
+                              }
+                              title={
+                                isStreaming
+                                  ? "Wait for the current turn to finish before reverting"
+                                  : "Revert to this turn"
+                              }
+                            >
+                              <RevertArrowIcon size={13} />
+                              <span>Revert</span>
+                            </button>
+                          )}
+                        </div>
+                      )}
+
+                    {message.role === "user" &&
+                      onRevertTurn &&
+                      revertPopoverMessageId === message.id && (
+                        <div
+                          className="pi-revert-popover"
+                          role="menu"
+                          aria-label="Revert turn options"
+                        >
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className="pi-revert-option-btn"
+                            disabled={isStreaming}
+                            onClick={() => {
+                              setRevertPopoverMessageId(null);
+                              onRevertTurn(message.id, false, message.content);
+                            }}
+                          >
+                            Revert chat only
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className="pi-revert-option-btn pi-revert-option-btn--code"
+                            disabled={isStreaming}
+                            onClick={() => {
+                              setRevertPopoverMessageId(null);
+                              onRevertTurn(message.id, true, message.content);
+                            }}
+                          >
+                            Revert chat &amp; code
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className="pi-revert-cancel-btn"
+                            onClick={() => setRevertPopoverMessageId(null)}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      )}
                   </article>
                 );
               })}
@@ -1422,6 +1609,30 @@ export function ChatTranscript({
           <div ref={bottomRef} />
         </div>
       </div>
+
+      {canRedoRevert && (
+        <div className="pi-redo-revert-banner" role="status" aria-live="polite">
+          <span className="pi-redo-revert-text">
+            <RevertArrowIcon size={14} />
+            <span>
+              {lastRevertedFiles.length > 0
+                ? `Code reverted (${lastRevertedFiles.length} ${
+                    lastRevertedFiles.length === 1 ? "file" : "files"
+                  })`
+                : "Code reverted"}
+            </span>
+          </span>
+          {onRedoRevert && (
+            <button
+              type="button"
+              className="pi-redo-revert-btn"
+              onClick={onRedoRevert}
+            >
+              Undo revert
+            </button>
+          )}
+        </div>
+      )}
 
       {isCompacting && (
         <div className="pi-compaction-pill" role="status" aria-live="polite">

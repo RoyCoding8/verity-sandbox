@@ -19,6 +19,7 @@ import { HistoryTreeModal } from "./components/HistoryTreeModal";
 import {
   AlertIcon,
   CloseIcon,
+  CopyIcon,
   GitMergeIcon,
   SettingsIcon,
   ShieldCheckIcon,
@@ -554,6 +555,17 @@ export function App() {
 
             <button
               type="button"
+              className="verity-topbar-pill"
+              disabled={state.messages.length === 0}
+              onClick={() => void actions.copyFullChat()}
+              title="Copy full chat as Markdown"
+            >
+              <CopyIcon size={15} />
+              <span className="verity-topbar-btn-label">Copy chat</span>
+            </button>
+
+            <button
+              type="button"
               className={
                 state.settingsModalOpen
                   ? "verity-topbar-pill verity-topbar-pill--active"
@@ -708,8 +720,14 @@ export function App() {
                 liveTools={state.liveTools}
                 retryBanner={state.retryBanner}
                 isCompacting={state.isCompacting}
+                canRedoRevert={state.canRedoRevert}
+                lastRevertedFiles={state.lastRevertedFiles}
                 onAbortRetry={() => void actions.abortRetry()}
                 onPickStarterPrompt={(prompt) => actions.setDraft(prompt)}
+                onRevertTurn={(entryId, revertCode, fallbackPromptText) =>
+                  void actions.revertTurn(entryId, revertCode, fallbackPromptText)
+                }
+                onRedoRevert={() => void actions.redoRevert()}
               />
             </div>
 

@@ -582,7 +582,7 @@ export function ProviderSettingsModal({
                       ref={draftModelInputRef}
                       className="md3-input"
                       aria-label="New model ID"
-                      placeholder="e.g. claude-sonnet-4-5"
+                      placeholder="e.g. claude-sonnet-5-5"
                       value={draftModelId}
                       disabled={isBusy}
                       onChange={(e) => setDraftModelId(e.target.value)}

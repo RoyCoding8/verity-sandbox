@@ -365,6 +365,44 @@ export interface ExportHtmlResult {
   readonly html: string;
 }
 
+export interface PiCycleModelPayload {
+  readonly provider?: string;
+  readonly id?: string;
+  readonly modelId?: string;
+  readonly label?: string;
+  readonly name?: string;
+  readonly model?: unknown;
+  readonly thinkingLevel?: string;
+  readonly thinking_level?: string;
+}
+
+export interface PiCycleThinkingPayload {
+  readonly level?: string;
+  readonly thinkingLevel?: string;
+  readonly thinking_level?: string;
+}
+
+export interface TurnCheckpointView {
+  readonly entryId: string;
+  readonly promptPreview: string;
+  readonly hasCodeSnapshot: boolean;
+  readonly createdAt: string;
+}
+
+export interface RevertTurnResult {
+  readonly session: PiSessionSummary;
+  readonly messages: readonly PiChatMessage[];
+  readonly restoredPrompt: string | null;
+  readonly codeReverted: boolean;
+  readonly revertedFiles: readonly string[];
+  readonly canRedo: boolean;
+  readonly codeRevertNote: string | null;
+}
+
+export interface RedoRevertResult {
+  readonly restoredFiles: readonly string[];
+}
+
 // ============================================================
 // Boundary Detection & Validation Helpers
 // ============================================================
@@ -1060,8 +1098,8 @@ class BrowserPreviewRuntime {
   ]);
 
   private models: ModelOption[] = [
-    { provider: "anthropic", modelId: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
-    { provider: "openai", modelId: "gpt-5", label: "GPT-5" },
+    { provider: "anthropic", modelId: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+    { provider: "openai", modelId: "gpt-6.1-sol", label: "GPT-6.1 Sol" },
     { provider: "google", modelId: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
     { provider: "local-vllm", modelId: "qwen-2.5-coder-32b", label: "Qwen 2.5 Coder 32B" },
   ];
@@ -1074,6 +1112,7 @@ class BrowserPreviewRuntime {
   private steeringMode: PiQueueMode = "one-at-a-time";
   private followUpMode: PiQueueMode = "one-at-a-time";
   private bashRunning = false;
+  private lastRevertedFiles: string[] = [];
 
   private commands: readonly SlashOrSkillCommand[] = [
     { trigger: "/", name: "/compact", description: "Compact conversation history into a summary", insertText: "/compact ", source: "builtin" },
@@ -1096,7 +1135,7 @@ class BrowserPreviewRuntime {
       api: "anthropic-messages",
       base_url: "https://api.anthropic.com/v1",
       sign_in_url: "https://console.anthropic.com",
-      models: ["claude-sonnet-4-5", "claude-opus-4"],
+      models: ["claude-sonnet-5-5", "claude-opus-5"],
       has_api_key: true,
     },
     {
@@ -1667,7 +1706,7 @@ class BrowserPreviewRuntime {
     this.followUpMode = mode;
   }
 
-  cycleModel(): { provider?: string; id?: string; model?: unknown } | null {
+  cycleModel(): PiCycleModelPayload | null {
     if (this.models.length === 0) return null;
     const idx = this.models.findIndex(
       (m) => m.provider === this.selectedModel.provider && m.modelId === this.selectedModel.modelId
@@ -1677,13 +1716,73 @@ class BrowserPreviewRuntime {
     return { provider: next.provider, id: next.modelId, model: next };
   }
 
-  cycleThinkingLevel(): { level?: string } | null {
+  cycleThinkingLevel(): PiCycleThinkingPayload | null {
     if (this.thinkingLevels.length === 0) return null;
     const idx = this.thinkingLevels.indexOf(this.thinkingLevel);
     const next = this.thinkingLevels[(idx + 1) % this.thinkingLevels.length];
     this.thinkingLevel = next;
     this.emit({ type: "thinking_level_changed", level: next });
     return { level: next };
+  }
+
+  listCheckpoints(): TurnCheckpointView[] {
+    const msgs = this.messagesBySession.get(this.activeSessionId) ?? [];
+    return msgs
+      .filter((m) => m.role === "user")
+      .map((m) => ({
+        entryId: m.id,
+        promptPreview: m.content.replace(/\s+/g, " ").slice(0, 120),
+        hasCodeSnapshot: true,
+        createdAt: m.timestamp,
+      }));
+  }
+
+  revertTurn(entryId: string, revertCode: boolean): RevertTurnResult {
+    this.cancelInFlightWork();
+    const source = this.messagesBySession.get(this.activeSessionId) ?? [];
+    const idx = source.findIndex((m) => m.id === entryId);
+    const restoredPrompt = idx >= 0 ? source[idx].content : null;
+    const sliced = idx >= 0 ? source.slice(0, idx) : [...source];
+    this.messagesBySession.set(this.activeSessionId, sliced);
+    this.updateSessionCount(this.activeSessionId);
+    const session: PiSessionSummary =
+      this.sessions.find((s) => s.id === this.activeSessionId) ?? {
+        id: this.activeSessionId,
+        projectId: this.activeProjectId,
+        name: "Session",
+        path: `/workspace/${this.activeProjectId}/.pi/sessions/${this.activeSessionId}.jsonl`,
+        updatedAt: "Just now",
+        messageCount: sliced.length,
+      };
+    if (revertCode) {
+      const files = ["crates/verity-core/src/scope.rs"];
+      this.lastRevertedFiles = files;
+      return {
+        session,
+        messages: sliced,
+        restoredPrompt,
+        codeReverted: true,
+        revertedFiles: files,
+        canRedo: true,
+        codeRevertNote: null,
+      };
+    }
+    this.lastRevertedFiles = [];
+    return {
+      session,
+      messages: sliced,
+      restoredPrompt,
+      codeReverted: false,
+      revertedFiles: [],
+      canRedo: false,
+      codeRevertNote: null,
+    };
+  }
+
+  redoRevert(): RedoRevertResult {
+    const restoredFiles = [...this.lastRevertedFiles];
+    this.lastRevertedFiles = [];
+    return { restoredFiles };
   }
 
   getCommands(): PiCommandInfo[] {
@@ -2048,18 +2147,39 @@ export const tauriApi = {
     await invoke<void>("pi_set_follow_up_mode", { mode });
   },
 
-  async piCycleModel(): Promise<{ provider?: string; id?: string; model?: unknown } | null> {
+  async piCycleModel(): Promise<PiCycleModelPayload | null> {
     if (!isTauriRuntime()) {
       return previewRuntime.cycleModel();
     }
-    return invoke<{ provider?: string; id?: string; model?: unknown } | null>("pi_cycle_model");
+    return invoke<PiCycleModelPayload | null>("pi_cycle_model");
   },
 
-  async piCycleThinkingLevel(): Promise<{ level?: string } | null> {
+  async piCycleThinkingLevel(): Promise<PiCycleThinkingPayload | null> {
     if (!isTauriRuntime()) {
       return previewRuntime.cycleThinkingLevel();
     }
-    return invoke<{ level?: string } | null>("pi_cycle_thinking_level");
+    return invoke<PiCycleThinkingPayload | null>("pi_cycle_thinking_level");
+  },
+
+  async piListCheckpoints(): Promise<TurnCheckpointView[]> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.listCheckpoints();
+    }
+    return invoke<TurnCheckpointView[]>("pi_list_checkpoints");
+  },
+
+  async piRevertTurn(entryId: string, revertCode: boolean): Promise<RevertTurnResult> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.revertTurn(entryId, revertCode);
+    }
+    return invoke<RevertTurnResult>("pi_revert_turn", { entryId, revertCode });
+  },
+
+  async piRedoRevert(): Promise<RedoRevertResult> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.redoRevert();
+    }
+    return invoke<RedoRevertResult>("pi_redo_revert");
   },
 
   async piGetCommands(): Promise<PiCommandInfo[]> {
@@ -2249,9 +2369,15 @@ export const piSetSteeringMode = (mode: PiQueueMode): Promise<void> =>
   tauriApi.piSetSteeringMode(mode);
 export const piSetFollowUpMode = (mode: PiQueueMode): Promise<void> =>
   tauriApi.piSetFollowUpMode(mode);
-export const piCycleModel = (): Promise<{ provider?: string; id?: string; model?: unknown } | null> =>
+export const piCycleModel = (): Promise<PiCycleModelPayload | null> =>
   tauriApi.piCycleModel();
-export const piCycleThinkingLevel = (): Promise<{ level?: string } | null> =>
+export const piCycleThinkingLevel = (): Promise<PiCycleThinkingPayload | null> =>
   tauriApi.piCycleThinkingLevel();
+export const piListCheckpoints = (): Promise<TurnCheckpointView[]> =>
+  tauriApi.piListCheckpoints();
+export const piRevertTurn = (entryId: string, revertCode: boolean): Promise<RevertTurnResult> =>
+  tauriApi.piRevertTurn(entryId, revertCode);
+export const piRedoRevert = (): Promise<RedoRevertResult> =>
+  tauriApi.piRedoRevert();
 export const piGetCommands = (): Promise<PiCommandInfo[]> =>
   tauriApi.piGetCommands();

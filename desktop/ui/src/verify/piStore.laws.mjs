@@ -143,7 +143,7 @@ async function main() {
     const slashMod = await server.ssrLoadModule("/src/lib/slashCommands.ts");
 
     const { parsePiUiEventPayload, tauriApi } = tauriMod;
-    const { createInitialPiState, piReducer } = storeMod;
+    const { createInitialPiState, piReducer, resolveCycledModel, resolveCycledThinkingLevel, formatChatTranscriptMarkdown } = storeMod;
     const {
       normalizeSlashName,
       displaySlashName,
@@ -998,6 +998,173 @@ async function main() {
         assert.equal(s.editorPrefillText, "/skill:kani-verify scope.rs");
         s = dispatchAction(s, { type: "consume_editor_prefill" }, "S16.consume");
         assert.equal(s.editorPrefillText, null);
+      },
+    ]);
+
+    // ------------------------------------------------------------
+    // Scenario 17: Cycle Model nested/flat/fallback wrap-around & single-model handling
+    // ------------------------------------------------------------
+    scenarios.push([
+      "Cycle Model nested/flat/fallback wrap-around & single-model handling",
+      () => {
+        const models = [
+          { provider: "anthropic", modelId: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+          { provider: "openai", modelId: "gpt-6.1-sol", label: "GPT-6.1 Sol" },
+          { provider: "google", modelId: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+        ];
+
+        // Nested wirePayload.model.{provider, id, name} + thinkingLevel
+        const nested = resolveCycledModel(models, models[0], {
+          model: { provider: "openai", id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+          thinkingLevel: "high",
+        });
+        assert.equal(nested.kind, "cycled");
+        assert.equal(nested.model.provider, "openai");
+        assert.equal(nested.model.modelId, "gpt-6.1-sol");
+        assert.equal(nested.model.label, "GPT-6.1 Sol");
+        assert.equal(nested.thinkingLevel, "high");
+
+        // Flat wirePayload.{provider, modelId, label} for a new model not in list
+        const flat = resolveCycledModel(models, models[0], {
+          provider: "anthropic",
+          modelId: "claude-opus-5",
+          label: "Claude Opus 5",
+        });
+        assert.equal(flat.kind, "cycled");
+        assert.deepEqual(flat.model, {
+          provider: "anthropic",
+          modelId: "claude-opus-5",
+          label: "Claude Opus 5",
+        });
+
+        // Null / empty payload triggers fallback_set_model to next model
+        const fallbackNull = resolveCycledModel(models, models[0], null);
+        assert.equal(fallbackNull.kind, "fallback_set_model");
+        assert.equal(fallbackNull.model.modelId, "gpt-6.1-sol");
+
+        // Unchanged model wraps around from last model back to index 0
+        const fallbackWrap = resolveCycledModel(models, models[2], {
+          model: { provider: "google", modelId: "gemini-2.5-pro" },
+        });
+        assert.equal(fallbackWrap.kind, "fallback_set_model");
+        assert.equal(fallbackWrap.model.modelId, "claude-sonnet-5-5");
+
+        // Single-model list returns single_model
+        const single = resolveCycledModel([models[0]], models[0], null);
+        assert.equal(single.kind, "single_model");
+        const singleSame = resolveCycledModel([models[0]], models[0], {
+          provider: "anthropic",
+          id: "claude-sonnet-5-5",
+        });
+        assert.equal(singleSame.kind, "single_model");
+
+        // Thinking level cycling: accepts thinkingLevel or level, and falls back with wrap-around
+        const thinkingLevels = ["off", "low", "medium", "high"];
+        assert.deepEqual(
+          resolveCycledThinkingLevel(thinkingLevels, "medium", { thinkingLevel: "high" }),
+          { kind: "cycled", level: "high" }
+        );
+        assert.deepEqual(
+          resolveCycledThinkingLevel(thinkingLevels, "high", { level: "high" }),
+          { kind: "fallback_set_thinking", level: "off" }
+        );
+        assert.deepEqual(
+          resolveCycledThinkingLevel(thinkingLevels, "low", null),
+          { kind: "fallback_set_thinking", level: "medium" }
+        );
+      },
+    ]);
+
+    // ------------------------------------------------------------
+    // Scenario 18: Revert turn + redo state transitions & copy markdown formatting
+    // ------------------------------------------------------------
+    scenarios.push([
+      "Revert turn (chat-only & chat+code) + redo state transitions",
+      async () => {
+        let s = createInitialPiState();
+        assert.equal(s.canRedoRevert, false);
+        assert.deepEqual(s.lastRevertedFiles, []);
+
+        // Seed 2 turns
+        const baseSession = {
+          id: "sess-rev",
+          projectId: "proj-verity",
+          name: "Revert test",
+          path: "/tmp/sess-rev.jsonl",
+          updatedAt: "Just now",
+          messageCount: 4,
+        };
+        const msgs = [
+          { id: "u-1", role: "user", content: "First prompt", timestamp: "10:00" },
+          { id: "a-1", role: "assistant", content: "First reply", timestamp: "10:00" },
+          { id: "u-2", role: "user", content: "Second prompt", timestamp: "10:01" },
+          { id: "a-2", role: "assistant", content: "Second reply", timestamp: "10:01" },
+        ];
+        s = dispatchAction(
+          s,
+          { type: "session_created", session: baseSession, messages: msgs },
+          "S18.seed"
+        );
+
+        // Verify Markdown formatting for Copy Full Chat
+        const md = formatChatTranscriptMarkdown(s.messages);
+        assert.equal(
+          md,
+          "## You\nFirst prompt\n\n## Verity\nFirst reply\n\n## You\nSecond prompt\n\n## Verity\nSecond reply"
+        );
+
+        // Revert turn with code snapshot -> truncates messages, prefills prompt, enables redo
+        s = dispatchAction(
+          s,
+          {
+            type: "turn_reverted",
+            session: { ...baseSession, messageCount: 2 },
+            messages: msgs.slice(0, 2),
+            restoredPrompt: "Second prompt",
+            canRedo: true,
+            revertedFiles: ["src/a.ts", "src/b.ts"],
+          },
+          "S18.revert_code"
+        );
+        assert.equal(s.messages.length, 2);
+        assert.equal(s.canRedoRevert, true);
+        assert.deepEqual(s.lastRevertedFiles, ["src/a.ts", "src/b.ts"]);
+        assert.equal(s.editorPrefillText, "Second prompt");
+        assert.equal(s.isStreaming, false);
+        assert.equal(s.pendingQueueCount, 0);
+
+        // Redo revert clears canRedoRevert & lastRevertedFiles
+        s = dispatchAction(s, { type: "revert_redone" }, "S18.redo");
+        assert.equal(s.canRedoRevert, false);
+        assert.deepEqual(s.lastRevertedFiles, []);
+
+        // Revert chat only leaves canRedoRevert false
+        s = dispatchAction(
+          s,
+          {
+            type: "turn_reverted",
+            session: { ...baseSession, messageCount: 0 },
+            messages: [],
+            restoredPrompt: "First prompt",
+            canRedo: false,
+            revertedFiles: [],
+          },
+          "S18.revert_chat_only"
+        );
+        assert.equal(s.messages.length, 0);
+        assert.equal(s.canRedoRevert, false);
+        assert.equal(s.editorPrefillText, "First prompt");
+
+        // BrowserPreviewRuntime IPC wrappers work end-to-end
+        const checkpoints = await tauriApi.piListCheckpoints();
+        assert.ok(Array.isArray(checkpoints));
+        if (checkpoints.length > 0) {
+          const rev = await tauriApi.piRevertTurn(checkpoints[0].entryId, true);
+          assert.equal(rev.codeReverted, true);
+          assert.equal(rev.canRedo, true);
+          const redone = await tauriApi.piRedoRevert();
+          assert.ok(redone.restoredFiles.length >= 1);
+        }
       },
     ]);
 
