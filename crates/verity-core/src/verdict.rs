@@ -105,10 +105,20 @@ pub enum VerdictStatus {
 pub enum VerdictReason {
     InvalidMetadataOrShouldPanic,
     SolverError,
+    EmptyChecks,
     CheckFailed {
         check_index: usize,
     },
+    AssertionUnreachable {
+        check_index: usize,
+    },
     CheckUndetermined {
+        check_index: usize,
+    },
+    CoverUnsatisfied {
+        check_index: usize,
+    },
+    CoverUndetermined {
         check_index: usize,
     },
     ProbeUnreachable {
@@ -144,6 +154,8 @@ pub struct CheckerVerdict {
 pub enum GateError {
     HygieneFailed(usize),
     VerdictNotPass(VerdictStatus),
+    MissingSpecDigest,
+    BlindBackTranslationUnverified,
 }
 
 impl fmt::Display for GateError {
@@ -154,6 +166,12 @@ impl fmt::Display for GateError {
             }
             GateError::VerdictNotPass(status) => {
                 write!(f, "machine checker verdict is {:?}, not Pass", status)
+            }
+            GateError::MissingSpecDigest => {
+                write!(f, "spec_digest is missing or unverified")
+            }
+            GateError::BlindBackTranslationUnverified => {
+                write!(f, "blind back-translation requirement is unmet")
             }
         }
     }
@@ -177,8 +195,8 @@ fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Allocation-free core classifier verified directly by Kani.
 /// Accepts standard CBMC safety checks alongside assertions and covers, while
-/// failing closed on any failure, undetermined check, solver error, or
-/// missing/unsatisfiable `kani::cover!` reachability probe.
+/// failing closed on empty check sets, any failure, unreachable assertion,
+/// undetermined check, solver error, or any unsatisfied/missing `kani::cover!` probe.
 pub fn classify_kani_core<C: CheckView>(
     has_harness_name: bool,
     should_panic: bool,
@@ -202,13 +220,46 @@ pub fn classify_kani_core<C: CheckView>(
             probes_satisfied: 0,
         };
     }
+    if checks.is_empty() {
+        return VerdictCore {
+            status: VerdictStatus::InvalidReport,
+            reason: VerdictReason::EmptyChecks,
+            checks_passed: 0,
+            probes_satisfied: 0,
+        };
+    }
 
     let mut checks_passed = 0usize;
+    let mut first_unreachable_assertion: Option<usize> = None;
+    let mut first_cover_unsatisfied: Option<usize> = None;
+    let mut first_undetermined: Option<(usize, bool)> = None;
+
     let mut check_index = 0usize;
     while check_index < checks.len() {
         let check = &checks[check_index];
         match check.kind() {
-            CheckKind::Assertion | CheckKind::Safety => match check.status() {
+            CheckKind::Assertion => match check.status() {
+                CheckStatus::Success => checks_passed += 1,
+                CheckStatus::Failure => {
+                    return VerdictCore {
+                        status: VerdictStatus::Counterexample,
+                        reason: VerdictReason::CheckFailed { check_index },
+                        checks_passed,
+                        probes_satisfied: 0,
+                    };
+                }
+                CheckStatus::Unreachable => {
+                    if first_unreachable_assertion.is_none() {
+                        first_unreachable_assertion = Some(check_index);
+                    }
+                }
+                CheckStatus::Undetermined | CheckStatus::Satisfied | CheckStatus::Unsatisfiable => {
+                    if first_undetermined.is_none() {
+                        first_undetermined = Some((check_index, false));
+                    }
+                }
+            },
+            CheckKind::Safety => match check.status() {
                 CheckStatus::Success => checks_passed += 1,
                 CheckStatus::Unreachable => {}
                 CheckStatus::Failure => {
@@ -220,17 +271,59 @@ pub fn classify_kani_core<C: CheckView>(
                     };
                 }
                 CheckStatus::Undetermined | CheckStatus::Satisfied | CheckStatus::Unsatisfiable => {
-                    return VerdictCore {
-                        status: VerdictStatus::Inconclusive,
-                        reason: VerdictReason::CheckUndetermined { check_index },
-                        checks_passed,
-                        probes_satisfied: 0,
-                    };
+                    if first_undetermined.is_none() {
+                        first_undetermined = Some((check_index, false));
+                    }
                 }
             },
-            CheckKind::Cover => {}
+            CheckKind::Cover => match check.status() {
+                CheckStatus::Satisfied => {}
+                CheckStatus::Unsatisfiable
+                | CheckStatus::Unreachable
+                | CheckStatus::Failure => {
+                    if first_cover_unsatisfied.is_none() {
+                        first_cover_unsatisfied = Some(check_index);
+                    }
+                }
+                CheckStatus::Undetermined | CheckStatus::Success => {
+                    if first_undetermined.is_none() {
+                        first_undetermined = Some((check_index, true));
+                    }
+                }
+            },
         }
         check_index += 1;
+    }
+
+    if let Some(check_index) = first_unreachable_assertion {
+        return VerdictCore {
+            status: VerdictStatus::Counterexample,
+            reason: VerdictReason::AssertionUnreachable { check_index },
+            checks_passed,
+            probes_satisfied: 0,
+        };
+    }
+
+    if let Some(check_index) = first_cover_unsatisfied {
+        return VerdictCore {
+            status: VerdictStatus::Counterexample,
+            reason: VerdictReason::CoverUnsatisfied { check_index },
+            checks_passed,
+            probes_satisfied: 0,
+        };
+    }
+
+    if let Some((check_index, is_cover)) = first_undetermined {
+        return VerdictCore {
+            status: VerdictStatus::Inconclusive,
+            reason: if is_cover {
+                VerdictReason::CoverUndetermined { check_index }
+            } else {
+                VerdictReason::CheckUndetermined { check_index }
+            },
+            checks_passed,
+            probes_satisfied: 0,
+        };
     }
 
     let mut probes_satisfied = 0usize;
@@ -284,6 +377,15 @@ pub fn classify_kani_core<C: CheckView>(
         probe_index += 1;
     }
 
+    if checks_passed == 0 {
+        return VerdictCore {
+            status: VerdictStatus::InvalidReport,
+            reason: VerdictReason::EmptyChecks,
+            checks_passed: 0,
+            probes_satisfied,
+        };
+    }
+
     VerdictCore {
         status: VerdictStatus::Pass,
         reason: VerdictReason::AllPassed,
@@ -307,12 +409,33 @@ pub fn classify_kani_report(report: &KaniReport, expected_probes: &[&str]) -> Ch
             "invalid harness metadata or should_panic is enabled".to_string()
         }
         VerdictReason::SolverError => "solver error reported by Kani".to_string(),
+        VerdictReason::EmptyChecks => {
+            "report contains no passing assertion or safety checks".to_string()
+        }
         VerdictReason::CheckFailed { check_index } => {
             format!("check failed: {}", report.checks[check_index].description)
+        }
+        VerdictReason::AssertionUnreachable { check_index } => {
+            format!(
+                "assertion unreachable: {}",
+                report.checks[check_index].description
+            )
         }
         VerdictReason::CheckUndetermined { check_index } => {
             format!(
                 "check undetermined: {}",
+                report.checks[check_index].description
+            )
+        }
+        VerdictReason::CoverUnsatisfied { check_index } => {
+            format!(
+                "cover property unsatisfied: {}",
+                report.checks[check_index].description
+            )
+        }
+        VerdictReason::CoverUndetermined { check_index } => {
+            format!(
+                "cover property undetermined: {}",
                 report.checks[check_index].description
             )
         }
@@ -360,6 +483,24 @@ pub fn can_approve_gate_core(
     }
     if verdict_status != VerdictStatus::Pass {
         return Err(GateError::VerdictNotPass(verdict_status));
+    }
+    Ok(())
+}
+
+/// Allocation-free handoff approval gate enforcing hygiene, checker verdict,
+/// `spec_digest`, and `blind_back_translation` requirements.
+pub fn can_approve_handoff_gate_core(
+    hygiene_violations: usize,
+    verdict_status: VerdictStatus,
+    spec_digest_present: bool,
+    blind_back_translation_verified: bool,
+) -> Result<(), GateError> {
+    can_approve_gate_core(hygiene_violations, verdict_status)?;
+    if !spec_digest_present {
+        return Err(GateError::MissingSpecDigest);
+    }
+    if !blind_back_translation_verified {
+        return Err(GateError::BlindBackTranslationUnverified);
     }
     Ok(())
 }
