@@ -5,9 +5,14 @@ import {
   isTauriRuntime,
   tauriApi,
   type ExtensionUiAnswer,
+  type PiSessionStats,
 } from "./api/tauri";
 import { ChatTranscript, STARTER_SUGGESTIONS } from "./components/ChatTranscript";
 import { Composer } from "./components/Composer";
+import {
+  ExtensionToastLayer,
+  type ExtensionToastItem as ToastLayerItem,
+} from "./components/ExtensionToastLayer";
 import { ExtensionUiLayer } from "./components/ExtensionUiLayer";
 import { ForkModal } from "./components/ForkModal";
 import { HistoryTreeModal } from "./components/HistoryTreeModal";
@@ -15,15 +20,22 @@ import {
   AlertIcon,
   CloseIcon,
   GitMergeIcon,
+  SettingsIcon,
   ShieldCheckIcon,
   TerminalIcon,
 } from "./components/Icons";
 import { MergeQueueModal } from "./components/MergeQueueModal";
 import { ProviderSettingsModal } from "./components/ProviderSettingsModal";
 import { RunLogDrawer } from "./components/RunLogDrawer";
+import {
+  SessionSettingsModal,
+  type SessionStatsView,
+  type SlashCommandDirectoryItem,
+} from "./components/SessionSettingsModal";
 import { Sidebar } from "./components/Sidebar";
 import { SpecReviewDrawer } from "./components/SpecReviewDrawer";
 import { SubagentRail } from "./components/SubagentRail";
+import { displaySlashName, mergeSlashCommands } from "./lib/slashCommands";
 import { usePiWorkspace } from "./state/piStore";
 import type {
   HandoffView,
@@ -41,6 +53,25 @@ function parseVerdictStatus(raw: string): VerdictStatus {
   return "invalid_report";
 }
 
+function toSessionStatsView(stats: PiSessionStats | null): SessionStatsView | null {
+  if (!stats) return null;
+  return {
+    sessionId: stats.sessionId ?? undefined,
+    userMessages: stats.userMessages,
+    assistantMessages: stats.assistantMessages,
+    toolCalls: stats.toolCalls,
+    totalMessages: stats.totalMessages,
+    inputTokens: stats.tokens?.input,
+    outputTokens: stats.tokens?.output,
+    cacheReadTokens: stats.tokens?.cacheRead,
+    cacheWriteTokens: stats.tokens?.cacheWrite,
+    totalTokens: stats.tokens?.total,
+    cost: stats.cost,
+    contextWindow: stats.contextWindow ?? undefined,
+    contextUsagePercent: stats.contextUsagePercent ?? undefined,
+  };
+}
+
 export function App() {
   const { state, projectSessions, activeSession, actions } = usePiWorkspace();
   const desktopRuntime = isTauriRuntime();
@@ -48,6 +79,9 @@ export function App() {
   const [verityPanelOpen, setVerityPanelOpen] = useState(false);
   const [mergeQueueOpen, setMergeQueueOpen] = useState(false);
   const [runLogOpen, setRunLogOpen] = useState(false);
+  const [pendingComposerInsert, setPendingComposerInsert] = useState<string | null>(
+    null
+  );
 
   const [subagents, setSubagents] = useState<SubagentTaskItem[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -125,6 +159,73 @@ export function App() {
   const pendingHandoffCount = useMemo(
     () => subagents.filter((t) => t.status === "awaiting_spec_review").length,
     [subagents]
+  );
+
+  const sessionStatsView = useMemo(
+    () => toSessionStatsView(state.sessionStats),
+    [state.sessionStats]
+  );
+
+  const contextUsagePercent = useMemo(() => {
+    const raw = state.sessionStats?.contextUsagePercent;
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
+    return Math.max(0, Math.min(100, Math.round(raw)));
+  }, [state.sessionStats]);
+
+  const commandDirectoryItems = useMemo<SlashCommandDirectoryItem[]>(
+    () =>
+      mergeSlashCommands(state.commands).map((cmd) => ({
+        name: cmd.normalizedName,
+        displayName: displaySlashName(cmd.name),
+        description: cmd.description || undefined,
+        source: cmd.source,
+        location: cmd.location,
+        usage: cmd.usage,
+      })),
+    [state.commands]
+  );
+
+  const toastLayerItems = useMemo<ToastLayerItem[]>(
+    () =>
+      state.extensionToasts.map((toast, idx) => ({
+        id: toast.id,
+        message: toast.message,
+        level: toast.notifyType,
+        createdAt: idx,
+      })),
+    [state.extensionToasts]
+  );
+
+  const toastLayerWidgets = useMemo<Record<string, string[]>>(() => {
+    const out: Record<string, string[]> = {};
+    for (const [key, lines] of Object.entries(state.extensionWidgetLines)) {
+      out[key] = [...lines];
+    }
+    return out;
+  }, [state.extensionWidgetLines]);
+
+  const extensionStatusEntries = useMemo(
+    () => Object.entries(state.extensionStatus),
+    [state.extensionStatus]
+  );
+
+  const effectiveEditorPrefill = pendingComposerInsert ?? state.editorPrefillText;
+
+  const handleConsumeEditorPrefill = useCallback((): string | null => {
+    if (pendingComposerInsert !== null) {
+      const next = pendingComposerInsert;
+      setPendingComposerInsert(null);
+      return next;
+    }
+    return actions.consumeEditorPrefill();
+  }, [pendingComposerInsert, actions.consumeEditorPrefill]);
+
+  const handleInsertCommand = useCallback(
+    (commandText: string) => {
+      setPendingComposerInsert(commandText);
+      actions.closeSettingsModal();
+    },
+    [actions.closeSettingsModal]
   );
 
   const handleRespondExtensionDialog = useCallback(
@@ -350,8 +451,11 @@ export function App() {
       commands={state.commands}
       isStreaming={state.isStreaming}
       pendingQueueCount={state.pendingQueueCount}
+      bashRunning={state.bashRunning}
+      editorPrefillText={effectiveEditorPrefill}
       variant={variant}
       onDraftChange={actions.setDraft}
+      onConsumeEditorPrefill={handleConsumeEditorPrefill}
       onRecallUp={actions.recallUp}
       onRecallDown={actions.recallDown}
       onAddAttachment={actions.addAttachment}
@@ -363,6 +467,7 @@ export function App() {
       onFollowUp={() => void actions.followUpPrompt()}
       onClearQueue={() => void actions.clearQueue()}
       onAbort={() => void actions.abortTurn()}
+      onAbortBash={() => void actions.abortBash()}
     />
   );
 
@@ -381,7 +486,10 @@ export function App() {
         activeSessionId={state.activeSessionId}
         theme={state.theme}
         isDesktop={desktopRuntime}
-        onSelectProject={(id) => void actions.selectProject(id)}
+        onSelectProject={(path) => void actions.selectProject(path)}
+        onPickAndAddProject={() => void actions.pickAndAddProject()}
+        onAddProject={(path) => void actions.addProject(path)}
+        onRemoveProject={(path) => void actions.removeProject(path)}
         onSelectSession={(s) => void actions.switchSession(s)}
         onCreateSession={() => void actions.createSession()}
         onRenameSession={(id, name) => void actions.renameSession(id, name)}
@@ -409,9 +517,56 @@ export function App() {
                 )}
               </>
             )}
+            {state.isCompacting && isHeroEmpty && (
+              <span className="verity-status-pill verity-status-pill--compacting" role="status">
+                <span className="verity-status-dot" aria-hidden="true" />
+                Compacting...
+              </span>
+            )}
+            {extensionStatusEntries.length > 0 && (
+              <div className="verity-ext-status-strip" aria-label="Extension status">
+                {extensionStatusEntries.map(([key, text]) => (
+                  <span
+                    key={key}
+                    className="verity-ext-status-pill"
+                    title={`${key}: ${text}`}
+                  >
+                    <span className="verity-ext-status-key">{key}</span>
+                    <span className="verity-ext-status-text">{text}</span>
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="verity-topbar-actions">
+            {contextUsagePercent !== null && (
+              <button
+                type="button"
+                className="verity-topbar-pill verity-topbar-pill--context"
+                onClick={() => actions.openSettingsModal("stats")}
+                title="View session statistics and context usage"
+                aria-label={`Context usage ${contextUsagePercent}%`}
+              >
+                <span>{contextUsagePercent}% ctx</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              className={
+                state.settingsModalOpen
+                  ? "verity-topbar-pill verity-topbar-pill--active"
+                  : "verity-topbar-pill"
+              }
+              aria-pressed={state.settingsModalOpen}
+              onClick={() => actions.openSettingsModal("behavior")}
+              title="Open session settings, stats, and skills"
+            >
+              <SettingsIcon size={15} />
+              <span className="verity-topbar-btn-label">Session &amp; Skills</span>
+            </button>
+
             <button
               type="button"
               className={
@@ -552,6 +707,7 @@ export function App() {
                 isStreaming={state.isStreaming}
                 liveTools={state.liveTools}
                 retryBanner={state.retryBanner}
+                isCompacting={state.isCompacting}
                 onAbortRetry={() => void actions.abortRetry()}
                 onPickStarterPrompt={(prompt) => actions.setDraft(prompt)}
               />
@@ -621,6 +777,25 @@ export function App() {
         onDelete={actions.deleteProvider}
         onClose={actions.closeModal}
       />
+      <SessionSettingsModal
+        open={state.settingsModalOpen}
+        initialTab={state.settingsModalTab}
+        onClose={actions.closeSettingsModal}
+        autoCompactionEnabled={state.autoCompactionEnabled}
+        autoRetryEnabled={state.autoRetryEnabled}
+        steeringMode={state.steeringMode}
+        followUpMode={state.followUpMode}
+        onToggleAutoCompaction={(enabled) => void actions.setAutoCompaction(enabled)}
+        onToggleAutoRetry={(enabled) => void actions.setAutoRetry(enabled)}
+        onChangeSteeringMode={(mode) => void actions.setSteeringMode(mode)}
+        onChangeFollowUpMode={(mode) => void actions.setFollowUpMode(mode)}
+        onCycleModel={() => void actions.cycleModel()}
+        onCycleThinkingLevel={() => void actions.cycleThinkingLevel()}
+        stats={sessionStatsView}
+        onRefreshStats={() => void actions.refreshSessionStats()}
+        commands={commandDirectoryItems}
+        onInsertCommand={handleInsertCommand}
+      />
       <MergeQueueModal
         open={mergeQueueOpen}
         entries={mergeEntries}
@@ -639,6 +814,11 @@ export function App() {
         onRespond={handleRespondExtensionDialog}
         onDismissSnackbar={actions.dismissSnackbar}
         onDismissWidget={actions.dismissWidget}
+      />
+      <ExtensionToastLayer
+        toasts={toastLayerItems}
+        onDismissToast={actions.dismissToast}
+        widgets={toastLayerWidgets}
       />
     </div>
   );

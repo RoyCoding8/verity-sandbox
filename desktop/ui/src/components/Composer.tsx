@@ -13,9 +13,17 @@ import {
 import type {
   ModelOption,
   PendingAttachment,
+  PiCommandSource,
   SlashOrSkillCommand,
   ThinkingLevel,
 } from "../api/tauri";
+import {
+  displaySlashName,
+  filterSlashCommands,
+  mergeSlashCommands,
+  parseBashPrefix,
+  type MergedSlashCommand,
+} from "../lib/slashCommands";
 import {
   CloseIcon,
   CpuIcon,
@@ -23,6 +31,7 @@ import {
   SendIcon,
   SparklesIcon,
   StopIcon,
+  TerminalIcon,
 } from "./Icons";
 import { Md3Select, type Md3SelectOption } from "./Md3Select";
 import "./Composer.css";
@@ -37,8 +46,11 @@ export interface ComposerProps {
   readonly commands: readonly SlashOrSkillCommand[];
   readonly isStreaming: boolean;
   readonly pendingQueueCount: number;
+  readonly bashRunning?: boolean;
+  readonly editorPrefillText?: string | null;
   readonly variant?: "hero" | "docked";
   readonly onDraftChange: (value: string) => void;
+  readonly onConsumeEditorPrefill?: () => string | null;
   readonly onRecallUp: () => void;
   readonly onRecallDown: () => void;
   readonly onAddAttachment: (attachment: PendingAttachment) => void;
@@ -50,6 +62,7 @@ export interface ComposerProps {
   readonly onFollowUp: () => void;
   readonly onClearQueue: () => void;
   readonly onAbort: () => void;
+  readonly onAbortBash?: () => void;
 }
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -100,17 +113,49 @@ function formatThinkingLevel(level: ThinkingLevel): string {
   }
 }
 
+interface CompletionItem {
+  readonly key: string;
+  readonly displayName: string;
+  readonly description: string;
+  readonly insertText: string;
+  readonly source: PiCommandSource;
+}
+
 interface CompletionMatch {
   readonly trigger: "/" | "$";
   readonly triggerStart: number;
   readonly triggerEnd: number;
-  readonly items: readonly SlashOrSkillCommand[];
+  readonly items: readonly CompletionItem[];
+}
+
+function sourceBadgeMeta(source: PiCommandSource): {
+  readonly label: string;
+  readonly className: string;
+} {
+  const lowered = source.trim().toLowerCase();
+  if (lowered === "skill") {
+    return { label: "Skill", className: "pi-completion-badge--skill" };
+  }
+  if (lowered === "prompt") {
+    return { label: "Prompt", className: "pi-completion-badge--prompt" };
+  }
+  if (lowered === "extension") {
+    return { label: "Extension", className: "pi-completion-badge--extension" };
+  }
+  if (lowered === "builtin" || lowered === "built-in") {
+    return { label: "Built-in", className: "pi-completion-badge--builtin" };
+  }
+  return {
+    label: source.trim() || "Command",
+    className: "pi-completion-badge--builtin",
+  };
 }
 
 function resolveCompletions(
   draft: string,
   caretPos: number,
-  commands: readonly SlashOrSkillCommand[]
+  mergedSlashCommands: readonly MergedSlashCommand[],
+  dollarCommands: readonly SlashOrSkillCommand[]
 ): CompletionMatch | null {
   const clampedCaret = Math.max(0, Math.min(caretPos, draft.length));
   const beforeCaret = draft.slice(0, clampedCaret);
@@ -119,23 +164,51 @@ function resolveCompletions(
   const rawToken = tokenMatch[2];
   const trigger = rawToken[0];
   if (trigger !== "/" && trigger !== "$") return null;
+
+  const triggerStart = beforeCaret.length - rawToken.length;
+
+  if (trigger === "/") {
+    const filtered = filterSlashCommands(mergedSlashCommands, rawToken);
+    if (filtered.length === 0) return null;
+    if (
+      filtered.length === 1 &&
+      displaySlashName(filtered[0].name).toLowerCase() === rawToken.toLowerCase() &&
+      filtered[0].insertText === displaySlashName(filtered[0].name)
+    ) {
+      return null;
+    }
+    const items: CompletionItem[] = filtered.map((cmd) => ({
+      key: `${cmd.source}:${cmd.normalizedName}`,
+      displayName: displaySlashName(cmd.name),
+      description: cmd.description,
+      insertText: cmd.insertText,
+      source: cmd.source,
+    }));
+    return { trigger: "/", triggerStart, triggerEnd: clampedCaret, items };
+  }
+
   const query = rawToken.toLowerCase();
-  const items = commands.filter(
+  const matchedDollar = dollarCommands.filter(
     (cmd) =>
-      cmd.trigger === trigger &&
-      (cmd.name.toLowerCase().startsWith(query) ||
-        cmd.description.toLowerCase().includes(query.slice(1)))
+      cmd.name.toLowerCase().startsWith(query) ||
+      cmd.description.toLowerCase().includes(query.slice(1))
   );
-  if (items.length === 0) return null;
+  if (matchedDollar.length === 0) return null;
   if (
-    items.length === 1 &&
-    items[0].name.toLowerCase() === query &&
-    items[0].insertText === items[0].name
+    matchedDollar.length === 1 &&
+    matchedDollar[0].name.toLowerCase() === query &&
+    matchedDollar[0].insertText === matchedDollar[0].name
   ) {
     return null;
   }
-  const triggerStart = beforeCaret.length - rawToken.length;
-  return { trigger, triggerStart, triggerEnd: clampedCaret, items };
+  const items: CompletionItem[] = matchedDollar.map((cmd) => ({
+    key: `dollar:${cmd.name}`,
+    displayName: cmd.name,
+    description: cmd.description,
+    insertText: cmd.insertText,
+    source: cmd.source ?? "skill",
+  }));
+  return { trigger: "$", triggerStart, triggerEnd: clampedCaret, items };
 }
 
 function resolveAttachmentFilename(
@@ -162,8 +235,11 @@ export function Composer({
   commands,
   isStreaming,
   pendingQueueCount,
+  bashRunning = false,
+  editorPrefillText = null,
   variant = "docked",
   onDraftChange,
+  onConsumeEditorPrefill,
   onRecallUp,
   onRecallDown,
   onAddAttachment,
@@ -175,6 +251,7 @@ export function Composer({
   onFollowUp,
   onClearQueue,
   onAbort,
+  onAbortBash,
 }: ComposerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -191,10 +268,22 @@ export function Composer({
   const [attachError, setAttachError] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
 
+  const mergedSlashCommands = useMemo(
+    () => mergeSlashCommands(commands),
+    [commands]
+  );
+
+  const dollarCommands = useMemo(
+    () => commands.filter((cmd) => cmd.trigger === "$" || cmd.name.trim().startsWith("$")),
+    [commands]
+  );
+
+  const bashPrefix = useMemo(() => parseBashPrefix(draft), [draft]);
+
   const completion = useMemo(() => {
     if (completionDismissed) return null;
-    return resolveCompletions(draft, caretPos, commands);
-  }, [draft, caretPos, commands, completionDismissed]);
+    return resolveCompletions(draft, caretPos, mergedSlashCommands, dollarCommands);
+  }, [draft, caretPos, mergedSlashCommands, dollarCommands, completionDismissed]);
 
   const activeCompletionIdx = completion
     ? Math.min(selectedCompletionIdx, completion.items.length - 1)
@@ -260,6 +349,18 @@ export function Composer({
     el.style.height = `${nextHeight}px`;
     el.style.overflowY = el.scrollHeight > MAX_TEXTAREA_HEIGHT_PX ? "auto" : "hidden";
   }, []);
+
+  useEffect(() => {
+    if (editorPrefillText === null) return;
+    const consumed = onConsumeEditorPrefill ? onConsumeEditorPrefill() : editorPrefillText;
+    if (consumed === null) return;
+    pendingCaretRef.current = consumed.length;
+    setCaretPos(consumed.length);
+    setCompletionDismissed(true);
+    setSelectedCompletionIdx(0);
+    onDraftChange(consumed);
+    textareaRef.current?.focus();
+  }, [editorPrefillText, onConsumeEditorPrefill, onDraftChange]);
 
   useLayoutEffect(() => {
     syncTextareaHeight();
@@ -434,7 +535,7 @@ export function Composer({
     [onAddAttachment]
   );
 
-  function applyCompletion(cmd: SlashOrSkillCommand) {
+  function applyCompletion(cmd: CompletionItem) {
     if (!completion) return;
     const next =
       draft.slice(0, completion.triggerStart) +
@@ -602,28 +703,66 @@ export function Composer({
             aria-label="Command completions"
           >
             <div className="pi-completion-header">
-              <span>{completion.trigger === "/" ? "Commands" : "Workspace skills"}</span>
+              <span>{completion.trigger === "/" ? "Commands & skills" : "Workspace skills"}</span>
               <span>Tab or Enter to insert · Esc to dismiss</span>
             </div>
             <div ref={completionListRef} className="pi-completion-list">
-              {completion.items.map((item, idx) => (
-                <button
-                  key={item.name}
-                  type="button"
-                  role="option"
-                  aria-selected={idx === activeCompletionIdx}
-                  className={`pi-completion-item${idx === activeCompletionIdx ? " selected" : ""}`}
-                  onMouseEnter={() => setSelectedCompletionIdx(idx)}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    applyCompletion(item);
-                  }}
-                >
-                  <span className="pi-completion-name">{item.name}</span>
-                  <span className="pi-completion-desc">{item.description}</span>
-                </button>
-              ))}
+              {completion.items.map((item, idx) => {
+                const badge = sourceBadgeMeta(item.source);
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    role="option"
+                    aria-selected={idx === activeCompletionIdx}
+                    className={`pi-completion-item${idx === activeCompletionIdx ? " selected" : ""}`}
+                    onMouseEnter={() => setSelectedCompletionIdx(idx)}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      applyCompletion(item);
+                    }}
+                  >
+                    <span className="pi-completion-left">
+                      <span className="pi-completion-name">{item.displayName}</span>
+                      <span className={`pi-completion-badge ${badge.className}`}>
+                        {badge.label}
+                      </span>
+                    </span>
+                    <span className="pi-completion-desc">{item.description}</span>
+                  </button>
+                );
+              })}
             </div>
+          </div>
+        )}
+
+        {(bashPrefix !== null || bashRunning) && (
+          <div
+            className={`pi-composer-bash-bar${
+              bashPrefix?.excludeFromContext ? " pi-composer-bash-bar--excluded" : ""
+            }`}
+            role="status"
+          >
+            <span className="pi-composer-bash-info">
+              <TerminalIcon size={13} />
+              {bashRunning ? (
+                <span>Running shell command...</span>
+              ) : bashPrefix?.excludeFromContext ? (
+                <span>Shell command (excluded from context)</span>
+              ) : (
+                <span>Shell command (added to context)</span>
+              )}
+            </span>
+            {bashRunning && onAbortBash && (
+              <button
+                type="button"
+                className="pi-composer-bash-stop-btn"
+                onClick={onAbortBash}
+              >
+                <StopIcon size={11} />
+                <span>Stop bash</span>
+              </button>
+            )}
           </div>
         )}
 
@@ -706,7 +845,7 @@ export function Composer({
             placeholder={
               isStreaming
                 ? "Follow-up (Enter) or steer (Ctrl+Enter)..."
-                : "Ask Verity or type / for commands"
+                : "Ask Verity, type / for commands, or ! for shell"
             }
             value={draft}
             rows={1}
