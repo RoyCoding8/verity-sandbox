@@ -1919,7 +1919,7 @@ mod tests {
             (
                 PiRpcCommand::SetModel {
                     provider: "anthropic".to_string(),
-                    model_id: "claude-sonnet-4".to_string(),
+                    model_id: "claude-sonnet-5-5".to_string(),
                 },
                 "set_model",
             ),

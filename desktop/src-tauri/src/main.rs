@@ -56,6 +56,9 @@ fn main() {
             pi_ipc::pi_cycle_model,
             pi_ipc::pi_cycle_thinking_level,
             pi_ipc::pi_get_commands,
+            pi_ipc::pi_list_checkpoints,
+            pi_ipc::pi_revert_turn,
+            pi_ipc::pi_redo_revert,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Verity desktop");
