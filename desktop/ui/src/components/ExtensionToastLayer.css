@@ -1,0 +1,214 @@
+/* ==========================================================================
+   ExtensionToastLayer — Material Design 3 Floating Toasts & Extension Widgets
+   Non-blocking fixed containers (pointer-events: none) with interactive items.
+   ========================================================================== */
+
+/* Floating Extension Widgets (Top-Right) */
+.etl-widget-stack {
+  position: fixed;
+  top: 68px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(320px, calc(100vw - 32px));
+  z-index: 45;
+  pointer-events: none;
+}
+
+.etl-widget-card {
+  pointer-events: auto;
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--verity-hairline);
+  border-radius: var(--md-sys-shape-corner-lg);
+  padding: 12px 14px;
+  box-shadow: var(--verity-surface-highlight), var(--md-sys-elevation-2);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: box-shadow var(--md-sys-motion-fast),
+    background var(--md-sys-motion-fast);
+}
+
+:root[data-theme="light"] .etl-widget-card {
+  background: var(--md-sys-color-surface-container-lowest);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .etl-widget-card {
+    background: var(--md-sys-color-surface-container-lowest);
+  }
+}
+
+.etl-widget-card:hover {
+  box-shadow: var(--verity-surface-highlight), var(--md-sys-elevation-3);
+}
+
+.etl-widget-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--md-sys-color-primary);
+}
+
+.etl-widget-key {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.etl-widget-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.etl-widget-line {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--md-sys-color-on-surface);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* Floating Snackbar / Toast Stack (Bottom-Right above composer) */
+.etl-toast-stack {
+  position: fixed;
+  bottom: 96px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(420px, calc(100vw - 32px));
+  z-index: 70;
+  pointer-events: none;
+}
+
+.etl-toast {
+  pointer-events: auto;
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--md-sys-shape-corner-lg);
+  border: 1px solid var(--verity-hairline);
+  background: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface);
+  box-shadow: var(--verity-surface-highlight), var(--md-sys-elevation-2);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  line-height: 1.45;
+  animation: etl-slide-in var(--md-sys-motion-standard);
+}
+
+:root[data-theme="light"] .etl-toast--info {
+  background: var(--md-sys-color-surface-container-lowest);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .etl-toast--info {
+    background: var(--md-sys-color-surface-container-lowest);
+  }
+}
+
+.etl-toast--info {
+  border-color: color-mix(
+    in srgb,
+    var(--md-sys-color-tertiary) 32%,
+    var(--verity-hairline)
+  );
+}
+
+.etl-toast--info .etl-toast-icon {
+  color: var(--md-sys-color-tertiary);
+}
+
+.etl-toast--warning {
+  background: color-mix(
+    in srgb,
+    var(--verity-warning-container) 88%,
+    var(--md-sys-color-surface-container-highest)
+  );
+  color: var(--verity-on-warning-container);
+  border-color: color-mix(in srgb, var(--verity-warning) 34%, transparent);
+}
+
+.etl-toast--warning .etl-toast-icon {
+  color: var(--verity-warning);
+}
+
+.etl-toast--error {
+  background: color-mix(
+    in srgb,
+    var(--md-sys-color-error-container) 88%,
+    var(--md-sys-color-surface-container-highest)
+  );
+  color: var(--md-sys-color-on-error-container);
+  border-color: color-mix(in srgb, var(--md-sys-color-error) 34%, transparent);
+}
+
+.etl-toast--error .etl-toast-icon {
+  color: var(--md-sys-color-error);
+}
+
+.etl-toast-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.etl-toast-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.etl-toast-message {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.etl-toast-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: var(--md-sys-shape-corner-full);
+  background: transparent;
+  color: inherit;
+  opacity: 0.78;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity var(--md-sys-motion-fast),
+    background var(--md-sys-motion-fast);
+}
+
+.etl-toast-dismiss:hover {
+  opacity: 1;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+@keyframes etl-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
