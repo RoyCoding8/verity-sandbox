@@ -159,10 +159,11 @@
   box-shadow: 0 0 0 3px var(--md-sys-color-primary-container);
 }
 
-/* Elevated MD3 Popover Menu */
+/* Elevated MD3 Popover Menu (portaled to document.body) */
 .md3-select-menu {
-  position: absolute;
-  min-width: max(100%, 180px);
+  position: fixed;
+  box-sizing: border-box;
+  max-width: min(360px, calc(100vw - 24px));
   max-height: 280px;
   overflow-y: auto;
   padding: 6px;
@@ -173,7 +174,7 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  z-index: 60;
+  z-index: 80;
   animation: md3-select-enter var(--md-sys-motion-fast) both;
 }
 
@@ -190,21 +191,12 @@
 }
 
 .md3-select-menu--bottom {
-  top: calc(100% + 6px);
   transform-origin: top center;
 }
 
 .md3-select-menu--top {
-  bottom: calc(100% + 6px);
   transform-origin: bottom center;
-}
-
-.md3-select-menu--align-start {
-  left: 0;
-}
-
-.md3-select-menu--align-end {
-  right: 0;
+  animation-name: md3-select-enter-top;
 }
 
 @keyframes md3-select-enter {
@@ -216,10 +208,6 @@
     opacity: 1;
     transform: translateY(0) scale(1);
   }
-}
-
-.md3-select-menu--top {
-  animation-name: md3-select-enter-top;
 }
 
 @keyframes md3-select-enter-top {
