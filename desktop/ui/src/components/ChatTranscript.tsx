@@ -33,6 +33,7 @@ export interface ChatTranscriptProps {
   readonly isStreaming: boolean;
   readonly liveTools: readonly PiToolCallState[];
   readonly retryBanner: RetryBannerState | null;
+  readonly isCompacting?: boolean;
   readonly onAbortRetry: () => void;
   readonly onPickStarterPrompt?: (prompt: string) => void;
 }
@@ -1009,7 +1010,17 @@ function toolStatusLabel(status: PiToolCallState["status"]): string {
 
 function ToolCallCard({ tool }: { readonly tool: PiToolCallState }) {
   const [expanded, setExpanded] = useState(false);
-  const singleLinePreview = tool.detail ? tool.detail.replace(/\s+/g, " ").trim() : "";
+  const detailText = tool.detail && tool.detail.trim().length > 0 ? tool.detail : undefined;
+  const partialText =
+    tool.partialOutput && tool.partialOutput.trim().length > 0
+      ? tool.partialOutput
+      : undefined;
+  const effectiveOutput = detailText ?? partialText;
+  const singleLinePreview = effectiveOutput
+    ? effectiveOutput.replace(/\s+/g, " ").trim()
+    : "";
+  const showLivePartial =
+    !expanded && tool.status === "running" && partialText !== undefined && !detailText;
 
   return (
     <div className="pi-tool-card">
@@ -1030,14 +1041,26 @@ function ToolCallCard({ tool }: { readonly tool: PiToolCallState }) {
         </span>
       </button>
 
+      {showLivePartial && (
+        <div className="pi-tool-card-live-output">
+          <pre className="pi-tool-card-pre pi-tool-card-pre--streaming">
+            {partialText}
+          </pre>
+        </div>
+      )}
+
       {expanded && (
         <div className="pi-tool-card-body">
           <div className="pi-tool-card-meta">
             <span>id: {tool.id}</span>
             <span>status: {tool.status}</span>
           </div>
-          {tool.detail ? (
-            <pre className="pi-tool-card-pre">{formatToolDetail(tool.detail)}</pre>
+          {detailText ? (
+            <pre className="pi-tool-card-pre">{formatToolDetail(detailText)}</pre>
+          ) : partialText ? (
+            <pre className="pi-tool-card-pre pi-tool-card-pre--streaming">
+              {partialText}
+            </pre>
           ) : (
             <div className="pi-tool-card-meta">No additional output recorded.</div>
           )}
@@ -1175,6 +1198,7 @@ export function ChatTranscript({
   isStreaming,
   liveTools,
   retryBanner,
+  isCompacting = false,
   onAbortRetry,
   onPickStarterPrompt,
 }: ChatTranscriptProps) {
@@ -1398,6 +1422,13 @@ export function ChatTranscript({
           <div ref={bottomRef} />
         </div>
       </div>
+
+      {isCompacting && (
+        <div className="pi-compaction-pill" role="status" aria-live="polite">
+          <span className="pi-compaction-dot" aria-hidden="true" />
+          <span>Compacting conversation context...</span>
+        </div>
+      )}
 
       {retryBanner && (
         <div className="pi-retry-banner" role="status">

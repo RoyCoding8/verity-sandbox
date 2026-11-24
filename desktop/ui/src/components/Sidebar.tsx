@@ -1,8 +1,9 @@
-import { useMemo, useState, type KeyboardEvent } from "react";
+import { useState, type FormEvent, type KeyboardEvent } from "react";
 import "./Sidebar.css";
 import type { PiProject, PiSessionSummary } from "../api/tauri";
 import type { ThemeMode } from "../theme/md3";
 import {
+  CloseIcon,
   CopyIcon,
   DownloadIcon,
   EditIcon,
@@ -14,9 +15,9 @@ import {
   PlusIcon,
   SettingsIcon,
   SunIcon,
+  TerminalIcon,
   VerityLogoMark,
 } from "./Icons";
-import { Md3Select, type Md3SelectOption } from "./Md3Select";
 
 export interface SidebarProps {
   readonly projects: readonly PiProject[];
@@ -25,7 +26,10 @@ export interface SidebarProps {
   readonly activeSessionId: string;
   readonly theme: ThemeMode;
   readonly isDesktop: boolean;
-  readonly onSelectProject: (projectId: string) => void;
+  readonly onSelectProject: (projectPath: string) => void;
+  readonly onPickAndAddProject: () => void;
+  readonly onAddProject: (projectPath: string) => void;
+  readonly onRemoveProject: (projectPath: string) => void;
   readonly onSelectSession: (session: PiSessionSummary) => void;
   readonly onCreateSession: () => void;
   readonly onRenameSession: (sessionId: string, name: string) => void;
@@ -45,6 +49,9 @@ export function Sidebar({
   theme,
   isDesktop,
   onSelectProject,
+  onPickAndAddProject,
+  onAddProject,
+  onRemoveProject,
   onSelectSession,
   onCreateSession,
   onRenameSession,
@@ -58,15 +65,8 @@ export function Sidebar({
   const [expanded, setExpanded] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
-
-  const projectOptions = useMemo<readonly Md3SelectOption[]>(
-    () =>
-      projects.map((project) => ({
-        value: project.id,
-        label: project.name,
-      })),
-    [projects]
-  );
+  const [manualPathOpen, setManualPathOpen] = useState(false);
+  const [manualPathValue, setManualPathValue] = useState("");
 
   function beginRename(session: PiSessionSummary) {
     setEditingId(session.id);
@@ -91,6 +91,23 @@ export function Sidebar({
     } else if (e.key === "Escape") {
       e.preventDefault();
       setEditingId(null);
+    }
+  }
+
+  function handleManualPathSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const trimmed = manualPathValue.trim();
+    if (!trimmed) return;
+    onAddProject(trimmed);
+    setManualPathValue("");
+    setManualPathOpen(false);
+  }
+
+  function handleManualPathKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      setManualPathOpen(false);
+      setManualPathValue("");
     }
   }
 
@@ -126,18 +143,105 @@ export function Sidebar({
       </div>
 
       {expanded && (
-        <div className="verity-project-block">
-          <Md3Select
-            variant="tonal"
-            placement="bottom"
-            align="start"
-            ariaLabel="Active project"
-            leadingIcon={<FolderIcon size={14} />}
-            value={activeProjectId}
-            options={projectOptions}
-            onChange={onSelectProject}
-          />
-        </div>
+        <section className="verity-project-block" aria-label="Projects">
+          <div className="verity-project-header">
+            <span className="verity-project-header-title">Projects</span>
+            <div className="verity-project-header-actions">
+              <button
+                type="button"
+                className={
+                  manualPathOpen
+                    ? "verity-project-icon-btn verity-project-icon-btn--active"
+                    : "verity-project-icon-btn"
+                }
+                title="Enter project path manually"
+                aria-label="Enter project path manually"
+                aria-pressed={manualPathOpen}
+                onClick={() => setManualPathOpen((prev) => !prev)}
+              >
+                <TerminalIcon size={12} />
+              </button>
+              <button
+                type="button"
+                className="verity-project-add-btn"
+                title="Add project folder"
+                aria-label="Add project"
+                onClick={onPickAndAddProject}
+              >
+                <PlusIcon size={12} />
+                <span>Add Project</span>
+              </button>
+            </div>
+          </div>
+
+          {manualPathOpen && (
+            <form className="verity-project-path-form" onSubmit={handleManualPathSubmit}>
+              <input
+                type="text"
+                className="verity-project-path-input"
+                aria-label="Project folder path"
+                placeholder="/path/to/project"
+                value={manualPathValue}
+                autoFocus
+                onChange={(e) => setManualPathValue(e.target.value)}
+                onKeyDown={handleManualPathKeyDown}
+              />
+            </form>
+          )}
+
+          <div className="verity-project-list" role="list">
+            {projects.map((project) => {
+              const isActive = project.id === activeProjectId;
+              return (
+                <div
+                  key={project.id}
+                  role="listitem"
+                  tabIndex={0}
+                  title={project.path}
+                  aria-current={isActive ? "true" : undefined}
+                  className={
+                    isActive
+                      ? "verity-project-item active"
+                      : "verity-project-item"
+                  }
+                  onClick={() => {
+                    if (!isActive) {
+                      onSelectProject(project.path);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      if (!isActive) {
+                        onSelectProject(project.path);
+                      }
+                    }
+                  }}
+                >
+                  <span className="verity-project-item-main">
+                    <FolderIcon size={14} className="verity-project-item-icon" />
+                    <span className="verity-project-item-name">{project.name}</span>
+                  </span>
+                  {projects.length > 1 && (
+                    <button
+                      type="button"
+                      className="verity-project-remove-btn"
+                      title={`Remove ${project.name}`}
+                      aria-label={`Remove ${project.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRemoveProject(project.path);
+                      }}
+                    >
+                      <CloseIcon size={12} />
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
       )}
 
       <nav className="verity-rail-nav" aria-label="Session actions">

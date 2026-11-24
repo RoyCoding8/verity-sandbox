@@ -73,12 +73,54 @@
   flex-shrink: 0;
 }
 
+.verity-status-pill--compacting {
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
 .verity-status-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: currentColor;
   animation: pi-pulse 1.1s ease-in-out infinite;
+}
+
+/* Extension status pills in header */
+.verity-ext-status-strip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.verity-ext-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  padding: 3px 9px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--verity-hairline-subtle);
+  background: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.verity-ext-status-key {
+  font-weight: 600;
+  color: var(--md-sys-color-on-surface);
+  flex-shrink: 0;
+}
+
+.verity-ext-status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .verity-topbar-actions {
@@ -111,6 +153,13 @@
     box-shadow var(--md-sys-motion-fast),
     color var(--md-sys-motion-fast),
     transform var(--md-sys-motion-fast);
+}
+
+.verity-topbar-pill--context {
+  padding: 0 11px;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  font-size: 11px;
 }
 
 .verity-topbar-pill:hover:not(:disabled) {

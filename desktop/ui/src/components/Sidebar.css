@@ -166,11 +166,212 @@
   text-overflow: ellipsis;
 }
 
-/* Expanded project selector */
+/* Expanded multi-project workspace section */
 .verity-project-block {
-  margin-top: 6px;
-  margin-bottom: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--verity-hairline-subtle);
   flex-shrink: 0;
+}
+
+.verity-project-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 4px 0 10px;
+}
+
+.verity-project-header-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.verity-project-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.verity-project-icon-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast),
+    border-color var(--md-sys-motion-fast);
+}
+
+.verity-project-icon-btn:hover {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+}
+
+.verity-project-icon-btn--active {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.verity-project-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 9999px;
+  border: 1px solid var(--verity-hairline-subtle);
+  background: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface-variant);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast),
+    border-color var(--md-sys-motion-fast);
+}
+
+.verity-project-add-btn:hover {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+  border-color: var(--verity-hairline);
+}
+
+.verity-project-path-form {
+  padding: 0 2px;
+}
+
+.verity-project-path-input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 10px;
+  border: 1px solid var(--md-sys-color-primary);
+  background: var(--md-sys-color-surface-container-lowest);
+  color: var(--md-sys-color-on-surface);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.3;
+}
+
+.verity-project-path-input:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--md-sys-color-primary-container);
+}
+
+.verity-project-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 152px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.verity-project-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 6px 6px 10px;
+  border-radius: 9999px;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  cursor: pointer;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    color var(--md-sys-motion-fast);
+}
+
+.verity-project-item:hover {
+  background: var(--md-sys-color-surface-container);
+  color: var(--md-sys-color-on-surface);
+}
+
+.verity-project-item:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
+}
+
+.verity-project-item.active,
+.verity-project-item.active:hover {
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.verity-project-item-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.verity-project-item-icon {
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+.verity-project-item-name {
+  font-size: var(--text-xs);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.verity-project-item.active .verity-project-item-name {
+  font-weight: 600;
+}
+
+.verity-project-remove-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: currentColor;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity var(--md-sys-motion-fast),
+    background-color var(--md-sys-motion-fast);
+}
+
+.verity-project-item:hover .verity-project-remove-btn,
+.verity-project-item:focus-within .verity-project-remove-btn {
+  opacity: 0.72;
+  pointer-events: auto;
+}
+
+.verity-project-remove-btn:hover {
+  opacity: 1 !important;
+  background: color-mix(in srgb, currentColor 14%, transparent);
 }
 
 /* Expanded session section */
