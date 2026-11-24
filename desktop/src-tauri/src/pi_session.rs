@@ -387,11 +387,17 @@ pub enum PiUiEvent {
     MessageUpdate {
         message_id: Option<String>,
         delta: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_delta: Option<String>,
         raw_json: String,
     },
     MessageEnd {
         message_id: Option<String>,
         stop_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
         raw_json: String,
     },
     ToolExecutionStart {
@@ -436,25 +442,34 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
     let raw_json = raw_json.to_string();
 
     match event_type {
-        "agent_settled" => Some(PiUiEvent::AgentSettled {
+        "agent_settled" | "agent_end" => Some(PiUiEvent::AgentSettled {
             summary: opt_str(val, &["summary"]),
             raw_json,
         }),
         "message_start" => Some(PiUiEvent::MessageStart {
-            message_id: opt_str(val, &["messageId", "message_id", "id"]),
-            role: opt_str(val, &["role"]),
+            message_id: opt_str_or_nested(val, "message", &["messageId", "message_id", "id"]),
+            role: opt_str_or_nested(val, "message", &["role"]),
             raw_json,
         }),
-        "message_update" => Some(PiUiEvent::MessageUpdate {
-            message_id: opt_str(val, &["messageId", "message_id", "id"]),
-            delta: opt_str(val, &["delta", "text"]),
-            raw_json,
-        }),
-        "message_end" => Some(PiUiEvent::MessageEnd {
-            message_id: opt_str(val, &["messageId", "message_id", "id"]),
-            stop_reason: opt_str(val, &["stopReason", "stop_reason"]),
-            raw_json,
-        }),
+        "message_update" => {
+            let (delta, thinking_delta) = parse_message_update_deltas(val);
+            Some(PiUiEvent::MessageUpdate {
+                message_id: opt_str_or_nested(val, "message", &["messageId", "message_id", "id"]),
+                delta,
+                thinking_delta,
+                raw_json,
+            })
+        }
+        "message_end" => {
+            let (text, thinking) = extract_message_end_content(val);
+            Some(PiUiEvent::MessageEnd {
+                message_id: opt_str_or_nested(val, "message", &["messageId", "message_id", "id"]),
+                stop_reason: opt_str_or_nested(val, "message", &["stopReason", "stop_reason"]),
+                text,
+                thinking,
+                raw_json,
+            })
+        }
         "tool_execution_start" => Some(PiUiEvent::ToolExecutionStart {
             tool_call_id: opt_str(val, &["toolCallId", "tool_call_id", "id"]),
             tool_name: opt_str(val, &["toolName", "tool_name", "name"]),
@@ -505,6 +520,102 @@ fn opt_str(val: &JsonValue, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|k| val.get(k).and_then(JsonValue::as_str))
         .map(ToString::to_string)
+}
+
+fn opt_str_or_nested(val: &JsonValue, nested_key: &str, keys: &[&str]) -> Option<String> {
+    opt_str(val, keys).or_else(|| val.get(nested_key).and_then(|obj| opt_str(obj, keys)))
+}
+
+fn parse_message_update_deltas(val: &JsonValue) -> (Option<String>, Option<String>) {
+    if let Some(ame) = val.get("assistantMessageEvent") {
+        if let Some(ame_type) = ame.get("type").and_then(JsonValue::as_str) {
+            return match ame_type {
+                "text_delta" => (opt_str(ame, &["delta", "text"]), None),
+                "thinking_delta" | "reasoning_delta" => {
+                    (None, opt_str(ame, &["delta", "thinking", "text"]))
+                }
+                _ => (None, None),
+            };
+        }
+    }
+    (
+        opt_str(val, &["delta", "text"]),
+        opt_str(val, &["thinking_delta", "thinkingDelta"]),
+    )
+}
+
+fn extract_message_end_content(val: &JsonValue) -> (Option<String>, Option<String>) {
+    let Some(content) = val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .or_else(|| val.get("content"))
+    else {
+        return (None, None);
+    };
+
+    match content {
+        JsonValue::String(s) => {
+            if s.is_empty() {
+                (None, None)
+            } else {
+                (Some(s.clone()), None)
+            }
+        }
+        JsonValue::Array(blocks) => {
+            let mut text_parts = Vec::new();
+            let mut thinking_parts = Vec::new();
+
+            for block in blocks {
+                if let Some(s) = block.as_str() {
+                    if !s.is_empty() {
+                        text_parts.push(s.to_string());
+                    }
+                    continue;
+                }
+                match block.get("type").and_then(JsonValue::as_str) {
+                    Some("thinking") | Some("reasoning") => {
+                        if let Some(t) = opt_str(block, &["thinking", "text", "content"]) {
+                            if !t.is_empty() {
+                                thinking_parts.push(t);
+                            }
+                        }
+                    }
+                    Some("text") => {
+                        if let Some(t) = opt_str(block, &["text", "content"]) {
+                            if !t.is_empty() {
+                                text_parts.push(t);
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(t) = opt_str(block, &["thinking"]) {
+                            if !t.is_empty() {
+                                thinking_parts.push(t);
+                            }
+                        } else if let Some(t) = opt_str(block, &["text", "content"]) {
+                            if !t.is_empty() {
+                                text_parts.push(t);
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            let text = if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join("\n"))
+            };
+            let thinking = if thinking_parts.is_empty() {
+                None
+            } else {
+                Some(thinking_parts.join("\n"))
+            };
+            (text, thinking)
+        }
+        _ => (None, None),
+    }
 }
 
 fn opt_u64(val: &JsonValue, keys: &[&str]) -> Option<u64> {
@@ -1406,5 +1517,197 @@ done
         sup.shutdown();
         sup.shutdown();
         assert_eq!(sup.get_state(), Err(PiSessionError::AlreadyShutdown));
+    }
+
+    #[test]
+    fn parses_nested_pi_rpc_streaming_events_and_agent_end() {
+        let start_raw =
+            r#"{"type":"message_start","message":{"id":"msg-42","role":"assistant","content":[]}}"#;
+        let start_ev = parse_pi_ui_event(&parse_json(start_raw).unwrap(), start_raw).unwrap();
+        assert_eq!(
+            start_ev,
+            PiUiEvent::MessageStart {
+                message_id: Some("msg-42".to_string()),
+                role: Some("assistant".to_string()),
+                raw_json: start_raw.to_string(),
+            }
+        );
+
+        let think_delta_raw = r#"{"type":"message_update","message":{"id":"msg-42","role":"assistant"},"assistantMessageEvent":{"type":"thinking_delta","delta":"Checking imports"}}"#;
+        let think_ev =
+            parse_pi_ui_event(&parse_json(think_delta_raw).unwrap(), think_delta_raw).unwrap();
+        assert_eq!(
+            think_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("msg-42".to_string()),
+                delta: None,
+                thinking_delta: Some("Checking imports".to_string()),
+                raw_json: think_delta_raw.to_string(),
+            }
+        );
+
+        let reasoning_delta_raw = r#"{"type":"message_update","message":{"id":"msg-42"},"assistantMessageEvent":{"type":"reasoning_delta","delta":"Step 2"}}"#;
+        let reasoning_ev = parse_pi_ui_event(
+            &parse_json(reasoning_delta_raw).unwrap(),
+            reasoning_delta_raw,
+        )
+        .unwrap();
+        assert_eq!(
+            reasoning_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("msg-42".to_string()),
+                delta: None,
+                thinking_delta: Some("Step 2".to_string()),
+                raw_json: reasoning_delta_raw.to_string(),
+            }
+        );
+
+        let text_delta_raw = r#"{"type":"message_update","message":{"id":"msg-42","role":"assistant"},"assistantMessageEvent":{"type":"text_delta","delta":"Hello!"}}"#;
+        let text_ev =
+            parse_pi_ui_event(&parse_json(text_delta_raw).unwrap(), text_delta_raw).unwrap();
+        assert_eq!(
+            text_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("msg-42".to_string()),
+                delta: Some("Hello!".to_string()),
+                thinking_delta: None,
+                raw_json: text_delta_raw.to_string(),
+            }
+        );
+
+        // Lifecycle sub-events (thinking_start / text_end) must not leak full content as deltas.
+        let text_end_raw = r#"{"type":"message_update","message":{"id":"msg-42"},"assistantMessageEvent":{"type":"text_end","content":"Hello!"}}"#;
+        let text_end_ev =
+            parse_pi_ui_event(&parse_json(text_end_raw).unwrap(), text_end_raw).unwrap();
+        assert_eq!(
+            text_end_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("msg-42".to_string()),
+                delta: None,
+                thinking_delta: None,
+                raw_json: text_end_raw.to_string(),
+            }
+        );
+
+        // Flat thinking_delta / thinkingDelta backwards compatibility.
+        let flat_think_raw =
+            r#"{"type":"message_update","messageId":"m-flat","thinkingDelta":"flat thought"}"#;
+        let flat_think_ev =
+            parse_pi_ui_event(&parse_json(flat_think_raw).unwrap(), flat_think_raw).unwrap();
+        assert_eq!(
+            flat_think_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("m-flat".to_string()),
+                delta: None,
+                thinking_delta: Some("flat thought".to_string()),
+                raw_json: flat_think_raw.to_string(),
+            }
+        );
+
+        // Nested message_end with thinking + text + toolCall content blocks.
+        let end_raw = r#"{"type":"message_end","message":{"id":"msg-42","role":"assistant","stopReason":"stop","content":[{"type":"thinking","thinking":"First thought"},{"type":"thinking","thinking":"Second thought"},{"type":"toolCall","id":"tc-1","name":"read"},{"type":"text","text":"Final answer"}]}}"#;
+        let end_ev = parse_pi_ui_event(&parse_json(end_raw).unwrap(), end_raw).unwrap();
+        assert_eq!(
+            end_ev,
+            PiUiEvent::MessageEnd {
+                message_id: Some("msg-42".to_string()),
+                stop_reason: Some("stop".to_string()),
+                text: Some("Final answer".to_string()),
+                thinking: Some("First thought\nSecond thought".to_string()),
+                raw_json: end_raw.to_string(),
+            }
+        );
+
+        // agent_end maps to AgentSettled.
+        let agent_end_raw = r#"{"type":"agent_end","messages":[]}"#;
+        let agent_end_ev =
+            parse_pi_ui_event(&parse_json(agent_end_raw).unwrap(), agent_end_raw).unwrap();
+        assert_eq!(
+            agent_end_ev,
+            PiUiEvent::AgentSettled {
+                summary: None,
+                raw_json: agent_end_raw.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn mock_sh_agent_end_settles_streaming_session_and_emits_nested_events() {
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    prompt)
+      printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+      printf '{"type":"message_start","message":{"id":"m99","role":"assistant","content":[]}}\n'
+      printf '{"type":"message_update","message":{"id":"m99"},"assistantMessageEvent":{"type":"thinking_delta","delta":"hmm"}}\n'
+      printf '{"type":"message_update","message":{"id":"m99"},"assistantMessageEvent":{"type":"text_delta","delta":"done"}}\n'
+      printf '{"type":"message_end","message":{"id":"m99","role":"assistant","stopReason":"stop","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"done"}]}}\n'
+      printf '{"type":"agent_end","messages":[]}\n'
+      ;;
+    *)
+      printf '{"type":"response","id":"%s","command":"%s","success":true}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#;
+
+        let events: Arc<Mutex<Vec<PiUiEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let (settled_tx, settled_rx) = mpsc::channel();
+        let events_clone = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| {
+            let is_settled = matches!(ev, PiUiEvent::AgentSettled { .. });
+            events_clone.lock().unwrap().push(ev);
+            if is_settled {
+                let _ = settled_tx.send(());
+            }
+        });
+        let reload_hook: ReloadHook = Arc::new(|| {});
+        let sup = PiSessionSupervisor::spawn(mock_sh_config(script), sink, reload_hook)
+            .expect("spawn mock pi");
+
+        sup.prompt("test nested", vec![]).expect("prompt");
+        settled_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("agent_end must settle session");
+        assert_eq!(sup.activity(), SessionActivity::Idle);
+
+        let recorded = events.lock().unwrap();
+        assert!(recorded.iter().any(|e| matches!(
+            e,
+            PiUiEvent::MessageStart {
+                message_id: Some(id),
+                role: Some(role),
+                ..
+            } if id == "m99" && role == "assistant"
+        )));
+        assert!(recorded.iter().any(|e| matches!(
+            e,
+            PiUiEvent::MessageUpdate {
+                thinking_delta: Some(t),
+                delta: None,
+                ..
+            } if t == "hmm"
+        )));
+        assert!(recorded.iter().any(|e| matches!(
+            e,
+            PiUiEvent::MessageUpdate {
+                delta: Some(d),
+                thinking_delta: None,
+                ..
+            } if d == "done"
+        )));
+        assert!(recorded.iter().any(|e| matches!(
+            e,
+            PiUiEvent::MessageEnd {
+                stop_reason: Some(sr),
+                text: Some(txt),
+                thinking: Some(th),
+                ..
+            } if sr == "stop" && txt == "done" && th == "hmm"
+        )));
+        drop(recorded);
+        sup.shutdown();
     }
 }
