@@ -5,6 +5,7 @@ pub enum TypeError {
     EmptyTaskId,
     InvalidTaskIdChar,
     InvalidCommitOid,
+    InvalidSpecDigest,
     EmptyPath,
     AbsolutePath,
     BackslashPath,
@@ -22,6 +23,9 @@ impl fmt::Display for TypeError {
             TypeError::InvalidTaskIdChar => write!(f, "task id contains invalid character"),
             TypeError::InvalidCommitOid => {
                 write!(f, "commit oid must be 40 or 64 lowercase hex chars")
+            }
+            TypeError::InvalidSpecDigest => {
+                write!(f, "spec digest must be 64 lowercase hex chars")
             }
             TypeError::EmptyPath => write!(f, "relative path cannot be empty"),
             TypeError::AbsolutePath => write!(f, "path must be relative"),
@@ -78,6 +82,29 @@ pub fn validate_commit_oid_bytes(bytes: &[u8]) -> Result<(), TypeError> {
         i += 1;
     }
     Ok(())
+}
+
+/// Pure, allocation-free byte validator for 64-char SHA-256 lowercase hex spec digests.
+pub fn validate_spec_digest_bytes(bytes: &[u8]) -> Result<(), TypeError> {
+    if bytes.len() != 64 {
+        return Err(TypeError::InvalidSpecDigest);
+    }
+    let mut i = 0;
+    while i < 64 {
+        if !matches!(bytes[i], b'0'..=b'9' | b'a'..=b'f') {
+            return Err(TypeError::InvalidSpecDigest);
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => 0,
+    }
 }
 
 fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
@@ -222,6 +249,18 @@ pub struct SpecDigest([u8; 32]);
 impl SpecDigest {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    pub fn parse_hex(raw: &str) -> Result<Self, TypeError> {
+        let bytes = raw.as_bytes();
+        validate_spec_digest_bytes(bytes)?;
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            out[i] = (hex_nibble(bytes[i * 2]) << 4) | hex_nibble(bytes[i * 2 + 1]);
+            i += 1;
+        }
+        Ok(Self(out))
     }
 
     pub fn of_spec(spec_text: &str) -> Self {

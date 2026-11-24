@@ -1,14 +1,15 @@
-//! Formal verification of Verity core branded types (`TaskId`, `CommitOid`, `RelPath`).
+//! Formal verification of Verity core branded types (`TaskId`, `CommitOid`, `RelPath`, `SpecDigest`).
 
 #[cfg(any(kani, test))]
 use verity_core::types::{
-    validate_commit_oid_bytes, validate_rel_path_bytes, validate_task_id_bytes, TypeError,
+    validate_commit_oid_bytes, validate_rel_path_bytes, validate_spec_digest_bytes,
+    validate_task_id_bytes, TypeError,
 };
 
 #[cfg(kani)]
 #[kani::proof]
-#[kani::unwind(42)]
-pub fn prove_task_id_and_commit_oid_laws() {
+#[kani::unwind(66)]
+pub fn prove_task_id_and_hex_digest_laws() {
     let len: usize = kani::any();
     kani::assume(len <= 8);
     let buf: [u8; 8] = kani::any();
@@ -22,6 +23,7 @@ pub fn prove_task_id_and_commit_oid_laws() {
         while i < slice.len() {
             let b = slice[i];
             assert!(b != b'/' && b != b'\\' && b != 0);
+            assert!(b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
             if i + 1 < slice.len() {
                 assert!(!(b == b'.' && slice[i + 1] == b'.'));
             }
@@ -29,7 +31,18 @@ pub fn prove_task_id_and_commit_oid_laws() {
         }
     }
 
+    // Oversized TaskId (> 128 bytes) must always be rejected without panic.
+    let oversized = [b'a'; 129];
+    assert_eq!(
+        validate_task_id_bytes(&oversized),
+        Err(TypeError::EmptyTaskId)
+    );
+
     kani::cover!(res.is_ok(), "task_id_valid_reachable");
+    kani::cover!(
+        res == Err(TypeError::EmptyTaskId),
+        "task_id_empty_reject_reachable"
+    );
     kani::cover!(
         res == Err(TypeError::TraversalSegment),
         "task_id_traversal_reject_reachable"
@@ -39,20 +52,74 @@ pub fn prove_task_id_and_commit_oid_laws() {
         "task_id_invalid_char_reject_reachable"
     );
 
-    // CommitOid length law: any slice shorter than 40 bytes must fail.
-    assert!(validate_commit_oid_bytes(slice) == Err(TypeError::InvalidCommitOid));
+    // CommitOid & SpecDigest length laws: any short slice (<= 8 bytes) must fail.
+    assert_eq!(
+        validate_commit_oid_bytes(slice),
+        Err(TypeError::InvalidCommitOid)
+    );
+    assert_eq!(
+        validate_spec_digest_bytes(slice),
+        Err(TypeError::InvalidSpecDigest)
+    );
 
-    // Symbolic 40-byte CommitOid: only lowercase hex passes.
-    let mut oid = [b'a'; 40];
-    let idx: usize = kani::any();
-    kani::assume(idx < 40);
-    let ch: u8 = kani::any();
-    oid[idx] = ch;
-    let oid_res = validate_commit_oid_bytes(&oid);
-    let is_lower_hex = matches!(ch, b'0'..=b'9' | b'a'..=b'f');
-    assert_eq!(oid_res.is_ok(), is_lower_hex);
-    kani::cover!(oid_res.is_ok(), "commit_oid_valid_reachable");
-    kani::cover!(oid_res.is_err(), "commit_oid_invalid_char_reachable");
+    // Symbolic 40-byte CommitOid: only lowercase hex passes; 40-byte SpecDigest always fails.
+    let mut oid40 = [b'a'; 40];
+    let idx40: usize = kani::any();
+    kani::assume(idx40 < 40);
+    let ch40: u8 = kani::any();
+    oid40[idx40] = ch40;
+    let oid40_res = validate_commit_oid_bytes(&oid40);
+    let is_lower_hex_40 = matches!(ch40, b'0'..=b'9' | b'a'..=b'f');
+    assert_eq!(oid40_res.is_ok(), is_lower_hex_40);
+    assert_eq!(
+        validate_spec_digest_bytes(&oid40),
+        Err(TypeError::InvalidSpecDigest)
+    );
+
+    // Symbolic 64-byte CommitOid & SpecDigest: only lowercase hex passes for both.
+    let mut hex64 = [b'0'; 64];
+    let idx64: usize = kani::any();
+    kani::assume(idx64 < 64);
+    let ch64: u8 = kani::any();
+    hex64[idx64] = ch64;
+    let is_lower_hex_64 = matches!(ch64, b'0'..=b'9' | b'a'..=b'f');
+    let oid64_res = validate_commit_oid_bytes(&hex64);
+    let digest_res = validate_spec_digest_bytes(&hex64);
+    assert_eq!(oid64_res.is_ok(), is_lower_hex_64);
+    assert_eq!(digest_res.is_ok(), is_lower_hex_64);
+
+    // Wrong-length hex slices (39, 41, 63, 65) are rejected.
+    let hex65 = [b'f'; 65];
+    assert_eq!(
+        validate_commit_oid_bytes(&hex65[..39]),
+        Err(TypeError::InvalidCommitOid)
+    );
+    assert_eq!(
+        validate_commit_oid_bytes(&hex65[..41]),
+        Err(TypeError::InvalidCommitOid)
+    );
+    assert_eq!(
+        validate_commit_oid_bytes(&hex65[..63]),
+        Err(TypeError::InvalidCommitOid)
+    );
+    assert_eq!(
+        validate_commit_oid_bytes(&hex65),
+        Err(TypeError::InvalidCommitOid)
+    );
+    assert_eq!(
+        validate_spec_digest_bytes(&hex65[..63]),
+        Err(TypeError::InvalidSpecDigest)
+    );
+    assert_eq!(
+        validate_spec_digest_bytes(&hex65),
+        Err(TypeError::InvalidSpecDigest)
+    );
+
+    kani::cover!(oid40_res.is_ok(), "commit_oid_40_valid_reachable");
+    kani::cover!(oid64_res.is_ok(), "commit_oid_64_valid_reachable");
+    kani::cover!(oid40_res.is_err(), "commit_oid_invalid_char_reachable");
+    kani::cover!(digest_res.is_ok(), "spec_digest_valid_reachable");
+    kani::cover!(digest_res.is_err(), "spec_digest_invalid_char_reachable");
 }
 
 #[cfg(kani)]
@@ -68,8 +135,9 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
     if let Ok(end) = res {
         assert!(end > 0 && end <= slice.len());
         let trimmed = &slice[..end];
-        // Never absolute Unix or Windows drive prefix
+        // Never absolute Unix, trailing slash, or Windows drive prefix
         assert!(trimmed[0] != b'/');
+        assert!(trimmed[end - 1] != b'/');
         if trimmed.len() >= 2 {
             assert!(!(trimmed[0].is_ascii_alphabetic() && trimmed[1] == b':'));
         }
@@ -77,14 +145,29 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
         let mut i = 0;
         while i < trimmed.len() {
             assert!(trimmed[i] != b'\\');
+            assert!(trimmed[i] != 0);
             assert!(trimmed[i] >= 0x20 && trimmed[i] != 0x7f);
             i += 1;
         }
-        // Never contains empty segment (`//`)
-        let mut j = 0;
-        while j + 1 < trimmed.len() {
-            assert!(!(trimmed[j] == b'/' && trimmed[j + 1] == b'/'));
-            j += 1;
+        // Never contains empty (`//`), `.`, `..`, or `.git` segments
+        let mut seg_start = 0;
+        let mut idx = 0;
+        while idx <= trimmed.len() {
+            if idx == trimmed.len() || trimmed[idx] == b'/' {
+                let seg = &trimmed[seg_start..idx];
+                assert!(!seg.is_empty());
+                assert!(seg != b".");
+                assert!(seg != b"..");
+                if seg.len() == 4 {
+                    let is_dotgit = seg[0] == b'.'
+                        && seg[1].to_ascii_lowercase() == b'g'
+                        && seg[2].to_ascii_lowercase() == b'i'
+                        && seg[3].to_ascii_lowercase() == b't';
+                    assert!(!is_dotgit);
+                }
+                seg_start = idx + 1;
+            }
+            idx += 1;
         }
     }
 
@@ -101,8 +184,16 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
         "rel_path_windows_drive_reject_reachable"
     );
     kani::cover!(
+        res == Err(TypeError::AbsolutePath) && !slice.is_empty() && slice[0] == b'/',
+        "rel_path_unix_abs_reject_reachable"
+    );
+    kani::cover!(
         res == Err(TypeError::BackslashPath),
         "rel_path_backslash_reject_reachable"
+    );
+    kani::cover!(
+        res == Err(TypeError::ControlCharInPath),
+        "rel_path_control_or_nul_reject_reachable"
     );
     kani::cover!(
         res == Err(TypeError::DotGitSegment),
@@ -113,25 +204,37 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use verity_core::SpecDigest;
 
     #[test]
     fn task_id_and_rel_path_reject_traversal_and_windows_drives() {
-        assert_eq!(validate_task_id_bytes(b".."), Err(TypeError::TraversalSegment));
-        assert_eq!(validate_task_id_bytes(b"a..b"), Err(TypeError::TraversalSegment));
-        assert_eq!(validate_task_id_bytes(b"a/b"), Err(TypeError::InvalidTaskIdChar));
+        assert_eq!(validate_task_id_bytes(b""), Err(TypeError::EmptyTaskId));
+        assert_eq!(
+            validate_task_id_bytes(&[b'a'; 129]),
+            Err(TypeError::EmptyTaskId)
+        );
+        assert_eq!(
+            validate_task_id_bytes(b".."),
+            Err(TypeError::TraversalSegment)
+        );
+        assert_eq!(
+            validate_task_id_bytes(b"a..b"),
+            Err(TypeError::TraversalSegment)
+        );
+        assert_eq!(
+            validate_task_id_bytes(b"a/b"),
+            Err(TypeError::InvalidTaskIdChar)
+        );
+        assert_eq!(
+            validate_task_id_bytes(b"a\0b"),
+            Err(TypeError::InvalidTaskIdChar)
+        );
         assert!(validate_task_id_bytes(b"task-1.v2").is_ok());
 
-        assert!(validate_commit_oid_bytes(&[b'a'; 40]).is_ok());
         assert_eq!(
-            validate_commit_oid_bytes(&[b'A'; 40]),
-            Err(TypeError::InvalidCommitOid)
+            validate_rel_path_bytes(b"C:foo"),
+            Err(TypeError::AbsolutePath)
         );
-        assert_eq!(
-            validate_commit_oid_bytes(b"abc"),
-            Err(TypeError::InvalidCommitOid)
-        );
-
-        assert_eq!(validate_rel_path_bytes(b"C:foo"), Err(TypeError::AbsolutePath));
         assert_eq!(
             validate_rel_path_bytes(b"c:/Windows/System32"),
             Err(TypeError::AbsolutePath)
@@ -145,6 +248,14 @@ mod tests {
             Err(TypeError::TraversalSegment)
         );
         assert_eq!(
+            validate_rel_path_bytes(b"src//lib.rs"),
+            Err(TypeError::TraversalSegment)
+        );
+        assert_eq!(
+            validate_rel_path_bytes(b"src/a\0b"),
+            Err(TypeError::ControlCharInPath)
+        );
+        assert_eq!(
             validate_rel_path_bytes(b"src/.git/config"),
             Err(TypeError::DotGitSegment)
         );
@@ -153,5 +264,34 @@ mod tests {
             Err(TypeError::ReservedDeviceName)
         );
         assert_eq!(validate_rel_path_bytes(b"src/lib.rs"), Ok(10));
+    }
+
+    #[test]
+    fn commit_oid_and_spec_digest_enforce_exact_hex_lengths() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(validate_commit_oid_bytes(sha1.as_bytes()).is_ok());
+        assert!(validate_commit_oid_bytes(sha256.as_bytes()).is_ok());
+        assert_eq!(
+            validate_commit_oid_bytes(b"0123456789abcdef"),
+            Err(TypeError::InvalidCommitOid)
+        );
+        assert_eq!(
+            validate_commit_oid_bytes(sha1.to_ascii_uppercase().as_bytes()),
+            Err(TypeError::InvalidCommitOid)
+        );
+
+        assert_eq!(
+            validate_spec_digest_bytes(sha1.as_bytes()),
+            Err(TypeError::InvalidSpecDigest)
+        );
+        assert!(validate_spec_digest_bytes(sha256.as_bytes()).is_ok());
+        let parsed = SpecDigest::parse_hex(sha256).unwrap();
+        assert_eq!(parsed.to_hex(), sha256);
+        assert_eq!(parsed, SpecDigest::of_spec("abc"));
+        assert_eq!(
+            SpecDigest::parse_hex(&sha256.to_ascii_uppercase()),
+            Err(TypeError::InvalidSpecDigest)
+        );
     }
 }
