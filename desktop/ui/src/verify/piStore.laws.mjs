@@ -140,9 +140,19 @@ async function main() {
   try {
     const tauriMod = await server.ssrLoadModule("/src/api/tauri.ts");
     const storeMod = await server.ssrLoadModule("/src/state/piStore.ts");
+    const slashMod = await server.ssrLoadModule("/src/lib/slashCommands.ts");
 
     const { parsePiUiEventPayload, tauriApi } = tauriMod;
     const { createInitialPiState, piReducer } = storeMod;
+    const {
+      normalizeSlashName,
+      displaySlashName,
+      BUILTIN_SLASH_COMMANDS,
+      mergeSlashCommands,
+      filterSlashCommands,
+      parseBashPrefix,
+      parseBuiltinSlashInvocation,
+    } = slashMod;
 
     function dispatchEvent(state, rawPayload, label) {
       const event = parsePiUiEventPayload(rawPayload);
@@ -715,6 +725,282 @@ async function main() {
       },
     ]);
 
+    // ------------------------------------------------------------
+    // Scenario 12: Slash command '/' prefix normalization, merging & filtering
+    // ------------------------------------------------------------
+    scenarios.push([
+      "Slash command '/' prefix normalization, merging, and filtering",
+      () => {
+        assert.equal(normalizeSlashName("/skill:foo"), "skill:foo");
+        assert.equal(normalizeSlashName("  ///compact  "), "compact");
+        assert.equal(displaySlashName("skill:foo"), "/skill:foo");
+        assert.equal(displaySlashName("/compact"), "/compact");
+        assert.ok(BUILTIN_SLASH_COMMANDS.length >= 11);
+
+        const merged = mergeSlashCommands([
+          {
+            trigger: "/",
+            name: "skill:foo",
+            description: "Run foo skill",
+            insertText: "/skill:foo ",
+            source: "skill",
+            location: ".pi/skills/foo/SKILL.md",
+          },
+          {
+            trigger: "/",
+            name: "/prompt:audit",
+            description: "Audit codebase",
+            insertText: "/prompt:audit ",
+            source: "prompt",
+            location: ".pi/prompts/audit.md",
+          },
+          {
+            trigger: "/",
+            name: "compact",
+            description: "Compact conversation context with optional focus instructions",
+            insertText: "/compact ",
+            source: "builtin",
+          },
+        ]);
+
+        // Deduplicated by normalized lowercase name
+        assert.equal(
+          merged.filter((c) => c.normalizedName === "compact").length,
+          1,
+          "duplicate /compact must be deduplicated"
+        );
+
+        // Fix for '/' prefix bug: "/ski" must match "skill:foo" ranked first (prefix match beats description match on "/settings")
+        const withSlash = filterSlashCommands(merged, "/ski");
+        assert.ok(withSlash.length >= 1);
+        assert.equal(withSlash[0].normalizedName, "skill:foo");
+        assert.equal(withSlash[0].name, "/skill:foo");
+        assert.equal(withSlash[0].source, "skill");
+        assert.equal(withSlash[0].location, ".pi/skills/foo/SKILL.md");
+
+        // Works without leading '/' as well
+        const withoutSlash = filterSlashCommands(merged, "ski");
+        assert.ok(withoutSlash.length >= 1);
+        assert.equal(withoutSlash[0].normalizedName, "skill:foo");
+
+        // Builtin slash invocation parser
+        assert.deepEqual(parseBuiltinSlashInvocation("/compact focus on scope.rs"), {
+          command: "compact",
+          args: "focus on scope.rs",
+        });
+        assert.deepEqual(parseBuiltinSlashInvocation("/name My Session"), {
+          command: "name",
+          args: "My Session",
+        });
+        assert.deepEqual(parseBuiltinSlashInvocation("/session"), {
+          command: "session",
+          args: "",
+        });
+        // Non-builtin slash commands pass through (return null)
+        assert.equal(parseBuiltinSlashInvocation("/skill:foo arg1"), null);
+        assert.equal(parseBuiltinSlashInvocation("/prompt:audit"), null);
+      },
+    ]);
+
+    // ------------------------------------------------------------
+    // Scenario 13: !cmd and !!cmd bash prefix parsing
+    // ------------------------------------------------------------
+    scenarios.push([
+      "!cmd and !!cmd bash prefix parsing",
+      () => {
+        assert.deepEqual(parseBashPrefix("!git status"), {
+          kind: "bash",
+          command: "git status",
+          excludeFromContext: false,
+        });
+        assert.deepEqual(parseBashPrefix("!!cargo test --workspace"), {
+          kind: "bash",
+          command: "cargo test --workspace",
+          excludeFromContext: true,
+        });
+        assert.deepEqual(parseBashPrefix("  !  ls -la  "), {
+          kind: "bash",
+          command: "ls -la",
+          excludeFromContext: false,
+        });
+        assert.equal(parseBashPrefix("!"), null);
+        assert.equal(parseBashPrefix("!!   "), null);
+        assert.equal(parseBashPrefix("hello !world"), null);
+      },
+    ]);
+
+    // ------------------------------------------------------------
+    // Scenario 14: compaction_start / compaction_end state transitions
+    // ------------------------------------------------------------
+    scenarios.push([
+      "compaction_start and compaction_end state transitions",
+      () => {
+        let s = createInitialPiState();
+        assert.equal(s.isCompacting, false);
+        s = dispatchEvent(s, { type: "compaction_start", reason: "threshold" }, "S14.start");
+        assert.equal(s.isCompacting, true);
+        s = dispatchEvent(
+          s,
+          { type: "compaction_end", aborted: false, will_retry: false, summary: "Compacted 12 messages" },
+          "S14.end_ok"
+        );
+        assert.equal(s.isCompacting, false);
+        assert.equal(s.extensionToasts.length, 0);
+
+        // Compaction error pushes error toast + snackbar and clears isCompacting
+        s = dispatchEvent(s, { type: "compaction_start", reason: "manual" }, "S14.start2");
+        assert.equal(s.isCompacting, true);
+        s = dispatchEvent(
+          s,
+          { type: "compaction_end", aborted: true, willRetry: false, errorMessage: "Context limit exceeded" },
+          "S14.end_err"
+        );
+        assert.equal(s.isCompacting, false);
+        assert.equal(s.extensionToasts.length, 1);
+        assert.equal(s.extensionToasts[0].notifyType, "error");
+        assert.equal(s.extensionToasts[0].message, "Context limit exceeded");
+      },
+    ]);
+
+    // ------------------------------------------------------------
+    // Scenario 15: tool_execution_update streaming partial output updates
+    // ------------------------------------------------------------
+    scenarios.push([
+      "tool_execution_update streams partial output into liveTools",
+      () => {
+        let s = createInitialPiState();
+        s = dispatchEvent(
+          s,
+          { type: "tool_execution_start", tool_call_id: "tc-stream-1", tool_name: "bash" },
+          "S15.start"
+        );
+        s = dispatchEvent(
+          s,
+          {
+            type: "tool_execution_update",
+            toolCallId: "tc-stream-1",
+            toolName: "bash",
+            partialResult: { content: [{ type: "text", text: "running test 1/3..." }] },
+          },
+          "S15.update1"
+        );
+        assert.equal(s.liveTools.length, 1);
+        assert.equal(s.liveTools[0].partialOutput, "running test 1/3...");
+        assert.equal(s.liveTools[0].detail, "running test 1/3...");
+
+        s = dispatchEvent(
+          s,
+          {
+            type: "tool_execution_update",
+            tool_call_id: "tc-stream-1",
+            tool_name: "bash",
+            partial_output: "running test 3/3... ok",
+          },
+          "S15.update2"
+        );
+        assert.equal(s.liveTools[0].partialOutput, "running test 3/3... ok");
+        s = dispatchEvent(
+          s,
+          { type: "tool_execution_end", tool_call_id: "tc-stream-1", tool_name: "bash", is_error: false },
+          "S15.end"
+        );
+        assert.equal(s.liveTools[0].status, "done");
+        assert.equal(s.liveTools[0].partialOutput, "running test 3/3... ok");
+      },
+    ]);
+
+    // ------------------------------------------------------------
+    // Scenario 16: extension_ui_effect (notify, setStatus, setWidget, set_editor_text)
+    // ------------------------------------------------------------
+    scenarios.push([
+      "extension_ui_effect handles notify, setStatus, setWidget, and set_editor_text",
+      () => {
+        let s = createInitialPiState();
+
+        // notify (snake_case)
+        s = dispatchEvent(
+          s,
+          {
+            type: "extension_ui_effect",
+            method: "notify",
+            message: "Build succeeded",
+            notify_type: "info",
+          },
+          "S16.notify_info"
+        );
+        assert.equal(s.extensionToasts.length, 1);
+        assert.equal(s.extensionToasts[0].message, "Build succeeded");
+        assert.equal(s.extensionToasts[0].notifyType, "info");
+
+        // setStatus (camelCase) then clear
+        s = dispatchEvent(
+          s,
+          {
+            type: "extension_ui_effect",
+            method: "setStatus",
+            statusKey: "git",
+            statusText: "wt/frontend-store-and-api",
+          },
+          "S16.status_set"
+        );
+        assert.equal(s.extensionStatus["git"], "wt/frontend-store-and-api");
+        s = dispatchEvent(
+          s,
+          {
+            type: "extension_ui_effect",
+            method: "setStatus",
+            status_key: "git",
+            status_text: "",
+          },
+          "S16.status_clear"
+        );
+        assert.equal("git" in s.extensionStatus, false);
+
+        // setWidget (snake_case) then clear
+        s = dispatchEvent(
+          s,
+          {
+            type: "extension_ui_effect",
+            method: "setWidget",
+            widget_key: "coverage",
+            widget_lines: ["Lines: 94%", "Branches: 88%"],
+          },
+          "S16.widget_set"
+        );
+        assert.deepEqual(s.extensionWidgetLines["coverage"], ["Lines: 94%", "Branches: 88%"]);
+        assert.equal(s.extensionWidgets.length, 1);
+        assert.equal(s.extensionWidgets[0].id, "coverage");
+        assert.equal(s.extensionWidgets[0].body, "Lines: 94%\nBranches: 88%");
+
+        s = dispatchEvent(
+          s,
+          {
+            type: "extension_ui_effect",
+            method: "setWidget",
+            widgetKey: "coverage",
+            widgetLines: [],
+          },
+          "S16.widget_clear"
+        );
+        assert.equal("coverage" in s.extensionWidgetLines, false);
+        assert.equal(s.extensionWidgets.length, 0);
+
+        // set_editor_text + consume_editor_prefill
+        s = dispatchEvent(
+          s,
+          {
+            type: "extension_ui_effect",
+            method: "set_editor_text",
+            text: "/skill:kani-verify scope.rs",
+          },
+          "S16.prefill"
+        );
+        assert.equal(s.editorPrefillText, "/skill:kani-verify scope.rs");
+        s = dispatchAction(s, { type: "consume_editor_prefill" }, "S16.consume");
+        assert.equal(s.editorPrefillText, null);
+      },
+    ]);
+
     let scenariosPassed = 0;
     for (const [name, fn] of scenarios) {
       await fn();
@@ -806,6 +1092,13 @@ async function main() {
           type: "tool_execution_start",
           tool_call_id: pick(rand, toolIdPool),
           tool_name: pick(rand, toolNamePool),
+        };
+      } else if (er < 0.61) {
+        raw = {
+          type: "tool_execution_update",
+          tool_call_id: pick(rand, toolIdPool),
+          tool_name: pick(rand, toolNamePool),
+          partial_output: pick(rand, textPool),
         };
       } else if (er < 0.66) {
         raw = {
