@@ -13,6 +13,10 @@ use crate::providers::{
     build_pi_provider_env, default_store_path, ensure_verity_pi_extension_path, ProviderStore,
     PublicProviderProfile,
 };
+use crate::snapshots::{
+    capture_snapshot, clear_last_redo, find_checkpoint, load_checkpoint_store, load_last_redo,
+    record_turn_checkpoint, redo_targeted_revert, revert_to_snapshot, save_last_redo,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
@@ -168,6 +172,33 @@ pub struct SessionWithMessages {
 pub struct ExportHtmlResult {
     pub path: String,
     pub html: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnCheckpointView {
+    pub entry_id: String,
+    pub prompt_preview: String,
+    pub has_code_snapshot: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertTurnResult {
+    pub session: PiSessionSummary,
+    pub messages: Vec<PiChatMessage>,
+    pub restored_prompt: Option<String>,
+    pub code_reverted: bool,
+    pub reverted_files: Vec<String>,
+    pub can_redo: bool,
+    pub code_revert_note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedoRevertResult {
+    pub restored_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -569,6 +600,24 @@ pub fn parse_model_option(
     }
 }
 
+pub fn try_parse_model_option(val: &JsonValue) -> Option<ModelOption> {
+    let obj = val
+        .get("model")
+        .filter(|v| matches!(v, JsonValue::Object(_)))
+        .unwrap_or(val);
+    if !matches!(obj, JsonValue::Object(_)) {
+        return None;
+    }
+    let model_id = opt_str(obj, &["modelId", "model_id", "id"])?;
+    let provider = opt_str(obj, &["provider"]).unwrap_or_else(|| "default".to_string());
+    let label = opt_str(obj, &["label", "name"]).unwrap_or_else(|| model_id.clone());
+    Some(ModelOption {
+        provider,
+        model_id,
+        label,
+    })
+}
+
 pub fn parse_models_list(val: &JsonValue) -> Vec<ModelOption> {
     let items = match val {
         JsonValue::Array(arr) => arr,
@@ -719,18 +768,18 @@ pub fn default_catalog_models() -> Vec<ModelOption> {
     vec![
         ModelOption {
             provider: "anthropic".to_string(),
-            model_id: "claude-sonnet-4-5".to_string(),
-            label: "Claude Sonnet 4.5".to_string(),
+            model_id: "claude-sonnet-5-5".to_string(),
+            label: "Claude Sonnet 5.5".to_string(),
         },
         ModelOption {
             provider: "anthropic".to_string(),
-            model_id: "claude-opus-4-5".to_string(),
-            label: "Claude Opus 4.5".to_string(),
+            model_id: "claude-opus-5".to_string(),
+            label: "Claude Opus 5".to_string(),
         },
         ModelOption {
             provider: "openai".to_string(),
-            model_id: "gpt-5".to_string(),
-            label: "GPT-5".to_string(),
+            model_id: "gpt-6.1-sol".to_string(),
+            label: "GPT-6.1 Sol".to_string(),
         },
         ModelOption {
             provider: "google".to_string(),
@@ -909,6 +958,7 @@ struct PiAppStateInner {
     model_pending_sync: AtomicBool,
     thinking_level_pending_sync: AtomicBool,
     provider_reload_pending: Arc<AtomicBool>,
+    active_session_id: Mutex<Option<String>>,
 }
 
 impl PiAppStateInner {
@@ -956,6 +1006,7 @@ impl PiAppState {
                 model_pending_sync: AtomicBool::new(false),
                 thinking_level_pending_sync: AtomicBool::new(false),
                 provider_reload_pending: Arc::new(AtomicBool::new(false)),
+                active_session_id: Mutex::new(None),
             }),
         }
     }
@@ -981,6 +1032,7 @@ impl PiAppState {
                 model_pending_sync: AtomicBool::new(false),
                 thinking_level_pending_sync: AtomicBool::new(false),
                 provider_reload_pending: Arc::new(AtomicBool::new(false)),
+                active_session_id: Mutex::new(None),
             }),
         }
     }
@@ -1336,6 +1388,11 @@ impl PiAppState {
             });
 
         let active_session_id = session.id.clone();
+        *self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned") = Some(active_session_id.clone());
         let sessions = merge_live_and_disk_sessions(disk_sessions, Some(session));
         PiBootstrapData {
             active_project_id: project.id.clone(),
@@ -1650,8 +1707,255 @@ impl PiAppState {
         images: Vec<PendingAttachment>,
     ) -> Result<(), String> {
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        self.record_pre_prompt_checkpoint(&message);
         sup.prompt(message, images).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    fn record_pre_prompt_checkpoint(&self, message: &str) {
+        let project_dir = self.project_path();
+        let Ok(tree_oid) = capture_snapshot(&project_dir) else {
+            return;
+        };
+        let session_id = self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned")
+            .clone()
+            .unwrap_or_else(|| "default-session".to_string());
+        let existing_count = load_checkpoint_store(&project_dir).checkpoints.len();
+        let entry_id = format!("turn-{}", existing_count + 1);
+        let _ = record_turn_checkpoint(
+            &project_dir,
+            session_id,
+            entry_id,
+            message.to_string(),
+            tree_oid,
+        );
+    }
+
+    pub fn list_checkpoints(&self) -> Result<Vec<TurnCheckpointView>, String> {
+        let project_dir = self.project_path();
+        let store = load_checkpoint_store(&project_dir);
+        let active_session = self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned")
+            .clone();
+
+        let filtered: Vec<TurnCheckpointView> = store
+            .checkpoints
+            .iter()
+            .filter(|cp| match active_session.as_deref() {
+                Some(sid) if !sid.is_empty() => {
+                    cp.session_id == sid || cp.session_id == "default-session"
+                }
+                _ => true,
+            })
+            .map(|cp| TurnCheckpointView {
+                entry_id: cp.entry_id.clone(),
+                prompt_preview: cp.prompt_preview.clone(),
+                has_code_snapshot: cp.tree_oid.len() == 40,
+                created_at: cp.created_at.clone(),
+            })
+            .collect();
+
+        if filtered.is_empty() && !store.checkpoints.is_empty() {
+            return Ok(store
+                .checkpoints
+                .into_iter()
+                .map(|cp| TurnCheckpointView {
+                    entry_id: cp.entry_id,
+                    prompt_preview: cp.prompt_preview,
+                    has_code_snapshot: cp.tree_oid.len() == 40,
+                    created_at: cp.created_at,
+                })
+                .collect());
+        }
+
+        Ok(filtered)
+    }
+
+    pub fn revert_turn_with_sink(
+        &self,
+        event_sink: EventSink,
+        entry_id: String,
+        revert_code: bool,
+    ) -> Result<RevertTurnResult, String> {
+        let entry_id = require_non_empty("entryId", &entry_id)?;
+        let sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink))?;
+
+        let session_id = self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned")
+            .clone()
+            .or_else(|| {
+                sup.get_state()
+                    .ok()
+                    .and_then(|r| parse_data_json(&r))
+                    .and_then(|v| opt_str(&v, &["id", "sessionId", "session_id"]))
+            });
+
+        let tree = sup
+            .get_tree()
+            .ok()
+            .and_then(|r| parse_data_json(&r))
+            .map(|v| parse_history_tree(&v))
+            .unwrap_or_default();
+        let fork_candidates = sup
+            .get_fork_messages()
+            .ok()
+            .and_then(|r| parse_data_json(&r))
+            .map(|v| parse_fork_candidates(&v))
+            .unwrap_or_default();
+        let current_messages = sup
+            .get_messages()
+            .ok()
+            .and_then(|r| parse_data_json(&r))
+            .map(|v| parse_chat_messages(&v))
+            .unwrap_or_default();
+
+        let project_dir = self.project_path();
+        let store = load_checkpoint_store(&project_dir);
+
+        let restored_prompt = current_messages
+            .iter()
+            .find(|m| m.id == entry_id)
+            .map(|m| m.content.clone())
+            .or_else(|| {
+                fork_candidates
+                    .iter()
+                    .find(|c| c.entry_id == entry_id)
+                    .map(|c| c.preview.clone())
+            })
+            .or_else(|| {
+                tree.iter()
+                    .find(|n| n.id == entry_id)
+                    .map(|n| n.preview.clone())
+            })
+            .or_else(|| {
+                store
+                    .checkpoints
+                    .iter()
+                    .rev()
+                    .find(|c| c.entry_id == entry_id)
+                    .map(|c| c.prompt_preview.clone())
+            });
+
+        // Determine rewind target: fork to parent entry, or start a new session if reverting the first user turn.
+        enum RewindAction {
+            ForkTo(String),
+            NewSession,
+        }
+
+        let rewind_action = if let Some(node) = tree.iter().find(|n| n.id == entry_id) {
+            match node
+                .parent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(parent) => RewindAction::ForkTo(parent.to_string()),
+                None => RewindAction::NewSession,
+            }
+        } else if let Some(idx) = current_messages.iter().position(|m| m.id == entry_id) {
+            if idx == 0 {
+                RewindAction::NewSession
+            } else {
+                RewindAction::ForkTo(current_messages[idx - 1].id.clone())
+            }
+        } else if let Some(idx) = fork_candidates.iter().position(|c| c.entry_id == entry_id) {
+            if idx == 0 {
+                RewindAction::NewSession
+            } else {
+                RewindAction::ForkTo(fork_candidates[idx - 1].entry_id.clone())
+            }
+        } else {
+            RewindAction::ForkTo(entry_id.clone())
+        };
+
+        let SessionWithMessages { session, messages } = match rewind_action {
+            RewindAction::ForkTo(parent_id) => {
+                let resp = sup.fork(&parent_id).map_err(|e| e.to_string())?;
+                self.parse_session_with_messages(&sup, &resp, "session-revert", "Reverted session")?
+            }
+            RewindAction::NewSession => {
+                let resp = sup.new_session(None).map_err(|e| e.to_string())?;
+                let project_id = project_from_path(&project_dir).id;
+                let summary = parse_data_json(&resp)
+                    .map(|v| {
+                        parse_session_summary(&v, &project_id, "session-new", "New session")
+                    })
+                    .unwrap_or_else(|| PiSessionSummary {
+                        id: "session-new".to_string(),
+                        project_id,
+                        name: "New session".to_string(),
+                        path: String::new(),
+                        updated_at: "Just now".to_string(),
+                        message_count: 0,
+                        parent_session_id: None,
+                    });
+                SessionWithMessages {
+                    session: summary,
+                    messages: Vec::new(),
+                }
+            }
+        };
+
+        *self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned") = Some(session.id.clone());
+
+        let (code_reverted, reverted_files, can_redo, code_revert_note) = if revert_code {
+            if let Some(cp) = find_checkpoint(
+                &store,
+                session_id.as_deref(),
+                &entry_id,
+                restored_prompt.as_deref(),
+            ) {
+                let outcome = revert_to_snapshot(&project_dir, &cp.tree_oid)?;
+                save_last_redo(
+                    &project_dir,
+                    outcome.redo_tree_oid.clone(),
+                    outcome.reverted_files.clone(),
+                )?;
+                (true, outcome.reverted_files, true, None)
+            } else {
+                (
+                    false,
+                    Vec::new(),
+                    false,
+                    Some("No code snapshot was recorded for this turn.".to_string()),
+                )
+            }
+        } else {
+            (false, Vec::new(), false, None)
+        };
+
+        Ok(RevertTurnResult {
+            session,
+            messages,
+            restored_prompt,
+            code_reverted,
+            reverted_files,
+            can_redo,
+            code_revert_note,
+        })
+    }
+
+    pub fn redo_revert_with_sink(&self) -> Result<RedoRevertResult, String> {
+        let project_dir = self.project_path();
+        let redo = load_last_redo(&project_dir)
+            .ok_or_else(|| "No revert operation is available to redo.".to_string())?;
+        let restored_files = redo_targeted_revert(&project_dir, &redo.redo_tree_oid, &redo.files)?;
+        clear_last_redo(&project_dir)?;
+        Ok(RedoRevertResult { restored_files })
     }
 
     pub fn compact_with_sink(
@@ -1828,44 +2132,175 @@ impl PiAppState {
         Ok(())
     }
 
+    fn available_merged_models(&self, sup: Option<&PiSessionSupervisor>) -> Vec<ModelOption> {
+        let store = ProviderStore::load(&self.inner.provider_store_path).unwrap_or_default();
+        let providers = store.public_profiles();
+        let provider_models = models_from_providers(&providers);
+        let agent_models = load_pi_agent_models();
+        let rpc_models = sup
+            .and_then(|s| s.get_available_models().ok())
+            .and_then(|r| parse_data_json(&r))
+            .map(|v| parse_models_list(&v))
+            .unwrap_or_default();
+        merge_models_with_fallback(rpc_models, provider_models, agent_models)
+    }
+
     pub fn cycle_model_with_sink(&self, event_sink: EventSink) -> Result<serde_json::Value, String> {
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
-        let resp = sup.cycle_model().map_err(|e| e.to_string())?;
-        if let Some(val) = parse_data_json(&resp) {
-            if val.get("model").is_some()
-                || val.get("modelId").is_some()
-                || val.get("model_id").is_some()
-            {
-                let parsed = parse_model_option(&val, "default", "default");
-                if parsed.model_id != "default" {
+        let sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink))?;
+        let current_model = self
+            .inner
+            .selected_model
+            .lock()
+            .expect("selected_model lock poisoned")
+            .clone();
+
+        let rpc_result = sup.cycle_model();
+        let mut parsed_from_rpc: Option<ModelOption> = None;
+        let mut parsed_thinking: Option<ThinkingLevel> = None;
+
+        if let Ok(resp) = rpc_result {
+            if let Some(val) = parse_data_json(&resp) {
+                parsed_thinking = opt_str(&val, &["thinkingLevel", "thinking_level", "level"])
+                    .and_then(|raw| ThinkingLevel::parse(&raw));
+                parsed_from_rpc = try_parse_model_option(&val);
+            }
+        }
+
+        let same_as_current = match (&parsed_from_rpc, &current_model) {
+            (Some(rpc_m), Some(cur)) => {
+                rpc_m.provider == cur.provider && rpc_m.model_id == cur.model_id
+            }
+            _ => false,
+        };
+
+        let (final_model, cycled, reason): (ModelOption, bool, Option<String>) =
+            if let Some(rpc_m) = parsed_from_rpc.filter(|_| !same_as_current) {
+                *self
+                    .inner
+                    .selected_model
+                    .lock()
+                    .expect("selected_model lock poisoned") = Some(rpc_m.clone());
+                self.inner
+                    .model_pending_sync
+                    .store(false, Ordering::Release);
+                if let Some(lvl) = parsed_thinking {
+                    *self
+                        .inner
+                        .thinking_level
+                        .lock()
+                        .expect("thinking_level lock poisoned") = lvl;
+                    self.inner
+                        .thinking_level_pending_sync
+                        .store(false, Ordering::Release);
+                }
+                (rpc_m, true, None)
+            } else {
+                let models = self.available_merged_models(Some(&sup));
+                if models.len() >= 2 {
+                    let next_idx = if let Some(ref cur) = current_model {
+                        models
+                            .iter()
+                            .position(|m| m.provider == cur.provider && m.model_id == cur.model_id)
+                            .map(|idx| (idx + 1) % models.len())
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let next = &models[next_idx];
+                    let mut switched = self.set_model_with_sink(
+                        event_sink,
+                        next.provider.clone(),
+                        next.model_id.clone(),
+                    )?;
+                    if switched.label == switched.model_id && next.label != next.model_id {
+                        switched.label = next.label.clone();
+                        *self
+                            .inner
+                            .selected_model
+                            .lock()
+                            .expect("selected_model lock poisoned") = Some(switched.clone());
+                    }
+                    (switched, true, None)
+                } else {
+                    let single = current_model
+                        .or_else(|| models.into_iter().next())
+                        .unwrap_or_else(|| fallback_model(&[]));
                     *self
                         .inner
                         .selected_model
                         .lock()
-                        .expect("selected_model lock poisoned") = Some(parsed);
+                        .expect("selected_model lock poisoned") = Some(single.clone());
+                    (single, false, Some("single_model".to_string()))
                 }
-            }
-        }
-        Ok(rpc_response_to_serde_value(&resp))
+            };
+
+        let thinking_level = *self
+            .inner
+            .thinking_level
+            .lock()
+            .expect("thinking_level lock poisoned");
+
+        Ok(serde_json::json!({
+            "model": {
+                "provider": final_model.provider,
+                "modelId": final_model.model_id,
+                "label": final_model.label,
+            },
+            "provider": final_model.provider,
+            "id": final_model.model_id,
+            "modelId": final_model.model_id,
+            "label": final_model.label,
+            "thinkingLevel": thinking_level.as_str(),
+            "cycled": cycled,
+            "reason": reason,
+        }))
     }
 
     pub fn cycle_thinking_level_with_sink(
         &self,
         event_sink: EventSink,
     ) -> Result<serde_json::Value, String> {
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
-        let resp = sup.cycle_thinking_level().map_err(|e| e.to_string())?;
-        if let Some(level) = parse_data_json(&resp)
+        let sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink))?;
+        let current_level = *self
+            .inner
+            .thinking_level
+            .lock()
+            .expect("thinking_level lock poisoned");
+
+        let rpc_level = sup
+            .cycle_thinking_level()
+            .ok()
+            .and_then(|resp| parse_data_json(&resp))
             .and_then(|v| opt_str(&v, &["level", "thinkingLevel", "thinking_level"]))
-            .and_then(|raw| ThinkingLevel::parse(&raw))
-        {
-            *self
-                .inner
-                .thinking_level
-                .lock()
-                .expect("thinking_level lock poisoned") = level;
-        }
-        Ok(rpc_response_to_serde_value(&resp))
+            .and_then(|raw| ThinkingLevel::parse(&raw));
+
+        let final_level = match rpc_level {
+            Some(level) if level != current_level => {
+                *self
+                    .inner
+                    .thinking_level
+                    .lock()
+                    .expect("thinking_level lock poisoned") = level;
+                self.inner
+                    .thinking_level_pending_sync
+                    .store(false, Ordering::Release);
+                level
+            }
+            _ => {
+                let levels = ThinkingLevel::all();
+                let cur_idx = levels
+                    .iter()
+                    .position(|&l| l == current_level)
+                    .unwrap_or(0);
+                let next = levels[(cur_idx + 1) % levels.len()];
+                self.set_thinking_level_with_sink(event_sink, next)?
+            }
+        };
+
+        Ok(serde_json::json!({
+            "level": final_level.as_str(),
+            "thinkingLevel": final_level.as_str(),
+        }))
     }
 
     pub fn get_commands_with_sink(
@@ -2381,6 +2816,43 @@ pub async fn pi_get_commands(
         .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
+#[tauri::command]
+pub async fn pi_list_checkpoints(
+    state: State<'_, PiAppState>,
+) -> Result<Vec<TurnCheckpointView>, String> {
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || app_state.list_checkpoints())
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_revert_turn(
+    app: AppHandle,
+    state: State<'_, PiAppState>,
+    entry_id: String,
+    revert_code: bool,
+) -> Result<RevertTurnResult, String> {
+    let app_state = state.inner().clone();
+    let sink = tauri_event_sink(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.revert_turn_with_sink(sink, entry_id, revert_code)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn pi_redo_revert(
+    _app: AppHandle,
+    state: State<'_, PiAppState>,
+) -> Result<RedoRevertResult, String> {
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || app_state.redo_revert_with_sink())
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2425,7 +2897,7 @@ mod tests {
                 api: "anthropic-messages".to_string(),
                 base_url: "https://api.anthropic.com/v1".to_string(),
                 sign_in_url: None,
-                models: vec!["claude-sonnet-4".to_string()],
+                models: vec!["claude-sonnet-5-5".to_string()],
                 api_key: Some("sk-secret-token".to_string()),
             })
             .unwrap();
@@ -2487,12 +2959,12 @@ mod tests {
         assert_eq!(forks[0].timestamp, "1700000002");
 
         let models_val = parse_json(
-            r#"{"models":[{"provider":"anthropic","modelId":"claude-sonnet-4","label":"Claude Sonnet 4"}]}"#,
+            r#"{"models":[{"provider":"anthropic","modelId":"claude-sonnet-5-5","label":"Claude Sonnet 5.5"}]}"#,
         )
         .unwrap();
         let models = parse_models_list(&models_val);
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].model_id, "claude-sonnet-4");
+        assert_eq!(models[0].model_id, "claude-sonnet-5-5");
 
         let levels_val = parse_json(r#"{"levels":["off","medium","high","xhigh"]}"#).unwrap();
         assert_eq!(
@@ -2634,7 +3106,7 @@ mod tests {
                 api: "openai-responses".to_string(),
                 base_url: "https://api.openai.com/v1".to_string(),
                 sign_in_url: None,
-                models: vec!["gpt-5".to_string()],
+                models: vec!["gpt-6.1-sol".to_string()],
                 api_key: Some("sk-test-env-injection-42".to_string()),
             })
             .unwrap();
@@ -2648,13 +3120,13 @@ while IFS= read -r line; do
   typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
   case "$typ" in
     get_state)
-      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"id":"sess-live","name":"Live Session","path":"/tmp/sess-live.jsonl","thinkingLevel":"high","model":{{"provider":"openai-dev","modelId":"gpt-5","label":"GPT-5"}}}}}}\n' "$id"
+      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"id":"sess-live","name":"Live Session","path":"/tmp/sess-live.jsonl","thinkingLevel":"high","model":{{"provider":"openai-dev","modelId":"gpt-6.1-sol","label":"GPT-6.1 Sol"}}}}}}\n' "$id"
       ;;
     get_messages)
       printf '{{"type":"response","id":"%s","command":"get_messages","success":true,"data":{{"messages":[{{"id":"m1","role":"user","content":"hi","timestamp":"10:00"}}]}}}}\n' "$id"
       ;;
     get_available_models)
-      printf '{{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{{"models":[{{"provider":"openai-dev","modelId":"gpt-5","label":"GPT-5"}}]}}}}\n' "$id"
+      printf '{{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{{"models":[{{"provider":"openai-dev","modelId":"gpt-6.1-sol","label":"GPT-6.1 Sol"}}]}}}}\n' "$id"
       ;;
     get_available_thinking_levels)
       printf '{{"type":"response","id":"%s","command":"get_available_thinking_levels","success":true,"data":{{"levels":["off","low","medium","high"]}}}}\n' "$id"
@@ -2687,7 +3159,7 @@ while IFS= read -r line; do
       printf '{{"type":"response","id":"%s","command":"export_html","success":true,"data":{{"path":"/tmp/out.html","html":"<html>exported</html>"}}}}\n' "$id"
       ;;
     set_model)
-      printf '{{"type":"response","id":"%s","command":"set_model","success":true,"data":{{"provider":"openai-dev","modelId":"gpt-5","label":"GPT-5"}}}}\n' "$id"
+      printf '{{"type":"response","id":"%s","command":"set_model","success":true,"data":{{"provider":"openai-dev","modelId":"gpt-6.1-sol","label":"GPT-6.1 Sol"}}}}\n' "$id"
       ;;
     set_thinking_level)
       printf '{{"type":"response","id":"%s","command":"set_thinking_level","success":true,"data":{{"level":"xhigh"}}}}\n' "$id"
@@ -2744,7 +3216,7 @@ done
         let boot = state.bootstrap_with_sink(Arc::clone(&sink));
         assert!(state.has_live_supervisor());
         assert_eq!(boot.active_session_id, "sess-live");
-        assert_eq!(boot.selected_model.model_id, "gpt-5");
+        assert_eq!(boot.selected_model.model_id, "gpt-6.1-sol");
         assert_eq!(boot.thinking_level, ThinkingLevel::High);
         assert_eq!(boot.messages.len(), 1);
         assert_eq!(boot.commands.len(), 1);
@@ -2816,10 +3288,10 @@ done
             .set_model_with_sink(
                 Arc::clone(&sink),
                 "openai-dev".to_string(),
-                "gpt-5".to_string(),
+                "gpt-6.1-sol".to_string(),
             )
             .unwrap();
-        assert_eq!(model.model_id, "gpt-5");
+        assert_eq!(model.model_id, "gpt-6.1-sol");
 
         // 11. pi_set_thinking_level
         let level = state
@@ -2994,11 +3466,11 @@ done
         assert!(data
             .models
             .iter()
-            .any(|m| m.provider == "anthropic" && m.model_id == "claude-sonnet-4-5"));
+            .any(|m| m.provider == "anthropic" && m.model_id == "claude-sonnet-5-5"));
         assert!(data
             .models
             .iter()
-            .any(|m| m.provider == "openai" && m.model_id == "gpt-5"));
+            .any(|m| m.provider == "openai" && m.model_id == "gpt-6.1-sol"));
 
         state.shutdown();
         let _ = fs::remove_dir_all(&dir);
@@ -3047,14 +3519,14 @@ done
         let sink: EventSink = Arc::new(|_| {});
 
         let updated = state
-            .set_model_with_sink(Arc::clone(&sink), "openai".to_string(), "gpt-5".to_string())
+            .set_model_with_sink(Arc::clone(&sink), "openai".to_string(), "gpt-6.1-sol".to_string())
             .expect("degraded set_model should succeed");
         assert_eq!(updated.provider, "openai");
-        assert_eq!(updated.model_id, "gpt-5");
+        assert_eq!(updated.model_id, "gpt-6.1-sol");
 
         let boot = state.bootstrap_with_sink(sink);
         assert_eq!(boot.selected_model.provider, "openai");
-        assert_eq!(boot.selected_model.model_id, "gpt-5");
+        assert_eq!(boot.selected_model.model_id, "gpt-6.1-sol");
 
         state.shutdown();
         let _ = fs::remove_dir_all(&dir);
@@ -3066,7 +3538,7 @@ done
         let models_json = dir.join("models.json");
         fs::write(
             &models_json,
-            r#"{"providers":{"anthropic":{"models":[{"id":"claude-sonnet-4-5","name":"Claude Sonnet 4.5"},"claude-opus-4-5"]},"openai":{"models":[{"id":"gpt-5","name":"GPT-5"}]}}}"#,
+            r#"{"providers":{"anthropic":{"models":[{"id":"claude-sonnet-5-5","name":"Claude Sonnet 5.5"},"claude-opus-5"]},"openai":{"models":[{"id":"gpt-6.1-sol","name":"GPT-6.1 Sol"}]}}}"#,
         )
         .unwrap();
 
@@ -3075,14 +3547,14 @@ done
 
         let rpc_models = vec![ModelOption {
             provider: "openai".to_string(),
-            model_id: "gpt-5".to_string(),
-            label: "GPT-5 RPC".to_string(),
+            model_id: "gpt-6.1-sol".to_string(),
+            label: "GPT-6.1 Sol RPC".to_string(),
         }];
         let provider_models = vec![
             ModelOption {
                 provider: "openai".to_string(),
-                model_id: "gpt-5".to_string(),
-                label: "gpt-5".to_string(),
+                model_id: "gpt-6.1-sol".to_string(),
+                label: "gpt-6.1-sol".to_string(),
             },
             ModelOption {
                 provider: "local-vllm".to_string(),
@@ -3093,13 +3565,13 @@ done
 
         let merged = merge_models_with_fallback(rpc_models, provider_models, agent_models);
         assert_eq!(merged.len(), 4);
-        assert_eq!(merged[0].label, "GPT-5 RPC");
+        assert_eq!(merged[0].label, "GPT-6.1 Sol RPC");
         assert!(merged
             .iter()
             .any(|m| m.provider == "local-vllm" && m.model_id == "qwen-2.5"));
         assert!(merged
             .iter()
-            .any(|m| m.provider == "anthropic" && m.model_id == "claude-opus-4-5"));
+            .any(|m| m.provider == "anthropic" && m.model_id == "claude-opus-5"));
 
         let fallback = merge_models_with_fallback(Vec::new(), Vec::new(), Vec::new());
         assert_eq!(fallback, default_catalog_models());
@@ -3401,7 +3873,7 @@ while IFS= read -r line; do
       printf '{{"type":"response","id":"%s","command":"get_last_assistant_text","success":true,"data":{{"text":"Last reply"}}}}\n' "$id"
       ;;
     cycle_model)
-      printf '{{"type":"response","id":"%s","command":"cycle_model","success":true,"data":{{"model":{{"provider":"anthropic","modelId":"claude-opus-4-5","label":"Claude Opus 4.5"}}}}}}\n' "$id"
+      printf '{{"type":"response","id":"%s","command":"cycle_model","success":true,"data":{{"model":{{"provider":"anthropic","modelId":"claude-opus-5","label":"Claude Opus 5"}}}}}}\n' "$id"
       ;;
     cycle_thinking_level)
       printf '{{"type":"response","id":"%s","command":"cycle_thinking_level","success":true,"data":{{"level":"high"}}}}\n' "$id"
@@ -3470,7 +3942,7 @@ done
             .unwrap();
 
         let cycled_model = state.cycle_model_with_sink(Arc::clone(&sink)).unwrap();
-        assert_eq!(cycled_model["model"]["modelId"], "claude-opus-4-5");
+        assert_eq!(cycled_model["model"]["modelId"], "claude-opus-5");
 
         let cycled_thinking = state
             .cycle_thinking_level_with_sink(Arc::clone(&sink))
@@ -3498,6 +3970,205 @@ done
         );
 
         state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cycle_model_falls_back_to_merged_models_when_pi_returns_null_and_normalizes_shape() {
+        let dir = unique_temp_dir("cycle-model-fallback");
+        let store_path = dir.join("providers.json");
+        let mut store = ProviderStore::default();
+        store
+            .upsert(ProviderProfileInput {
+                id: "custom-a".to_string(),
+                name: "Custom A".to_string(),
+                api: "openai-completions".to_string(),
+                base_url: "https://a.example.com/v1".to_string(),
+                sign_in_url: None,
+                models: vec!["model-alpha".to_string(), "model-beta".to_string()],
+                api_key: Some("k-a".to_string()),
+            })
+            .unwrap();
+        store.save_atomic(&store_path).unwrap();
+
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    get_available_models)
+      printf '{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{"models":[]}}\n' "$id"
+      ;;
+    cycle_model)
+      printf '{"type":"response","id":"%s","command":"cycle_model","success":true,"data":null}\n' "$id"
+      ;;
+    set_model)
+      model_id=$(printf '%s\n' "$line" | sed -n 's/.*"modelId":"\([^"]*\)".*/\1/p')
+      provider=$(printf '%s\n' "$line" | sed -n 's/.*"provider":"\([^"]*\)".*/\1/p')
+      printf '{"type":"response","id":"%s","command":"set_model","success":true,"data":{"provider":"%s","modelId":"%s","label":"%s"}}\n' "$id" "$provider" "$model_id" "$model_id"
+      ;;
+    cycle_thinking_level)
+      printf '{"type":"response","id":"%s","command":"cycle_thinking_level","success":true,"data":null}\n' "$id"
+      ;;
+    set_thinking_level)
+      lvl=$(printf '%s\n' "$line" | sed -n 's/.*"level":"\([^"]*\)".*/\1/p')
+      printf '{"type":"response","id":"%s","command":"set_thinking_level","success":true,"data":{"level":"%s"}}\n' "$id" "$lvl"
+      ;;
+    *)
+      printf '{"type":"response","id":"%s","command":"%s","success":true}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#;
+
+        let state = PiAppState::with_config(
+            dir.clone(),
+            store_path,
+            mock_sh_config(dir.clone(), script),
+        );
+        let sink: EventSink = Arc::new(|_| {});
+
+        state
+            .set_model_with_sink(
+                Arc::clone(&sink),
+                "custom-a".to_string(),
+                "model-alpha".to_string(),
+            )
+            .unwrap();
+
+        let cycled = state.cycle_model_with_sink(Arc::clone(&sink)).unwrap();
+        assert_eq!(cycled["cycled"], true);
+        assert_eq!(cycled["provider"], "custom-a");
+        assert_eq!(cycled["id"], "model-beta");
+        assert_eq!(cycled["modelId"], "model-beta");
+        assert_eq!(cycled["model"]["modelId"], "model-beta");
+        assert!(cycled["reason"].is_null());
+
+        let t1 = state
+            .cycle_thinking_level_with_sink(Arc::clone(&sink))
+            .unwrap();
+        assert_eq!(t1["level"], "high");
+        assert_eq!(t1["thinkingLevel"], "high");
+        let t2 = state
+            .cycle_thinking_level_with_sink(Arc::clone(&sink))
+            .unwrap();
+        assert_eq!(t2["level"], "xhigh");
+        let t3 = state
+            .cycle_thinking_level_with_sink(Arc::clone(&sink))
+            .unwrap();
+        assert_eq!(t3["level"], "off");
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_turn_and_redo_work_with_snapshot_and_missing_snapshot_note() {
+        let _env_lock = crate::snapshots::tests::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = unique_temp_dir("revert-turn-e2e");
+        let verity_home = dir.join("verity-home");
+        let prev_vh = env::var("VERITY_HOME").ok();
+        env::set_var("VERITY_HOME", &verity_home);
+
+        let project_dir = dir.join("proj");
+        fs::create_dir_all(&project_dir).unwrap();
+        let code_file = project_dir.join("main.rs");
+        fs::write(&code_file, "fn main() { /* v1 */ }\n").unwrap();
+
+        let store_path = dir.join("providers.json");
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    get_state)
+      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"id":"sess-rev","name":"Rev Session"}}\n' "$id"
+      ;;
+    get_tree)
+      printf '{"type":"response","id":"%s","command":"get_tree","success":true,"data":{"nodes":[{"id":"u-1","parentId":null,"role":"user","preview":"Refactor main","timestamp":"t1","depth":0,"isActiveBranch":true},{"id":"a-1","parentId":"u-1","role":"assistant","preview":"Done","timestamp":"t2","depth":1,"isActiveBranch":true},{"id":"u-2","parentId":"a-1","role":"user","preview":"Unrecorded turn","timestamp":"t3","depth":2,"isActiveBranch":true}]}}\n' "$id"
+      ;;
+    get_fork_messages)
+      printf '{"type":"response","id":"%s","command":"get_fork_messages","success":true,"data":{"messages":[{"entryId":"u-1","role":"user","preview":"Refactor main","timestamp":"t1"},{"entryId":"u-2","role":"user","preview":"Unrecorded turn","timestamp":"t3"}]}}\n' "$id"
+      ;;
+    get_messages)
+      printf '{"type":"response","id":"%s","command":"get_messages","success":true,"data":{"messages":[{"id":"u-1","role":"user","content":"Refactor main","timestamp":"t1"},{"id":"u-2","role":"user","content":"Unrecorded turn","timestamp":"t3"}]}}\n' "$id"
+      ;;
+    fork)
+      printf '{"type":"response","id":"%s","command":"fork","success":true,"data":{"id":"sess-forked","name":"Forked","messages":[{"id":"u-1","role":"user","content":"Refactor main","timestamp":"t1"}]}}\n' "$id"
+      ;;
+    prompt)
+      printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+      printf '{"type":"agent_end"}\n'
+      ;;
+    new_session)
+      printf '{"type":"response","id":"%s","command":"new_session","success":true,"data":{"id":"sess-fresh","name":"New session"}}\n' "$id"
+      ;;
+    *)
+      printf '{"type":"response","id":"%s","command":"%s","success":true}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#;
+
+        let state = PiAppState::with_config(
+            project_dir.clone(),
+            store_path,
+            mock_sh_config(project_dir.clone(), script),
+        );
+        let (settled_tx, settled_rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |ev| {
+            if matches!(ev, PiUiEvent::AgentSettled { .. }) {
+                let _ = settled_tx.send(());
+            }
+        });
+
+        state
+            .prompt_with_sink(Arc::clone(&sink), "Refactor main".to_string(), vec![])
+            .unwrap();
+        settled_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("agent should settle after prompt");
+        let cps = state.list_checkpoints().unwrap();
+        assert_eq!(cps.len(), 1);
+        assert!(cps[0].has_code_snapshot);
+        assert_eq!(cps[0].prompt_preview, "Refactor main");
+
+        fs::write(&code_file, "fn main() { /* v2 */ }\n").unwrap();
+
+        let missing = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true)
+            .unwrap();
+        assert!(!missing.code_reverted);
+        assert!(!missing.can_redo);
+        assert_eq!(
+            missing.code_revert_note.as_deref(),
+            Some("No code snapshot was recorded for this turn.")
+        );
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "fn main() { /* v2 */ }\n");
+
+        let reverted = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true)
+            .unwrap();
+        assert!(reverted.code_reverted);
+        assert!(reverted.can_redo);
+        assert!(reverted.code_revert_note.is_none());
+        assert_eq!(reverted.session.id, "sess-fresh");
+        assert!(reverted.messages.is_empty());
+        assert_eq!(reverted.restored_prompt.as_deref(), Some("Refactor main"));
+        assert_eq!(reverted.reverted_files, vec!["main.rs".to_string()]);
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "fn main() { /* v1 */ }\n");
+
+        let redone = state.redo_revert_with_sink().unwrap();
+        assert_eq!(redone.restored_files, vec!["main.rs".to_string()]);
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "fn main() { /* v2 */ }\n");
+
+        state.shutdown();
+        match prev_vh {
+            Some(v) => env::set_var("VERITY_HOME", v),
+            None => env::remove_var("VERITY_HOME"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
