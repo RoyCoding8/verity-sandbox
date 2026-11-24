@@ -747,3 +747,196 @@
   gap: 8px;
   min-width: 0;
 }
+
+/* --------------------------------------------------------------------------
+   Thinking Indicator (3-Dot Constellation) & MD3 Thinking Panel
+   -------------------------------------------------------------------------- */
+
+.pi-thinking-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 2px;
+  margin-bottom: 6px;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.pi-constellation {
+  position: relative;
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.pi-constellation--animated {
+  animation: pi-constellation-orbit 2.4s linear infinite;
+}
+
+.pi-constellation-dot {
+  position: absolute;
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 50%;
+  background: var(--md-sys-color-primary);
+}
+
+.pi-constellation-dot--1 {
+  top: 2px;
+  left: 2.5px;
+}
+
+.pi-constellation-dot--2 {
+  top: 4.5px;
+  right: 2px;
+}
+
+.pi-constellation-dot--3 {
+  bottom: 2px;
+  left: 4.5px;
+}
+
+.pi-constellation--animated .pi-constellation-dot--1 {
+  animation: pi-constellation-pulse 1.35s ease-in-out infinite 0s;
+}
+
+.pi-constellation--animated .pi-constellation-dot--2 {
+  animation: pi-constellation-pulse 1.35s ease-in-out infinite 0.35s;
+}
+
+.pi-constellation--animated .pi-constellation-dot--3 {
+  animation: pi-constellation-pulse 1.35s ease-in-out infinite 0.7s;
+}
+
+@keyframes pi-constellation-orbit {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pi-constellation-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.22);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pi-constellation--animated,
+  .pi-constellation--animated .pi-constellation-dot {
+    animation: none;
+  }
+}
+
+.pi-thinking-label {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.pi-thinking-panel {
+  width: 100%;
+  margin-bottom: 12px;
+  border: 1px solid var(--verity-hairline-subtle);
+  border-radius: 16px;
+  background: var(--md-sys-color-surface-container-low);
+  overflow: hidden;
+  transition:
+    background-color var(--md-sys-motion-fast),
+    border-color var(--md-sys-motion-fast);
+}
+
+.pi-thinking-panel--streaming {
+  border-color: color-mix(in srgb, var(--md-sys-color-primary) 26%, var(--verity-hairline-subtle));
+}
+
+:root[data-theme="light"] .pi-thinking-panel {
+  background: #ffffff;
+  border-color: var(--verity-hairline);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .pi-thinking-panel {
+    background: #ffffff;
+    border-color: var(--verity-hairline);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  }
+}
+
+.pi-thinking-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 14px;
+  border: none;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--md-sys-motion-fast);
+}
+
+.pi-thinking-header:hover {
+  background: var(--md-sys-color-surface-container);
+}
+
+:root[data-theme="light"] .pi-thinking-header:hover {
+  background: var(--md-sys-color-surface-container-low);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .pi-thinking-header:hover {
+    background: var(--md-sys-color-surface-container-low);
+  }
+}
+
+.pi-thinking-header-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.pi-thinking-chevron {
+  color: var(--md-sys-color-on-surface-variant);
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  transition: transform var(--md-sys-motion-fast);
+}
+
+.pi-thinking-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.pi-thinking-body {
+  border-top: 1px solid var(--verity-hairline);
+  padding: 10px 14px 12px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.pi-thinking-content {
+  margin: 0;
+  padding-left: 10px;
+  border-left: 2px solid color-mix(in srgb, var(--md-sys-color-primary) 35%, transparent);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  line-height: 1.58;
+  color: var(--md-sys-color-on-surface-variant);
+  white-space: pre-wrap;
+  word-break: break-word;
+}

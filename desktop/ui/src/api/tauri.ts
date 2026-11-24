@@ -80,6 +80,7 @@ export interface PiChatMessage {
   readonly id: string;
   readonly role: "user" | "assistant" | "system";
   readonly content: string;
+  readonly thinking?: string;
   readonly timestamp: string;
   readonly streaming?: boolean;
   readonly attachments?: readonly PendingAttachment[];
@@ -113,8 +114,19 @@ export type ExtensionUiAnswer =
 export type PiUiEvent =
   | { readonly type: "agent_settled"; readonly summary: string | null }
   | { readonly type: "message_start"; readonly message_id: string | null; readonly role: string | null }
-  | { readonly type: "message_update"; readonly message_id: string | null; readonly delta: string | null }
-  | { readonly type: "message_end"; readonly message_id: string | null; readonly stop_reason: string | null }
+  | {
+      readonly type: "message_update";
+      readonly message_id: string | null;
+      readonly delta: string | null;
+      readonly thinking_delta?: string | null;
+    }
+  | {
+      readonly type: "message_end";
+      readonly message_id: string | null;
+      readonly stop_reason: string | null;
+      readonly text?: string | null;
+      readonly thinking?: string | null;
+    }
   | {
       readonly type: "tool_execution_start";
       readonly tool_call_id: string | null;
@@ -262,6 +274,47 @@ function isDialogKind(raw: string | null): raw is DialogKind {
   return raw === "select" || raw === "confirm" || raw === "input" || raw === "editor";
 }
 
+function parseRawJsonRecord(obj: Record<string, unknown>): Record<string, unknown> | null {
+  const rawJson = readString(obj, "raw_json");
+  if (!rawJson) return null;
+  try {
+    const parsed: unknown = JSON.parse(rawJson);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractMessageContentParts(
+  messageObj: Record<string, unknown> | null
+): { readonly text: string | null; readonly thinking: string | null } {
+  if (!messageObj) return { text: null, thinking: null };
+  const rawContent = messageObj["content"];
+  if (typeof rawContent === "string") {
+    return { text: rawContent || null, thinking: null };
+  }
+  if (!Array.isArray(rawContent)) {
+    return { text: null, thinking: null };
+  }
+  const textParts: string[] = [];
+  const thinkingParts: string[] = [];
+  for (const item of rawContent) {
+    if (!isRecord(item)) continue;
+    const blockType = readString(item, "type");
+    if (blockType === "text") {
+      const t = readString(item, "text");
+      if (t) textParts.push(t);
+    } else if (blockType === "thinking") {
+      const th = readString(item, "thinking") ?? readString(item, "text");
+      if (th) thinkingParts.push(th);
+    }
+  }
+  return {
+    text: textParts.length > 0 ? textParts.join("") : null,
+    thinking: thinkingParts.length > 0 ? thinkingParts.join("") : null,
+  };
+}
+
 /**
  * Boundary parser for incoming `pi:event` payloads from Tauri.
  */
@@ -271,24 +324,73 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
   switch (type) {
     case "agent_settled":
       return { type, summary: readString(raw, "summary") };
-    case "message_start":
+    case "message_start": {
+      let messageId = readString(raw, "message_id") ?? readString(raw, "messageId");
+      let role = readString(raw, "role");
+      if (!messageId || !role) {
+        const rawJson = parseRawJsonRecord(raw);
+        const nestedMsg = rawJson && isRecord(rawJson["message"]) ? rawJson["message"] : null;
+        if (!messageId) {
+          messageId =
+            (nestedMsg ? readString(nestedMsg, "id") : null) ??
+            (rawJson ? readString(rawJson, "messageId") ?? readString(rawJson, "message_id") : null);
+        }
+        if (!role) {
+          role =
+            (nestedMsg ? readString(nestedMsg, "role") : null) ??
+            (rawJson ? readString(rawJson, "role") : null);
+        }
+      }
+      return { type, message_id: messageId, role };
+    }
+    case "message_update": {
+      const messageId = readString(raw, "message_id") ?? readString(raw, "messageId");
+      let delta = readString(raw, "delta");
+      let thinkingDelta =
+        readString(raw, "thinking_delta") ?? readString(raw, "thinkingDelta");
+      if (delta === null && thinkingDelta === null) {
+        const rawJson = parseRawJsonRecord(raw);
+        const assistantEvent =
+          rawJson && isRecord(rawJson["assistantMessageEvent"])
+            ? rawJson["assistantMessageEvent"]
+            : null;
+        if (assistantEvent) {
+          const evType = readString(assistantEvent, "type");
+          const evDelta = readString(assistantEvent, "delta");
+          if (evType === "thinking_delta") {
+            thinkingDelta = evDelta;
+          } else if (evType === "text_delta") {
+            delta = evDelta;
+          }
+        }
+      }
       return {
         type,
-        message_id: readString(raw, "message_id"),
-        role: readString(raw, "role"),
+        message_id: messageId,
+        delta,
+        thinking_delta: thinkingDelta,
       };
-    case "message_update":
+    }
+    case "message_end": {
+      const messageId = readString(raw, "message_id") ?? readString(raw, "messageId");
+      const stopReason = readString(raw, "stop_reason") ?? readString(raw, "stopReason");
+      let text = readString(raw, "text");
+      let thinking = readString(raw, "thinking");
+      if (text === null || thinking === null) {
+        const rawJson = parseRawJsonRecord(raw);
+        const nestedMsg = rawJson && isRecord(rawJson["message"]) ? rawJson["message"] : null;
+        const extracted = extractMessageContentParts(nestedMsg);
+        if (text === null) text = extracted.text;
+        if (thinking === null) thinking = extracted.thinking;
+      }
       return {
         type,
-        message_id: readString(raw, "message_id"),
-        delta: readString(raw, "delta"),
+        message_id: messageId,
+        stop_reason: stopReason,
+        text,
+        thinking,
       };
-    case "message_end":
-      return {
-        type,
-        message_id: readString(raw, "message_id"),
-        stop_reason: readString(raw, "stop_reason"),
-      };
+    }
     case "tool_execution_start":
       return {
         type,
@@ -782,6 +884,7 @@ class BrowserPreviewRuntime {
         options: ["master", "release/v0.2", "staging"],
         timeout_ms: null,
       });
+      this.emit({ type: "agent_settled", summary: null });
       return;
     }
 
@@ -812,6 +915,13 @@ class BrowserPreviewRuntime {
 
     const attachmentNote =
       imageCount > 0 ? ` Received **${imageCount}** image attachment${imageCount > 1 ? "s" : ""}.` : "";
+    const thinkingChunks =
+      this.thinkingLevel === "off"
+        ? []
+        : [
+            `Inspecting request with ${this.selectedModel.label} (thinking: ${this.thinkingLevel}).\n`,
+            `Checking active session context and workspace files before drafting a response.`,
+          ];
     const chunks = [
       `Working with **${this.selectedModel.label}** (thinking: \`${this.thinkingLevel}\`).${attachmentNote}\n\n`,
       `I inspected the active workspace for:\n> ${promptText.slice(0, 140)}\n\n`,
@@ -821,6 +931,20 @@ class BrowserPreviewRuntime {
 
     this.emit({ type: "message_start", message_id: msgId, role: "assistant" });
     this.emit({ type: "tool_execution_start", tool_call_id: toolId, tool_name: "read" });
+
+    let fullThinking = "";
+    thinkingChunks.forEach((chunk, index) => {
+      this.schedule(() => {
+        if (!this.streaming) return;
+        fullThinking += chunk;
+        this.emit({
+          type: "message_update",
+          message_id: msgId,
+          delta: null,
+          thinking_delta: chunk,
+        });
+      }, 140 + index * 180);
+    });
 
     this.schedule(() => {
       if (!this.streaming) return;
@@ -832,13 +956,14 @@ class BrowserPreviewRuntime {
       });
     }, 280);
 
+    const textStartMs = 140 + thinkingChunks.length * 180 + 180;
     let fullText = "";
     chunks.forEach((chunk, index) => {
       this.schedule(() => {
         if (!this.streaming) return;
         fullText += chunk;
         this.emit({ type: "message_update", message_id: msgId, delta: chunk });
-      }, 360 + index * 220);
+      }, textStartMs + index * 220);
     });
 
     this.schedule(() => {
@@ -851,12 +976,19 @@ class BrowserPreviewRuntime {
           id: msgId,
           role: "assistant",
           content: fullText,
+          thinking: fullThinking || undefined,
           timestamp: this.nowLabel(),
           toolCalls: [{ id: toolId, name: "read", status: "done" }],
         },
       ]);
       this.updateSessionCount(this.activeSessionId);
-      this.emit({ type: "message_end", message_id: msgId, stop_reason: "end_turn" });
+      this.emit({
+        type: "message_end",
+        message_id: msgId,
+        stop_reason: "end_turn",
+        text: fullText,
+        thinking: fullThinking || null,
+      });
       this.emit({ type: "agent_settled", summary: "Turn complete" });
 
       if (this.pendingQueue.length > 0) {
@@ -866,7 +998,7 @@ class BrowserPreviewRuntime {
           this.streamAssistantReply(next, 0);
         }
       }
-    }, 360 + chunks.length * 220 + 180);
+    }, textStartMs + chunks.length * 220 + 180);
   }
 
   steer(message: string): void {

@@ -700,6 +700,78 @@ export const STARTER_SUGGESTIONS: readonly StarterSuggestion[] = [
 ];
 
 // ============================================================
+// Thinking Indicator (3-Dot Constellation) & Thinking Panel
+// ============================================================
+
+function ThinkingConstellation({ animated }: { readonly animated: boolean }) {
+  return (
+    <span
+      className={`pi-constellation${animated ? " pi-constellation--animated" : ""}`}
+      aria-hidden="true"
+    >
+      <span className="pi-constellation-dot pi-constellation-dot--1" />
+      <span className="pi-constellation-dot pi-constellation-dot--2" />
+      <span className="pi-constellation-dot pi-constellation-dot--3" />
+    </span>
+  );
+}
+
+function ThinkingIndicator() {
+  return (
+    <div className="pi-thinking-indicator" role="status" aria-live="polite">
+      <ThinkingConstellation animated />
+      <span className="pi-thinking-label">Thinking...</span>
+    </div>
+  );
+}
+
+function ThinkingPanel({
+  thinking,
+  streaming,
+  hasContent,
+}: {
+  readonly thinking: string;
+  readonly streaming: boolean;
+  readonly hasContent: boolean;
+}) {
+  const [expanded, setExpanded] = useState(true);
+
+  return (
+    <div
+      className={`pi-thinking-panel${streaming ? " pi-thinking-panel--streaming" : ""}`}
+    >
+      <button
+        type="button"
+        className="pi-thinking-header"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+      >
+        <span className="pi-thinking-header-left">
+          <ThinkingConstellation animated={streaming} />
+          <span className="pi-thinking-label">
+            {streaming ? "Thinking..." : "Thinking"}
+          </span>
+        </span>
+        <span className={`pi-thinking-chevron${expanded ? " expanded" : ""}`}>
+          <ChevronRightIcon size={14} />
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="pi-thinking-body">
+          <pre className="pi-thinking-content">
+            {thinking}
+            {streaming && !hasContent && (
+              <span className="pi-streaming-caret" aria-hidden="true" />
+            )}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
 // ChatTranscript
 // ============================================================
 
@@ -712,16 +784,28 @@ export function ChatTranscript({
   onPickStarterPrompt,
 }: ChatTranscriptProps) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+  const lastContentLength = lastMessage?.content.length ?? 0;
+  const lastThinkingLength = lastMessage?.thinking?.length ?? 0;
+  const hasStreamingAssistantMessage = messages.some(
+    (m) => m.role === "assistant" && Boolean(m.streaming)
+  );
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, isStreaming, liveTools.length]);
+  }, [
+    messages.length,
+    isStreaming,
+    liveTools.length,
+    lastContentLength,
+    lastThinkingLength,
+  ]);
 
   return (
     <div className="pi-transcript-shell">
       <div className="pi-transcript-scroll" role="log" aria-live="polite">
         <div className="pi-transcript-inner">
-          {messages.length === 0 ? (
+          {messages.length === 0 && !isStreaming ? (
             <div className="pi-empty-hero">
               <h2 className="pi-empty-title">Where should we start?</h2>
               {onPickStarterPrompt && (
@@ -743,54 +827,107 @@ export function ChatTranscript({
               )}
             </div>
           ) : (
-            messages.map((message) => (
-              <article key={message.id} className={`pi-message-row ${message.role}`}>
-                <div className="pi-message-header">
-                  {message.role === "assistant" ? (
+            <>
+              {messages.map((message) => {
+                const hasThinking = Boolean(
+                  message.thinking && message.thinking.trim().length > 0
+                );
+                const hasContent = message.content.trim().length > 0;
+                const isAssistantStreaming =
+                  message.role === "assistant" && Boolean(message.streaming);
+
+                return (
+                  <article key={message.id} className={`pi-message-row ${message.role}`}>
+                    <div className="pi-message-header">
+                      {message.role === "assistant" ? (
+                        <span className="pi-role-avatar assistant" aria-hidden="true">
+                          <VerityLogoMark size={13} strokeWidth={2.1} />
+                        </span>
+                      ) : message.role === "user" ? (
+                        <span className="pi-role-avatar user" aria-hidden="true">
+                          U
+                        </span>
+                      ) : (
+                        <span className="pi-role-avatar system" aria-hidden="true">
+                          <InfoIcon size={12} />
+                        </span>
+                      )}
+                      <span className="pi-message-role">
+                        {message.role === "user"
+                          ? "You"
+                          : message.role === "assistant"
+                            ? "Verity"
+                            : "System"}
+                      </span>
+                      <span className="pi-message-time">{message.timestamp}</span>
+                    </div>
+
+                    <div className={`pi-message-bubble ${message.role}`}>
+                      {message.attachments && message.attachments.length > 0 && (
+                        <div className="pi-message-attachments">
+                          {message.attachments.map((att) => (
+                            <span key={att.filename} className="pi-attachment-thumb">
+                              <img
+                                src={`data:${att.mime_type};base64,${att.base64_data}`}
+                                alt={att.filename}
+                              />
+                              <span>{att.filename}</span>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      {message.role === "assistant" ? (
+                        <>
+                          {hasThinking ? (
+                            <ThinkingPanel
+                              thinking={message.thinking ?? ""}
+                              streaming={isAssistantStreaming}
+                              hasContent={hasContent}
+                            />
+                          ) : (
+                            isAssistantStreaming && <ThinkingIndicator />
+                          )}
+
+                          {hasContent && (
+                            <MarkdownView
+                              content={message.content}
+                              streaming={isAssistantStreaming}
+                            />
+                          )}
+                        </>
+                      ) : (
+                        <MarkdownView
+                          content={message.content}
+                          streaming={message.streaming}
+                        />
+                      )}
+                    </div>
+
+                    {message.toolCalls && message.toolCalls.length > 0 && (
+                      <ToolCallList tools={message.toolCalls} />
+                    )}
+                  </article>
+                );
+              })}
+
+              {isStreaming && !hasStreamingAssistantMessage && (
+                <article
+                  className="pi-message-row assistant pi-message-row--pending"
+                  aria-busy="true"
+                >
+                  <div className="pi-message-header">
                     <span className="pi-role-avatar assistant" aria-hidden="true">
                       <VerityLogoMark size={13} strokeWidth={2.1} />
                     </span>
-                  ) : message.role === "user" ? (
-                    <span className="pi-role-avatar user" aria-hidden="true">
-                      U
-                    </span>
-                  ) : (
-                    <span className="pi-role-avatar system" aria-hidden="true">
-                      <InfoIcon size={12} />
-                    </span>
-                  )}
-                  <span className="pi-message-role">
-                    {message.role === "user"
-                      ? "You"
-                      : message.role === "assistant"
-                        ? "Verity"
-                        : "System"}
-                  </span>
-                  <span className="pi-message-time">{message.timestamp}</span>
-                </div>
-
-                <div className={`pi-message-bubble ${message.role}`}>
-                  {message.attachments && message.attachments.length > 0 && (
-                    <div className="pi-message-attachments">
-                      {message.attachments.map((att) => (
-                        <span key={att.filename} className="pi-attachment-thumb">
-                          <img
-                            src={`data:${att.mime_type};base64,${att.base64_data}`}
-                            alt={att.filename}
-                          />
-                          <span>{att.filename}</span>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  <MarkdownView content={message.content} streaming={message.streaming} />
-                </div>
-
-                {message.toolCalls && message.toolCalls.length > 0 && (
-                  <ToolCallList tools={message.toolCalls} />
-                )}
-              </article>
-            ))
+                    <span className="pi-message-role">Verity</span>
+                  </div>
+                  <div className="pi-message-bubble assistant">
+                    <ThinkingIndicator />
+                  </div>
+                </article>
+              )}
+            </>
           )}
 
           {liveTools.length > 0 && (
