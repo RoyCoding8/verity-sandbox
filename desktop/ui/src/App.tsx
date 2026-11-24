@@ -74,7 +74,7 @@ function toSessionStatsView(stats: PiSessionStats | null): SessionStatsView | nu
 }
 
 export function App() {
-  const { state, projectSessions, activeSession, actions } = usePiWorkspace();
+  const { state, activeSession, actions } = usePiWorkspace();
   const desktopRuntime = isTauriRuntime();
 
   const [verityPanelOpen, setVerityPanelOpen] = useState(false);
@@ -483,7 +483,7 @@ export function App() {
       <Sidebar
         projects={state.projects}
         activeProjectId={state.activeProjectId}
-        sessions={projectSessions}
+        sessions={state.sessions}
         activeSessionId={state.activeSessionId}
         theme={state.theme}
         isDesktop={desktopRuntime}
@@ -492,8 +492,10 @@ export function App() {
         onAddProject={(path) => void actions.addProject(path)}
         onRemoveProject={(path) => void actions.removeProject(path)}
         onSelectSession={(s) => void actions.switchSession(s)}
-        onCreateSession={() => void actions.createSession()}
+        onCreateSession={(projectPath) => void actions.createSession(projectPath)}
         onRenameSession={(id, name) => void actions.renameSession(id, name)}
+        onArchiveSession={(id, archived) => void actions.archiveSession(id, archived)}
+        onDeleteSession={(id) => void actions.deleteSession(id)}
         onOpenHistoryTree={() => void actions.openHistoryTree()}
         onOpenFork={() => void actions.openForkModal()}
         onCloneSession={() => void actions.cloneCurrentSession()}

@@ -1178,8 +1178,23 @@ function ThinkingPanel({
   readonly streaming: boolean;
   readonly hasContent: boolean;
 }) {
-  const [expanded, setExpanded] = useState(() => streaming);
   const isThinkingActive = streaming && !hasContent;
+  const [expanded, setExpanded] = useState(() => isThinkingActive);
+  const userToggledRef = useRef(false);
+  const prevHasContentRef = useRef(hasContent);
+
+  useEffect(() => {
+    const contentJustArrived = !prevHasContentRef.current && hasContent;
+    prevHasContentRef.current = hasContent;
+
+    if (userToggledRef.current) return;
+
+    if (isThinkingActive) {
+      setExpanded(true);
+    } else if (contentJustArrived || !streaming) {
+      setExpanded(false);
+    }
+  }, [isThinkingActive, hasContent, streaming]);
 
   return (
     <div
@@ -1189,7 +1204,10 @@ function ThinkingPanel({
         type="button"
         className="pi-thinking-header"
         aria-expanded={expanded}
-        onClick={() => setExpanded((prev) => !prev)}
+        onClick={() => {
+          userToggledRef.current = true;
+          setExpanded((prev) => !prev);
+        }}
       >
         <span className="pi-thinking-header-left">
           <ThinkingConstellation animated={isThinkingActive} />

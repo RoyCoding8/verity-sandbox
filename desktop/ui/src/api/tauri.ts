@@ -116,6 +116,7 @@ export interface PiSessionSummary {
   readonly updatedAt: string;
   readonly messageCount: number;
   readonly parentSessionId?: string;
+  readonly archived?: boolean;
 }
 
 export interface PiToolCallState {
@@ -178,6 +179,7 @@ export type PiUiEvent =
       readonly message_id: string | null;
       readonly delta: string | null;
       readonly thinking_delta?: string | null;
+      readonly content?: string | null;
     }
   | {
       readonly type: "message_end";
@@ -424,6 +426,75 @@ function readString(obj: Record<string, unknown>, key: string): string | null {
   return typeof v === "string" ? v : null;
 }
 
+/** Preserves whitespace-only strings (e.g. " " and "\n") while treating "" as absent. */
+function readNonEmptyRawString(obj: Record<string, unknown>, key: string): string | null {
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+interface ExtractedStreamingDelta {
+  readonly delta: string | null;
+  readonly thinkingDelta: string | null;
+  readonly content: string | null;
+}
+
+function extractDeltaFromNestedEvent(
+  ev: Record<string, unknown> | null
+): ExtractedStreamingDelta {
+  if (!ev) return { delta: null, thinkingDelta: null, content: null };
+  const evType = readString(ev, "type");
+  if (evType === "thinking_delta" || evType === "reasoning_delta") {
+    return {
+      delta: null,
+      thinkingDelta:
+        readNonEmptyRawString(ev, "delta") ??
+        readNonEmptyRawString(ev, "thinking") ??
+        readNonEmptyRawString(ev, "text"),
+      content: null,
+    };
+  }
+  if (evType === "text_delta") {
+    return {
+      delta: readNonEmptyRawString(ev, "delta") ?? readNonEmptyRawString(ev, "text"),
+      thinkingDelta: null,
+      content: null,
+    };
+  }
+  if (evType === "text_end") {
+    return {
+      delta: null,
+      thinkingDelta: null,
+      content: readNonEmptyRawString(ev, "content") ?? readNonEmptyRawString(ev, "text"),
+    };
+  }
+  if (evType === "content_block_delta") {
+    const innerDelta = ev["delta"];
+    if (isRecord(innerDelta)) {
+      return extractDeltaFromNestedEvent(innerDelta);
+    }
+    return {
+      delta: readNonEmptyRawString(ev, "delta") ?? readNonEmptyRawString(ev, "text"),
+      thinkingDelta:
+        readNonEmptyRawString(ev, "thinking_delta") ??
+        readNonEmptyRawString(ev, "thinkingDelta") ??
+        readNonEmptyRawString(ev, "thinking"),
+      content: null,
+    };
+  }
+  const nestedDelta = ev["delta"];
+  if (isRecord(nestedDelta)) {
+    return extractDeltaFromNestedEvent(nestedDelta);
+  }
+  return {
+    delta: readNonEmptyRawString(ev, "delta") ?? readNonEmptyRawString(ev, "text"),
+    thinkingDelta:
+      readNonEmptyRawString(ev, "thinking_delta") ??
+      readNonEmptyRawString(ev, "thinkingDelta") ??
+      readNonEmptyRawString(ev, "thinking"),
+    content: null,
+  };
+}
+
 function readNumber(obj: Record<string, unknown>, key: string): number | null {
   const v = obj[key];
   return typeof v === "number" && Number.isFinite(v) ? v : null;
@@ -584,7 +655,8 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
       }
       return { type, message_id: messageId, role };
     }
-    case "message_update": {
+    case "message_update":
+    case "content_block_delta": {
       const directMsg = isRecord(raw["message"]) ? raw["message"] : null;
       let messageId =
         readString(raw, "message_id") ??
@@ -594,45 +666,68 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
             readString(directMsg, "messageId") ??
             readString(directMsg, "message_id")
           : null);
-      let delta = readString(raw, "delta");
+      let delta = readNonEmptyRawString(raw, "delta");
       let thinkingDelta =
-        readString(raw, "thinking_delta") ?? readString(raw, "thinkingDelta");
-      if (!delta && !thinkingDelta) {
-        const directAssistantEvent = isRecord(raw["assistantMessageEvent"])
-          ? raw["assistantMessageEvent"]
-          : null;
-        const rawJson = directAssistantEvent ? null : parseRawJsonRecord(raw);
-        const assistantEvent =
-          directAssistantEvent ??
-          (rawJson && isRecord(rawJson["assistantMessageEvent"])
-            ? rawJson["assistantMessageEvent"]
-            : null);
+        readNonEmptyRawString(raw, "thinking_delta") ??
+        readNonEmptyRawString(raw, "thinkingDelta");
+      let content: string | null = null;
+
+      // Handle Anthropic-style nested `delta: { type: "text_delta", text }` / `{ type: "thinking_delta", thinking }`
+      if (!delta && !thinkingDelta && isRecord(raw["delta"])) {
+        const extracted = extractDeltaFromNestedEvent(raw["delta"]);
+        delta = extracted.delta;
+        thinkingDelta = extracted.thinkingDelta;
+        content = extracted.content;
+      }
+
+      if (!delta && !thinkingDelta && !content) {
+        const directNestedEvent =
+          (isRecord(raw["assistantMessageEvent"]) ? raw["assistantMessageEvent"] : null) ??
+          (isRecord(raw["assistant_message_event"]) ? raw["assistant_message_event"] : null) ??
+          (isRecord(raw["content_block_delta"]) ? raw["content_block_delta"] : null);
+        const rawJson = directNestedEvent ? null : parseRawJsonRecord(raw);
         if (!messageId && rawJson) {
           const nestedMsg = isRecord(rawJson["message"]) ? rawJson["message"] : null;
           messageId =
-            (nestedMsg ? readString(nestedMsg, "id") : null) ??
+            (nestedMsg
+              ? readString(nestedMsg, "id") ??
+                readString(nestedMsg, "messageId") ??
+                readString(nestedMsg, "message_id")
+              : null) ??
             readString(rawJson, "messageId") ??
             readString(rawJson, "message_id");
         }
-        if (assistantEvent) {
-          const evType = readString(assistantEvent, "type");
-          if (evType === "thinking_delta" || evType === "reasoning_delta") {
-            thinkingDelta =
-              readString(assistantEvent, "delta") ??
-              readString(assistantEvent, "thinking") ??
-              readString(assistantEvent, "text");
-          } else if (evType === "text_delta") {
-            delta =
-              readString(assistantEvent, "delta") ??
-              readString(assistantEvent, "text");
-          }
+        const nestedEvent =
+          directNestedEvent ??
+          (rawJson && isRecord(rawJson["assistantMessageEvent"])
+            ? rawJson["assistantMessageEvent"]
+            : null) ??
+          (rawJson && isRecord(rawJson["assistant_message_event"])
+            ? rawJson["assistant_message_event"]
+            : null) ??
+          (rawJson && isRecord(rawJson["content_block_delta"])
+            ? rawJson["content_block_delta"]
+            : null) ??
+          (rawJson && isRecord(rawJson["delta"]) ? rawJson["delta"] : null);
+
+        if (nestedEvent) {
+          const extracted = extractDeltaFromNestedEvent(nestedEvent);
+          delta = extracted.delta;
+          thinkingDelta = extracted.thinkingDelta;
+          content = extracted.content;
+        } else if (rawJson) {
+          delta = readNonEmptyRawString(rawJson, "delta");
+          thinkingDelta =
+            readNonEmptyRawString(rawJson, "thinking_delta") ??
+            readNonEmptyRawString(rawJson, "thinkingDelta");
         }
       }
       return {
-        type,
+        type: "message_update",
         message_id: messageId,
         delta,
         thinking_delta: thinkingDelta,
+        ...(content !== null ? { content } : {}),
       };
     }
     case "message_end": {
@@ -1269,6 +1364,42 @@ class BrowserPreviewRuntime {
       return s;
     });
     return updated;
+  }
+
+  archiveSession(sessionId: string, archived: boolean): PiBootstrapData {
+    this.sessions = this.sessions.map((s) =>
+      s.id === sessionId ? { ...s, archived } : s
+    );
+    if (archived && this.activeSessionId === sessionId) {
+      this.cancelInFlightWork();
+      const nextActive =
+        this.sessions.find((s) => s.projectId === this.activeProjectId && !s.archived) ??
+        this.sessions.find((s) => !s.archived);
+      this.activeSessionId = nextActive?.id ?? "";
+      if (nextActive) {
+        this.activeProjectId = nextActive.projectId;
+      }
+    }
+    return this.bootstrap();
+  }
+
+  deleteSession(sessionId: string): PiBootstrapData {
+    if (this.activeSessionId === sessionId) {
+      this.cancelInFlightWork();
+    }
+    this.sessions = this.sessions.filter((s) => s.id !== sessionId);
+    this.messagesBySession.delete(sessionId);
+    if (this.activeSessionId === sessionId) {
+      const nextActive =
+        this.sessions.find((s) => s.projectId === this.activeProjectId && !s.archived) ??
+        this.sessions.find((s) => !s.archived) ??
+        this.sessions[0];
+      this.activeSessionId = nextActive?.id ?? "";
+      if (nextActive) {
+        this.activeProjectId = nextActive.projectId;
+      }
+    }
+    return this.bootstrap();
   }
 
   getHistoryTree(): readonly HistoryTreeNode[] {
@@ -1937,6 +2068,20 @@ export const tauriApi = {
     return invoke<PiSessionSummary>("pi_set_session_name", { sessionId, name });
   },
 
+  async piArchiveSession(sessionId: string, archived: boolean): Promise<PiBootstrapData> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.archiveSession(sessionId, archived);
+    }
+    return invoke<PiBootstrapData>("pi_archive_session", { sessionId, archived });
+  },
+
+  async piDeleteSession(sessionId: string): Promise<PiBootstrapData> {
+    if (!isTauriRuntime()) {
+      return previewRuntime.deleteSession(sessionId);
+    }
+    return invoke<PiBootstrapData>("pi_delete_session", { sessionId });
+  },
+
   async getHistoryTree(): Promise<readonly HistoryTreeNode[]> {
     if (!isTauriRuntime()) {
       return previewRuntime.getHistoryTree();
@@ -2381,3 +2526,7 @@ export const piRedoRevert = (): Promise<RedoRevertResult> =>
   tauriApi.piRedoRevert();
 export const piGetCommands = (): Promise<PiCommandInfo[]> =>
   tauriApi.piGetCommands();
+export const piArchiveSession = (sessionId: string, archived: boolean): Promise<PiBootstrapData> =>
+  tauriApi.piArchiveSession(sessionId, archived);
+export const piDeleteSession = (sessionId: string): Promise<PiBootstrapData> =>
+  tauriApi.piDeleteSession(sessionId);
