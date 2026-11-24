@@ -224,8 +224,7 @@ pub fn delete_session_file_with_root(
         ));
     }
 
-    fs::remove_file(&canon_file)
-        .map_err(|e| format!("failed to delete session file: {}", e))?;
+    fs::remove_file(&canon_file).map_err(|e| format!("failed to delete session file: {}", e))?;
     Ok(true)
 }
 
@@ -380,7 +379,10 @@ impl ProjectRegistry {
     /// Removes a project matching `path`. If it was active and another project remains,
     /// switches `active_project_path` to the next available project.
     /// Returns `(removed, active_changed, new_active_project)`.
-    pub fn remove_project(&mut self, path: &Path) -> Result<(bool, bool, Option<PiProject>), String> {
+    pub fn remove_project(
+        &mut self,
+        path: &Path,
+    ) -> Result<(bool, bool, Option<PiProject>), String> {
         let raw_str = path.to_string_lossy().to_string();
         if raw_str.trim().is_empty() {
             return Err("project path must not be empty".to_string());
@@ -508,7 +510,12 @@ pub fn default_pi_sessions_root() -> Option<PathBuf> {
     }
     non_empty_env("HOME")
         .or_else(|| non_empty_env("USERPROFILE"))
-        .map(|home| PathBuf::from(home).join(".pi").join("agent").join("sessions"))
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".pi")
+                .join("agent")
+                .join("sessions")
+        })
 }
 
 /// Scans Pi `.jsonl` session files on disk for a specific project `cwd`, tagging archived state.
@@ -606,12 +613,9 @@ pub fn scan_project_sessions_with_root_and_archived(
             if !seen_files.insert(norm_file) {
                 continue;
             }
-            if let Some(mut summary) = parse_jsonl_session_file(
-                &file_path,
-                project_id,
-                &canonical_cwd,
-                require_cwd_match,
-            ) {
+            if let Some(mut summary) =
+                parse_jsonl_session_file(&file_path, project_id, &canonical_cwd, require_cwd_match)
+            {
                 summary.archived = archived_ids.contains(&summary.id);
                 sessions.push(summary);
             }
@@ -681,8 +685,10 @@ pub fn parse_jsonl_session_file(
     let mut name = opt_json_str(&header, &["name", "sessionName", "session_name", "title"]);
     let mut updated_at = opt_json_str(&header, &["timestamp", "updatedAt", "updated_at"])
         .unwrap_or_else(|| file_mtime_string(file_path));
-    let parent_session_id =
-        opt_json_str(&header, &["parentSession", "parentSessionId", "parent_session_id"]);
+    let parent_session_id = opt_json_str(
+        &header,
+        &["parentSession", "parentSessionId", "parent_session_id"],
+    );
 
     let mut message_count: usize = 0;
     for line_res in lines {
@@ -825,7 +831,10 @@ mod tests {
         // Removing the active project switches active to the remaining project (beta).
         let (reg5, next_active) = remove_project(&store_path, &proj_a).unwrap();
         assert_eq!(reg5.projects.len(), 1);
-        assert_eq!(next_active.as_ref().map(|p| p.id.as_str()), Some(added_b.id.as_str()));
+        assert_eq!(
+            next_active.as_ref().map(|p| p.id.as_str()),
+            Some(added_b.id.as_str())
+        );
         assert_eq!(
             reg5.active_project_path.as_deref(),
             Some(added_b.path.as_str())
@@ -1010,29 +1019,41 @@ mod tests {
         let local_sess = local_dir.join("l1.jsonl");
         let outside_jsonl = proj.join("important.jsonl");
         let non_jsonl = local_dir.join("notes.txt");
-        fs::write(&global_sess, "{}
-").unwrap();
-        fs::write(&local_sess, "{}
-").unwrap();
-        fs::write(&outside_jsonl, "{}
-").unwrap();
-        fs::write(&non_jsonl, "keep
-").unwrap();
+        fs::write(
+            &global_sess,
+            "{}
+",
+        )
+        .unwrap();
+        fs::write(
+            &local_sess,
+            "{}
+",
+        )
+        .unwrap();
+        fs::write(
+            &outside_jsonl,
+            "{}
+",
+        )
+        .unwrap();
+        fs::write(
+            &non_jsonl, "keep
+",
+        )
+        .unwrap();
 
         // Rejects non-jsonl files even inside .pi/sessions/
-        assert!(delete_session_file_with_root(
-            &non_jsonl.to_string_lossy(),
-            Some(&pi_root)
-        )
-        .is_err());
+        assert!(
+            delete_session_file_with_root(&non_jsonl.to_string_lossy(), Some(&pi_root)).is_err()
+        );
         assert!(non_jsonl.exists());
 
         // Rejects .jsonl files outside Pi sessions directories
-        assert!(delete_session_file_with_root(
-            &outside_jsonl.to_string_lossy(),
-            Some(&pi_root)
-        )
-        .is_err());
+        assert!(
+            delete_session_file_with_root(&outside_jsonl.to_string_lossy(), Some(&pi_root))
+                .is_err()
+        );
         assert!(outside_jsonl.exists());
 
         // Allows deleting .jsonl inside global Pi sessions root

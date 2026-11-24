@@ -114,9 +114,7 @@ fn kill_tree(pid: u32) {
     {
         let pgid_arg = format!("-{}", pid);
         let pid_str = pid.to_string();
-        let _ = Command::new("kill")
-            .args(["-9", "--", &pgid_arg])
-            .status();
+        let _ = Command::new("kill").args(["-9", "--", &pgid_arg]).status();
         let _ = Command::new("pkill").args(["-9", "-P", &pid_str]).status();
         let _ = Command::new("kill").args(["-9", &pid_str]).status();
     }

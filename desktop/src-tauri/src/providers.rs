@@ -210,8 +210,13 @@ pub fn ensure_verity_pi_extension_at(path: &Path) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("extension path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("failed to create extension directory {}: {}", parent.display(), e))?;
+    fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "failed to create extension directory {}: {}",
+            parent.display(),
+            e
+        )
+    })?;
 
     let file_name = path
         .file_name()
@@ -223,12 +228,22 @@ pub fn ensure_verity_pi_extension_at(path: &Path) -> Result<PathBuf, String> {
     let write_result = (|| -> Result<(), String> {
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
-        let mut file = opts
-            .open(&tmp_path)
-            .map_err(|e| format!("failed to create temp extension {}: {}", tmp_path.display(), e))?;
+        let mut file = opts.open(&tmp_path).map_err(|e| {
+            format!(
+                "failed to create temp extension {}: {}",
+                tmp_path.display(),
+                e
+            )
+        })?;
         file.write_all(VERITY_PI_EXTENSION_SOURCE.as_bytes())
             .and_then(|_| file.sync_all())
-            .map_err(|e| format!("failed to write temp extension {}: {}", tmp_path.display(), e))?;
+            .map_err(|e| {
+                format!(
+                    "failed to write temp extension {}: {}",
+                    tmp_path.display(),
+                    e
+                )
+            })?;
         drop(file);
 
         fs::rename(&tmp_path, path).map_err(|e| {
@@ -953,12 +968,7 @@ mod tests {
                 .join("providers.json")
         );
         assert_eq!(
-            resolve_store_path_from_env(
-                Some(""),
-                Some(" \t "),
-                Some("C:"),
-                Some("\\Users\\alice")
-            ),
+            resolve_store_path_from_env(Some(""), Some(" \t "), Some("C:"), Some("\\Users\\alice")),
             PathBuf::from("C:\\Users\\alice")
                 .join(".verity")
                 .join("providers.json")

@@ -113,7 +113,7 @@ fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
     }
     let mut i = 0;
     while i < a.len() {
-        if a[i].to_ascii_uppercase() != b[i].to_ascii_uppercase() {
+        if !a[i].eq_ignore_ascii_case(&b[i]) {
             return false;
         }
         i += 1;

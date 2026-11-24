@@ -179,7 +179,8 @@ impl<'a> Parser<'a> {
             self.bytes[self.pos + 2],
             self.bytes[self.pos + 3],
         ];
-        let unit = parse_hex4_bytes(hex4).ok_or_else(|| self.err("invalid hex in unicode escape"))?;
+        let unit =
+            parse_hex4_bytes(hex4).ok_or_else(|| self.err("invalid hex in unicode escape"))?;
         self.pos += 4;
         Ok(unit)
     }
@@ -421,8 +422,14 @@ mod tests {
         assert_eq!(mixed.as_str(), Some("ship 🚀 + é + 🎉"));
 
         assert_eq!(decode_utf16_surrogate_pair(0xD83D, 0xDE80), Some('🚀'));
-        assert_eq!(decode_utf16_surrogate_pair(0xD800, 0xDC00), Some('\u{10000}'));
-        assert_eq!(decode_utf16_surrogate_pair(0xDBFF, 0xDFFF), Some('\u{10FFFF}'));
+        assert_eq!(
+            decode_utf16_surrogate_pair(0xD800, 0xDC00),
+            Some('\u{10000}')
+        );
+        assert_eq!(
+            decode_utf16_surrogate_pair(0xDBFF, 0xDFFF),
+            Some('\u{10FFFF}')
+        );
     }
 
     #[test]
@@ -468,7 +475,10 @@ mod tests {
                 !validate_json_number_bytes(invalid.as_bytes()),
                 "expected invalid: {invalid}"
             );
-            assert!(parse_json(invalid).is_err(), "expected parse err: {invalid}");
+            assert!(
+                parse_json(invalid).is_err(),
+                "expected parse err: {invalid}"
+            );
         }
     }
 
@@ -477,10 +487,16 @@ mod tests {
         let payload = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Deploying \uD83D\uDE80 to https:\/\/openrouter.ai\/api\/v1","partial":{"role":"assistant","provider":"openrouter","model":"anthropic\/claude-sonnet-5-5","usage":{"input":1240,"output":85,"cost":{"input":1.2e-06,"output":0.000425,"total":4.262e-4}}}}}"#;
 
         let val = parse_json(payload).unwrap();
-        assert_eq!(val.get("type").and_then(JsonValue::as_str), Some("message_update"));
+        assert_eq!(
+            val.get("type").and_then(JsonValue::as_str),
+            Some("message_update")
+        );
 
         let evt = val.get("assistantMessageEvent").unwrap();
-        assert_eq!(evt.get("type").and_then(JsonValue::as_str), Some("text_delta"));
+        assert_eq!(
+            evt.get("type").and_then(JsonValue::as_str),
+            Some("text_delta")
+        );
         assert_eq!(
             evt.get("delta").and_then(JsonValue::as_str),
             Some("Deploying 🚀 to https://openrouter.ai/api/v1")

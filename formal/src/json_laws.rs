@@ -127,7 +127,10 @@ pub fn prove_json_number_syntax_laws() {
         "number_valid_negative"
     );
     kani::cover!(valid && has_dot && !has_exp, "number_valid_decimal");
-    kani::cover!(valid && bytes == b"1.2e-6", "number_valid_scientific_1_2e_6");
+    kani::cover!(
+        valid && bytes == b"1.2e-6",
+        "number_valid_scientific_1_2e_6"
+    );
 
     // Rejected classes
     kani::cover!(!valid && len == 0, "number_reject_empty");
@@ -135,5 +138,8 @@ pub fn prove_json_number_syntax_laws() {
     kani::cover!(!valid && bytes == b"1.", "number_reject_dangling_dot");
     kani::cover!(!valid && bytes == b"1e", "number_reject_dangling_exp");
     kani::cover!(!valid && bytes == b"1e+", "number_reject_dangling_exp_plus");
-    kani::cover!(!valid && bytes == b"1e-", "number_reject_dangling_exp_minus");
+    kani::cover!(
+        !valid && bytes == b"1e-",
+        "number_reject_dangling_exp_minus"
+    );
 }

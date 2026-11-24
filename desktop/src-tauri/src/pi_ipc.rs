@@ -4,13 +4,13 @@ use crate::pi_session::{
     EventSink, PiRpcResponse, PiSessionConfig, PiSessionSupervisor, PiUiEvent, ReloadDisposition,
     ReloadHook,
 };
-pub use crate::projects::{PiProject, PiSessionSummary};
 use crate::projects::{
     default_projects_store_path, default_session_meta_path, delete_session_file,
     load_archived_session_ids_from, load_or_init_projects, merge_live_and_disk_sessions,
     project_from_path, scan_project_sessions_with_archived, set_session_archived_at,
     ProjectRegistry,
 };
+pub use crate::projects::{PiProject, PiSessionSummary};
 use crate::providers::{
     build_pi_provider_env, default_store_path, ensure_verity_pi_extension_path, ProviderStore,
     PublicProviderProfile,
@@ -1128,10 +1128,7 @@ impl PiAppState {
                 .lock()
                 .expect("supervisor lock poisoned");
             if let Some(existing) = guard.as_ref() {
-                let should_recycle = self
-                    .inner
-                    .provider_reload_pending
-                    .load(Ordering::Acquire)
+                let should_recycle = self.inner.provider_reload_pending.load(Ordering::Acquire)
                     && existing.activity().is_idle();
                 if existing.is_alive() && !should_recycle {
                     return Ok(Arc::clone(existing));
@@ -1283,11 +1280,8 @@ impl PiAppState {
     ) -> Vec<PiSessionSummary> {
         let mut all = Vec::new();
         for proj in projects {
-            let mut proj_sessions = scan_project_sessions_with_archived(
-                &proj.id,
-                Path::new(&proj.path),
-                archived_ids,
-            );
+            let mut proj_sessions =
+                scan_project_sessions_with_archived(&proj.id, Path::new(&proj.path), archived_ids);
             all.append(&mut proj_sessions);
         }
         all.sort_by(|a, b| {
@@ -1527,12 +1521,16 @@ impl PiAppState {
             .expect("active_session_id lock poisoned")
             .clone();
 
-        let live_sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink)).ok();
+        let live_sup = self
+            .ensure_supervisor_with_sink(Arc::clone(&event_sink))
+            .ok();
         let live_session = live_sup.as_ref().and_then(|sup| {
             sup.get_state()
                 .ok()
                 .and_then(|r| parse_data_json(&r))
-                .map(|v| parse_session_summary(&v, &active_project.id, "session-1", "Current session"))
+                .map(|v| {
+                    parse_session_summary(&v, &active_project.id, "session-1", "Current session")
+                })
         });
 
         if target_path.trim().is_empty() {
@@ -1671,8 +1669,7 @@ impl PiAppState {
                     )
                 });
             if current_path.as_deref() != Some(target_path) {
-                sup.switch_session(target_path)
-                    .map_err(|e| e.to_string())?;
+                sup.switch_session(target_path).map_err(|e| e.to_string())?;
             }
         }
 
@@ -1772,9 +1769,7 @@ impl PiAppState {
                 .selected_model
                 .lock()
                 .expect("selected_model lock poisoned") = Some(updated_model.clone());
-            self.inner
-                .model_pending_sync
-                .store(true, Ordering::Release);
+            self.inner.model_pending_sync.store(true, Ordering::Release);
             return Ok(updated_model);
         };
 
@@ -2017,9 +2012,7 @@ impl PiAppState {
                 let resp = sup.new_session(None).map_err(|e| e.to_string())?;
                 let project_id = project_from_path(&project_dir).id;
                 let summary = parse_data_json(&resp)
-                    .map(|v| {
-                        parse_session_summary(&v, &project_id, "session-new", "New session")
-                    })
+                    .map(|v| parse_session_summary(&v, &project_id, "session-new", "New session"))
                     .unwrap_or_else(|| PiSessionSummary {
                         id: "session-new".to_string(),
                         project_id,
@@ -2276,7 +2269,10 @@ impl PiAppState {
         merge_models_with_fallback(rpc_models, provider_models, agent_models)
     }
 
-    pub fn cycle_model_with_sink(&self, event_sink: EventSink) -> Result<serde_json::Value, String> {
+    pub fn cycle_model_with_sink(
+        &self,
+        event_sink: EventSink,
+    ) -> Result<serde_json::Value, String> {
         let sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink))?;
         let current_model = self
             .inner
@@ -2419,10 +2415,7 @@ impl PiAppState {
             }
             _ => {
                 let levels = ThinkingLevel::all();
-                let cur_idx = levels
-                    .iter()
-                    .position(|&l| l == current_level)
-                    .unwrap_or(0);
+                let cur_idx = levels.iter().position(|&l| l == current_level).unwrap_or(0);
                 let next = levels[(cur_idx + 1) % levels.len()];
                 self.set_thinking_level_with_sink(event_sink, next)?
             }
@@ -2642,9 +2635,11 @@ pub async fn pi_set_thinking_level(
 ) -> Result<ThinkingLevel, String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
-    tauri::async_runtime::spawn_blocking(move || app_state.set_thinking_level_with_sink(sink, level))
-        .await
-        .map_err(|e| format!("blocking task failed: {}", e))?
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.set_thinking_level_with_sink(sink, level)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
@@ -2707,10 +2702,7 @@ pub async fn pi_follow_up(
 }
 
 #[tauri::command]
-pub async fn pi_clear_queue(
-    app: AppHandle,
-    state: State<'_, PiAppState>,
-) -> Result<(), String> {
+pub async fn pi_clear_queue(app: AppHandle, state: State<'_, PiAppState>) -> Result<(), String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
     tauri::async_runtime::spawn_blocking(move || app_state.clear_queue_with_sink(sink))
@@ -3009,9 +3001,11 @@ pub async fn pi_delete_session(
 ) -> Result<PiBootstrapData, String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
-    tauri::async_runtime::spawn_blocking(move || app_state.delete_session_with_sink(sink, session_id))
-        .await
-        .map_err(|e| format!("blocking task failed: {}", e))?
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.delete_session_with_sink(sink, session_id)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[cfg(test)]
@@ -3092,10 +3086,9 @@ mod tests {
         assert_eq!(msgs[1].timestamp, "1700000000000");
         assert_eq!(msgs[1].tool_calls.as_ref().unwrap()[0].name, "read");
 
-        let sess_val = parse_json(
-            r#"{"id":"s1","sessionFile":"/tmp/s1.jsonl","updatedAt":1700000000}"#,
-        )
-        .unwrap();
+        let sess_val =
+            parse_json(r#"{"id":"s1","sessionFile":"/tmp/s1.jsonl","updatedAt":1700000000}"#)
+                .unwrap();
         let sess = parse_session_summary(&sess_val, "p1", "fb", "Fallback");
         assert_eq!(sess.path, "/tmp/s1.jsonl");
         assert_eq!(sess.updated_at, "1700000000");
@@ -3680,7 +3673,11 @@ done
         let sink: EventSink = Arc::new(|_| {});
 
         let updated = state
-            .set_model_with_sink(Arc::clone(&sink), "openai".to_string(), "gpt-6.1-sol".to_string())
+            .set_model_with_sink(
+                Arc::clone(&sink),
+                "openai".to_string(),
+                "gpt-6.1-sol".to_string(),
+            )
             .expect("degraded set_model should succeed");
         assert_eq!(updated.provider, "openai");
         assert_eq!(updated.model_id, "gpt-6.1-sol");
@@ -3835,8 +3832,8 @@ done
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         let conf_path = manifest_dir.join("tauri.conf.json");
-        let conf_raw = fs::read_to_string(&conf_path)
-            .expect("desktop/src-tauri/tauri.conf.json must exist");
+        let conf_raw =
+            fs::read_to_string(&conf_path).expect("desktop/src-tauri/tauri.conf.json must exist");
         let conf = parse_json(&conf_raw).expect("tauri.conf.json must be valid JSON");
         let main_label = conf
             .get("app")
@@ -4120,7 +4117,10 @@ done
             .lines()
             .map(ToString::to_string)
             .collect();
-        let sw_idx = log_lines.iter().position(|c| c == "switch_session").unwrap();
+        let sw_idx = log_lines
+            .iter()
+            .position(|c| c == "switch_session")
+            .unwrap();
         let rn_idx = log_lines
             .iter()
             .position(|c| c == "set_session_name")
@@ -4182,11 +4182,8 @@ while IFS= read -r line; do
 done
 "#;
 
-        let state = PiAppState::with_config(
-            dir.clone(),
-            store_path,
-            mock_sh_config(dir.clone(), script),
-        );
+        let state =
+            PiAppState::with_config(dir.clone(), store_path, mock_sh_config(dir.clone(), script));
         let sink: EventSink = Arc::new(|_| {});
 
         state
@@ -4307,7 +4304,10 @@ done
             missing.code_revert_note.as_deref(),
             Some("No code snapshot was recorded for this turn.")
         );
-        assert_eq!(fs::read_to_string(&code_file).unwrap(), "fn main() { /* v2 */ }\n");
+        assert_eq!(
+            fs::read_to_string(&code_file).unwrap(),
+            "fn main() { /* v2 */ }\n"
+        );
 
         let reverted = state
             .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true)
@@ -4319,11 +4319,17 @@ done
         assert!(reverted.messages.is_empty());
         assert_eq!(reverted.restored_prompt.as_deref(), Some("Refactor main"));
         assert_eq!(reverted.reverted_files, vec!["main.rs".to_string()]);
-        assert_eq!(fs::read_to_string(&code_file).unwrap(), "fn main() { /* v1 */ }\n");
+        assert_eq!(
+            fs::read_to_string(&code_file).unwrap(),
+            "fn main() { /* v1 */ }\n"
+        );
 
         let redone = state.redo_revert_with_sink().unwrap();
         assert_eq!(redone.restored_files, vec!["main.rs".to_string()]);
-        assert_eq!(fs::read_to_string(&code_file).unwrap(), "fn main() { /* v2 */ }\n");
+        assert_eq!(
+            fs::read_to_string(&code_file).unwrap(),
+            "fn main() { /* v2 */ }\n"
+        );
 
         state.shutdown();
         match prev_vh {
@@ -4444,9 +4450,21 @@ done
         // Bootstrap must return sessions for BOTH registered projects, tagged with exact project_id.
         assert_eq!(boot.projects.len(), 2);
         assert_eq!(boot.active_project_id, proj_a_id);
-        let s_a1 = boot.sessions.iter().find(|s| s.id == "sess-a1").expect("sess-a1");
-        let s_a2 = boot.sessions.iter().find(|s| s.id == "sess-a2").expect("sess-a2");
-        let s_b1 = boot.sessions.iter().find(|s| s.id == "sess-b1").expect("sess-b1");
+        let s_a1 = boot
+            .sessions
+            .iter()
+            .find(|s| s.id == "sess-a1")
+            .expect("sess-a1");
+        let s_a2 = boot
+            .sessions
+            .iter()
+            .find(|s| s.id == "sess-a2")
+            .expect("sess-a2");
+        let s_b1 = boot
+            .sessions
+            .iter()
+            .find(|s| s.id == "sess-b1")
+            .expect("sess-b1");
         assert_eq!(s_a1.project_id, proj_a_id);
         assert_eq!(s_a2.project_id, proj_a_id);
         assert_eq!(s_b1.project_id, proj_b_id);
@@ -4456,23 +4474,27 @@ done
         let after_arch = state
             .archive_session_with_sink(Arc::clone(&sink), "sess-b1".to_string(), true)
             .unwrap();
-        assert!(after_arch
-            .sessions
-            .iter()
-            .find(|s| s.id == "sess-b1")
-            .unwrap()
-            .archived);
+        assert!(
+            after_arch
+                .sessions
+                .iter()
+                .find(|s| s.id == "sess-b1")
+                .unwrap()
+                .archived
+        );
 
         // Unarchive sess-b1.
         let after_unarch = state
             .archive_session_with_sink(Arc::clone(&sink), "sess-b1".to_string(), false)
             .unwrap();
-        assert!(!after_unarch
-            .sessions
-            .iter()
-            .find(|s| s.id == "sess-b1")
-            .unwrap()
-            .archived);
+        assert!(
+            !after_unarch
+                .sessions
+                .iter()
+                .find(|s| s.id == "sess-b1")
+                .unwrap()
+                .archived
+        );
 
         // Delete active session sess-a1: must delete a1.jsonl on disk and switch to sess-a2.
         let after_del_a1 = state

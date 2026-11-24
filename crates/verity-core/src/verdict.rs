@@ -278,9 +278,7 @@ pub fn classify_kani_core<C: CheckView>(
             },
             CheckKind::Cover => match check.status() {
                 CheckStatus::Satisfied => {}
-                CheckStatus::Unsatisfiable
-                | CheckStatus::Unreachable
-                | CheckStatus::Failure => {
+                CheckStatus::Unsatisfiable | CheckStatus::Unreachable | CheckStatus::Failure => {
                     if first_cover_unsatisfied.is_none() {
                         first_cover_unsatisfied = Some(check_index);
                     }

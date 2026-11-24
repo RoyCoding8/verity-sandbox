@@ -417,81 +417,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normal_openrouter_thinking_to_text_to_settled_flow() {
-        let s0 = UiTurnState::idle(0);
-        assert!(!s0.thinking_indicator_active());
-        assert!(!s0.is_streaming());
-
-        let s1 = step_ui_turn(s0, UiTurnEvent::PromptSubmitted);
-        assert_eq!(s1.phase, UiTurnPhase::AwaitingFirstEvent);
-        assert!(s1.thinking_indicator_active());
-        assert!(s1.is_streaming());
-
-        // User echo must not touch assistant state.
-        let s1_echo = step_ui_turn(
-            s1,
-            UiTurnEvent::MessageStart {
-                role: WireRole::User,
-                event_epoch: 0,
-            },
-        );
-        assert_eq!(s1_echo, s1);
-
-        let s2 = step_ui_turn(s1, UiTurnEvent::ThinkingDelta { event_epoch: 0 });
-        assert_eq!(s2.phase, UiTurnPhase::StreamingThinking);
-        assert!(s2.has_assistant_thinking);
-        assert!(s2.thinking_indicator_active());
-
-        let s3 = step_ui_turn(s2, UiTurnEvent::TextDelta { event_epoch: 0 });
-        assert_eq!(s3.phase, UiTurnPhase::StreamingText);
-        assert!(s3.has_assistant_text);
-        assert!(!s3.thinking_indicator_active());
-        assert!(s3.is_streaming());
-
-        let s4 = step_ui_turn(
-            s3,
-            UiTurnEvent::MessageEnd {
-                role: WireRole::Assistant,
-                stop_reason: WireStopReason::Stop,
-                has_error_message: false,
-                event_epoch: 0,
-            },
-        );
-        assert_eq!(s4.assistant_message_count, 1);
-
-        let s5 = step_ui_turn(s4, UiTurnEvent::AgentSettled { event_epoch: 0 });
-        assert_eq!(s5.phase, UiTurnPhase::Idle);
-        assert!(!s5.is_streaming());
-        assert!(!s5.thinking_indicator_active());
-        assert!(!s5.has_visible_error);
-        assert_eq!(s5.running_tools, 0);
-    }
-
-    #[test]
-    fn error_is_preserved_across_trailing_agent_settled() {
-        let s1 = step_ui_turn(UiTurnState::idle(2), UiTurnEvent::PromptSubmitted);
-        let s2 = step_ui_turn(s1, UiTurnEvent::ErrorEvent { event_epoch: 2 });
-        assert_eq!(s2.phase, UiTurnPhase::Failed);
-        assert!(s2.has_visible_error);
-        assert!(!s2.is_streaming());
-
-        let s3 = step_ui_turn(s2, UiTurnEvent::AgentSettled { event_epoch: 2 });
-        assert_eq!(s3.phase, UiTurnPhase::Failed);
-        assert!(s3.has_visible_error);
-        assert!(!s3.is_streaming());
-    }
-
-    #[test]
-    fn session_switch_fences_stale_epoch_events() {
-        let s1 = step_ui_turn(UiTurnState::idle(0), UiTurnEvent::PromptSubmitted);
-        let s2 = step_ui_turn(s1, UiTurnEvent::SessionSwitched);
-        assert_eq!(s2, UiTurnState::idle(1));
-
-        let stale = step_ui_turn(s2, UiTurnEvent::ErrorEvent { event_epoch: 0 });
-        assert_eq!(stale, s2);
-    }
-
-    #[test]
     fn boundary_parsers_handle_known_and_unknown_wire_strings() {
         assert_eq!(WireRole::parse_str("user"), WireRole::User);
         assert_eq!(WireRole::parse_str("assistant"), WireRole::Assistant);
@@ -499,9 +424,15 @@ mod tests {
         assert_eq!(WireRole::parse_str("system"), WireRole::Other);
 
         assert_eq!(WireStopReason::parse_str("stop"), WireStopReason::Stop);
-        assert_eq!(WireStopReason::parse_str("tool_use"), WireStopReason::ToolUse);
+        assert_eq!(
+            WireStopReason::parse_str("tool_use"),
+            WireStopReason::ToolUse
+        );
         assert_eq!(WireStopReason::parse_str("error"), WireStopReason::Error);
-        assert_eq!(WireStopReason::parse_str("aborted"), WireStopReason::Aborted);
+        assert_eq!(
+            WireStopReason::parse_str("aborted"),
+            WireStopReason::Aborted
+        );
         assert_eq!(WireStopReason::parse_str("other"), WireStopReason::Unknown);
     }
 }

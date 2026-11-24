@@ -254,11 +254,9 @@ pub async fn spawn_write_subagent(input: SpawnWriteTaskInput) -> Result<HandoffV
 
 #[tauri::command]
 pub async fn list_handoffs(repo_path: String) -> Result<Vec<HandoffView>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        list_persisted_handoffs(&PathBuf::from(repo_path))
-    })
-    .await
-    .map_err(|e| format!("blocking task failed: {}", e))?
+    tauri::async_runtime::spawn_blocking(move || list_persisted_handoffs(&PathBuf::from(repo_path)))
+        .await
+        .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]

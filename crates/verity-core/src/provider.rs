@@ -125,7 +125,7 @@ fn eq_ignore_ascii_case_bytes(a: &[u8], b: &[u8]) -> bool {
     }
     let mut i = 0usize;
     while i < a.len() {
-        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+        if !a[i].eq_ignore_ascii_case(&b[i]) {
             return false;
         }
         i += 1;
@@ -154,7 +154,7 @@ fn is_valid_port_bytes(port: &[u8]) -> bool {
         value = value * 10 + (b - b'0') as u32;
         p += 1;
     }
-    value >= 1 && value <= 65535
+    (1..=65535).contains(&value)
 }
 
 fn is_valid_reg_host_bytes(host: &[u8]) -> bool {
@@ -335,10 +335,8 @@ pub fn validate_provider_url_bytes(bytes: &[u8], require_https: bool) -> Result<
             return Err(ProviderError::InvalidHost);
         }
         let after = &authority[end_bracket + 1..];
-        if !after.is_empty() {
-            if after[0] != b':' || !is_valid_port_bytes(&after[1..]) {
-                return Err(ProviderError::InvalidHost);
-            }
+        if !after.is_empty() && (after[0] != b':' || !is_valid_port_bytes(&after[1..])) {
+            return Err(ProviderError::InvalidHost);
         }
         &authority[..=end_bracket]
     } else {

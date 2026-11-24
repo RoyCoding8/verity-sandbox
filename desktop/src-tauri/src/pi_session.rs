@@ -1,7 +1,7 @@
 use crate::attachments::PendingAttachment;
 use crate::extension_ui::{
-    parse_extension_ui_effect, parse_extension_ui_request, DialogId, DialogKind,
-    ExtensionUiAnswer, ExtensionUiError, ExtensionUiResponse, ExtensionUiTracker,
+    parse_extension_ui_effect, parse_extension_ui_request, DialogId, DialogKind, ExtensionUiAnswer,
+    ExtensionUiError, ExtensionUiResponse, ExtensionUiTracker,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -112,8 +112,7 @@ impl PiSessionConfig {
     /// Appends `--extension <path>` to the Pi CLI arguments.
     pub fn with_extension(mut self, extension_path: &Path) -> Self {
         self.args.push("--extension".to_string());
-        self.args
-            .push(extension_path.to_string_lossy().to_string());
+        self.args.push(extension_path.to_string_lossy().to_string());
         self
     }
 }
@@ -764,7 +763,13 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
         "error" | "extension_error" => {
             let message = opt_str(
                 val,
-                &["error", "message", "errorMessage", "error_message", "reason"],
+                &[
+                    "error",
+                    "message",
+                    "errorMessage",
+                    "error_message",
+                    "reason",
+                ],
             )
             .unwrap_or_else(|| "Pi reported an error".to_string());
             Some(PiUiEvent::Error { message, raw_json })
@@ -1101,9 +1106,7 @@ fn kill_tree(pid: u32) {
     {
         let pgid_arg = format!("-{}", pid);
         let pid_str = pid.to_string();
-        let _ = Command::new("kill")
-            .args(["-9", "--", &pgid_arg])
-            .status();
+        let _ = Command::new("kill").args(["-9", "--", &pgid_arg]).status();
         let _ = Command::new("pkill").args(["-9", "-P", &pid_str]).status();
         let _ = Command::new("kill").args(["-9", &pid_str]).status();
     }
@@ -1309,15 +1312,12 @@ impl PiSessionSupervisor {
                 }
 
                 if !was_shutdown {
-                    let exit_code = r_child
-                        .try_lock()
-                        .ok()
-                        .and_then(|mut guard| {
-                            guard
-                                .as_mut()
-                                .and_then(|c| c.try_wait().ok().flatten())
-                                .and_then(|status| status.code())
-                        });
+                    let exit_code = r_child.try_lock().ok().and_then(|mut guard| {
+                        guard
+                            .as_mut()
+                            .and_then(|c| c.try_wait().ok().flatten())
+                            .and_then(|status| status.code())
+                    });
                     r_sink(PiUiEvent::ProcessExited {
                         exit_code,
                         stderr_tail: tail,
@@ -2165,8 +2165,7 @@ mod tests {
         );
 
         let ext_err_raw = r#"{"type":"extension_error","message":"extension crashed"}"#;
-        let ext_err_ev =
-            parse_pi_ui_event(&parse_json(ext_err_raw).unwrap(), ext_err_raw).unwrap();
+        let ext_err_ev = parse_pi_ui_event(&parse_json(ext_err_raw).unwrap(), ext_err_raw).unwrap();
         assert_eq!(
             ext_err_ev,
             PiUiEvent::Error {
@@ -2619,8 +2618,9 @@ done
 
     #[test]
     fn default_pi_with_extension_appends_extension_cli_flag() {
-        let cfg = PiSessionConfig::default_pi(PathBuf::from("/tmp/repo"))
-            .with_extension(Path::new("/Users/alice/.verity/extensions/verity-providers.js"));
+        let cfg = PiSessionConfig::default_pi(PathBuf::from("/tmp/repo")).with_extension(
+            Path::new("/Users/alice/.verity/extensions/verity-providers.js"),
+        );
         assert!(!cfg.no_session);
         assert_eq!(
             cfg.args,
@@ -2683,10 +2683,7 @@ done
                 parsed.get("type").and_then(JsonValue::as_str),
                 Some(expected_type)
             );
-            assert_eq!(
-                parsed.get("id").and_then(JsonValue::as_str),
-                Some("req-99")
-            );
+            assert_eq!(parsed.get("id").and_then(JsonValue::as_str), Some("req-99"));
         }
 
         let bash_json = parse_json(
@@ -2816,9 +2813,11 @@ done
 
         // 2. Anthropic-style content_block_delta (both top-level and inside assistantMessageEvent)
         let anthropic_text_raw = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"chunk-a"}}"#;
-        let anthropic_text_ev =
-            parse_pi_ui_event(&parse_jsonl_line(anthropic_text_raw).unwrap(), anthropic_text_raw)
-                .unwrap();
+        let anthropic_text_ev = parse_pi_ui_event(
+            &parse_jsonl_line(anthropic_text_raw).unwrap(),
+            anthropic_text_raw,
+        )
+        .unwrap();
         assert_eq!(
             anthropic_text_ev,
             PiUiEvent::MessageUpdate {
@@ -2903,9 +2902,7 @@ done
         let (chunk_tx, chunk_rx) = mpsc::channel::<(String, Instant)>();
         let (settled_tx, settled_rx) = mpsc::channel::<()>();
         let sink: EventSink = Arc::new(move |ev| match ev {
-            PiUiEvent::MessageUpdate {
-                delta: Some(d), ..
-            } => {
+            PiUiEvent::MessageUpdate { delta: Some(d), .. } => {
                 let _ = chunk_tx.send((d, Instant::now()));
             }
             PiUiEvent::AgentSettled { .. } => {

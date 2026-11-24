@@ -371,7 +371,12 @@ fn checkout_single_file(
         .arg("--")
         .arg(rel_path)
         .output()
-        .map_err(|e| format!("failed to execute shadow git checkout for {}: {}", rel_path, e))?;
+        .map_err(|e| {
+            format!(
+                "failed to execute shadow git checkout for {}: {}",
+                rel_path, e
+            )
+        })?;
     if !out.status.success() {
         return Err(format!(
             "shadow git checkout failed for {}: {}",
@@ -441,7 +446,12 @@ pub fn revert_to_snapshot(
             remove_worktree_file(&canonical_project, &rel_buf)?;
         } else if status.starts_with('M') || status.starts_with('D') || status.starts_with('T') {
             // File existed in target_tree_oid -> restore ONLY this file.
-            checkout_single_file(&shadow_git_dir, &canonical_project, &target_tree_oid, &rel_path)?;
+            checkout_single_file(
+                &shadow_git_dir,
+                &canonical_project,
+                &target_tree_oid,
+                &rel_path,
+            )?;
         } else {
             return Err(format!(
                 "unexpected git diff-tree status '{}' for path '{}'",
@@ -494,7 +504,12 @@ pub fn redo_targeted_revert(
             .arg("--")
             .arg(&rel_path)
             .output()
-            .map_err(|e| format!("failed to execute shadow git ls-tree for {}: {}", rel_path, e))?;
+            .map_err(|e| {
+                format!(
+                    "failed to execute shadow git ls-tree for {}: {}",
+                    rel_path, e
+                )
+            })?;
         if !ls_out.status.success() {
             return Err(format!(
                 "shadow git ls-tree failed for {}: {}",
@@ -504,7 +519,12 @@ pub fn redo_targeted_revert(
         }
 
         if !ls_out.stdout.is_empty() {
-            checkout_single_file(&shadow_git_dir, &canonical_project, &redo_tree_oid, &rel_path)?;
+            checkout_single_file(
+                &shadow_git_dir,
+                &canonical_project,
+                &redo_tree_oid,
+                &rel_path,
+            )?;
         } else {
             remove_worktree_file(&canonical_project, &rel_buf)?;
         }
@@ -515,10 +535,7 @@ pub fn redo_targeted_revert(
 }
 
 pub fn normalize_prompt_preview(prompt: &str) -> String {
-    let collapsed = prompt
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = String::new();
     for (idx, ch) in collapsed.chars().enumerate() {
         if idx >= 160 {
@@ -778,7 +795,9 @@ pub(crate) mod tests {
         assert!(outcome
             .reverted_files
             .contains(&"generated/extra.txt".to_string()));
-        assert!(!outcome.reverted_files.contains(&"untouched.txt".to_string()));
+        assert!(!outcome
+            .reverted_files
+            .contains(&"untouched.txt".to_string()));
 
         // Verify disk state after revert.
         assert_eq!(
@@ -809,7 +828,10 @@ pub(crate) mod tests {
             fs::read_to_string(&modified).unwrap(),
             "fn main() { println!(\"v2-broken\"); }\n"
         );
-        assert!(!deleted.exists(), "deleted file must be removed again on redo");
+        assert!(
+            !deleted.exists(),
+            "deleted file must be removed again on redo"
+        );
         assert_eq!(fs::read_to_string(&added).unwrap(), "unwanted file\n");
 
         let untouched_mtime_after_redo = fs::metadata(&untouched).unwrap().modified().unwrap();
@@ -833,7 +855,9 @@ pub(crate) mod tests {
             !project.path.join(".git").exists(),
             "shadow git must never create .git inside project directory"
         );
-        assert!(shadow_git_dir_for_project(&project.path).join("HEAD").exists());
+        assert!(shadow_git_dir_for_project(&project.path)
+            .join("HEAD")
+            .exists());
 
         fs::write(&note, "version 2\n").unwrap();
         let outcome = revert_to_snapshot(&project.path, &oid).expect("revert in non-git dir");
@@ -887,9 +911,13 @@ pub(crate) mod tests {
         let by_id = find_checkpoint(&store, Some("sess-1"), "turn-1", None).unwrap();
         assert_eq!(by_id.tree_oid, fake_oid);
 
-        let by_prompt =
-            find_checkpoint(&store, Some("sess-1"), "pi-entry-99", Some("Fix the login bug"))
-                .unwrap();
+        let by_prompt = find_checkpoint(
+            &store,
+            Some("sess-1"),
+            "pi-entry-99",
+            Some("Fix the login bug"),
+        )
+        .unwrap();
         assert_eq!(by_prompt.tree_oid, fake_oid);
 
         assert!(find_checkpoint(&store, Some("sess-1"), "unknown", Some("other")).is_none());

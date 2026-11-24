@@ -1,6 +1,6 @@
 {
   "name": "verity",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Verity v2: Rust formal-verification controller, Pi agent harness, and Tauri v2 Material Design 3 desktop app",
   "scripts": {

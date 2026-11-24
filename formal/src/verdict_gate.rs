@@ -116,9 +116,9 @@ pub fn prove_verdict_and_hygiene_gate() {
             },
             CheckKind::Cover => match c.status {
                 CheckStatus::Satisfied => {}
-                CheckStatus::Unsatisfiable
-                | CheckStatus::Unreachable
-                | CheckStatus::Failure => any_cover_unsatisfied = true,
+                CheckStatus::Unsatisfiable | CheckStatus::Unreachable | CheckStatus::Failure => {
+                    any_cover_unsatisfied = true
+                }
                 CheckStatus::Undetermined | CheckStatus::Success => any_cover_undetermined = true,
             },
         }
