@@ -10,6 +10,10 @@ use verity_core::provider::{validate_external_sign_in_url, validate_provider_url
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+pub const VERITY_PI_EXTENSION_FILENAME: &str = "verity-providers.js";
+pub const VERITY_PI_EXTENSION_SOURCE: &str =
+    include_str!("../resources/verity-providers-extension.js");
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredProviderProfile {
     pub id: String,
@@ -123,34 +127,119 @@ fn non_empty_env(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|v| !v.is_empty())
 }
 
-pub fn resolve_store_path_from_env(
+pub fn resolve_verity_dir_from_env(
     home: Option<&str>,
     userprofile: Option<&str>,
     homedrive: Option<&str>,
     homepath: Option<&str>,
 ) -> PathBuf {
     if let Some(dir) = non_empty_env(home).or_else(|| non_empty_env(userprofile)) {
-        return PathBuf::from(dir).join(".verity").join("providers.json");
+        return PathBuf::from(dir).join(".verity");
     }
     if let (Some(drive), Some(path)) = (non_empty_env(homedrive), non_empty_env(homepath)) {
-        return PathBuf::from(format!("{}{}", drive, path))
-            .join(".verity")
-            .join("providers.json");
+        return PathBuf::from(format!("{}{}", drive, path)).join(".verity");
     }
-    PathBuf::from(".verity").join("providers.json")
+    PathBuf::from(".verity")
 }
 
-pub fn default_store_path() -> PathBuf {
+pub fn default_verity_dir() -> PathBuf {
     let home = env::var("HOME").ok();
     let userprofile = env::var("USERPROFILE").ok();
     let homedrive = env::var("HOMEDRIVE").ok();
     let homepath = env::var("HOMEPATH").ok();
-    resolve_store_path_from_env(
+    resolve_verity_dir_from_env(
         home.as_deref(),
         userprofile.as_deref(),
         homedrive.as_deref(),
         homepath.as_deref(),
     )
+}
+
+pub fn resolve_store_path_from_env(
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    homedrive: Option<&str>,
+    homepath: Option<&str>,
+) -> PathBuf {
+    resolve_verity_dir_from_env(home, userprofile, homedrive, homepath).join("providers.json")
+}
+
+pub fn default_store_path() -> PathBuf {
+    default_verity_dir().join("providers.json")
+}
+
+pub fn resolve_pi_extension_path_from_env(
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    homedrive: Option<&str>,
+    homepath: Option<&str>,
+) -> PathBuf {
+    resolve_verity_dir_from_env(home, userprofile, homedrive, homepath)
+        .join("extensions")
+        .join(VERITY_PI_EXTENSION_FILENAME)
+}
+
+pub fn default_pi_extension_path() -> PathBuf {
+    default_verity_dir()
+        .join("extensions")
+        .join(VERITY_PI_EXTENSION_FILENAME)
+}
+
+/// Idempotently writes the embedded Verity Pi provider extension to `path`
+/// only when missing or when its bytes differ. Uses atomic temp-file + rename
+/// so interrupted writes never leave a partial extension on disk.
+pub fn ensure_verity_pi_extension_at(path: &Path) -> Result<PathBuf, String> {
+    if let Ok(existing) = fs::read(path) {
+        if existing == VERITY_PI_EXTENSION_SOURCE.as_bytes() {
+            return Ok(path.to_path_buf());
+        }
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("extension path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create extension directory {}: {}", parent.display(), e))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("invalid extension filename: {}", path.display()))?;
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{}.tmp.{}.{}", file_name, std::process::id(), seq));
+
+    let write_result = (|| -> Result<(), String> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        let mut file = opts
+            .open(&tmp_path)
+            .map_err(|e| format!("failed to create temp extension {}: {}", tmp_path.display(), e))?;
+        file.write_all(VERITY_PI_EXTENSION_SOURCE.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("failed to write temp extension {}: {}", tmp_path.display(), e))?;
+        drop(file);
+
+        fs::rename(&tmp_path, path).map_err(|e| {
+            format!(
+                "failed to rename {} -> {}: {}",
+                tmp_path.display(),
+                path.display(),
+                e
+            )
+        })
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result?;
+    Ok(path.to_path_buf())
+}
+
+/// Ensures the embedded Verity Pi provider extension is materialized at
+/// `~/.verity/extensions/verity-providers.js`.
+pub fn ensure_verity_pi_extension_path() -> Result<PathBuf, String> {
+    ensure_verity_pi_extension_at(&default_pi_extension_path())
 }
 
 fn validate_optional_sign_in_url(raw: Option<String>) -> Result<Option<String>, String> {
@@ -489,21 +578,29 @@ pub fn list_providers() -> Result<Vec<PublicProviderProfile>, String> {
 }
 
 #[tauri::command]
-pub fn upsert_provider(input: ProviderProfileInput) -> Result<PublicProviderProfile, String> {
+pub fn upsert_provider(
+    state: tauri::State<'_, crate::pi_ipc::PiAppState>,
+    input: ProviderProfileInput,
+) -> Result<PublicProviderProfile, String> {
     let path = default_store_path();
     let mut store = ProviderStore::load(&path)?;
     let public = store.upsert(input)?;
     store.save_atomic(&path)?;
+    state.notify_providers_changed();
     Ok(public)
 }
 
 #[tauri::command]
-pub fn delete_provider(id: String) -> Result<bool, String> {
+pub fn delete_provider(
+    state: tauri::State<'_, crate::pi_ipc::PiAppState>,
+    id: String,
+) -> Result<bool, String> {
     let path = default_store_path();
     let mut store = ProviderStore::load(&path)?;
     let removed = store.remove(&id)?;
     if removed {
         store.save_atomic(&path)?;
+        state.notify_providers_changed();
     }
     Ok(removed)
 }
@@ -792,5 +889,51 @@ mod tests {
             resolve_store_path_from_env(None, None, None, None),
             PathBuf::from(".verity").join("providers.json")
         );
+    }
+
+    #[test]
+    fn pi_extension_path_uses_verity_extensions_directory() {
+        assert_eq!(
+            resolve_pi_extension_path_from_env(Some("/Users/alice"), None, None, None),
+            PathBuf::from("/Users/alice")
+                .join(".verity")
+                .join("extensions")
+                .join(VERITY_PI_EXTENSION_FILENAME)
+        );
+        assert_eq!(
+            resolve_pi_extension_path_from_env(None, Some("C:\\Users\\alice"), None, None),
+            PathBuf::from("C:\\Users\\alice")
+                .join(".verity")
+                .join("extensions")
+                .join(VERITY_PI_EXTENSION_FILENAME)
+        );
+    }
+
+    #[test]
+    fn ensure_verity_pi_extension_is_idempotent_and_repairs_stale_content() {
+        let dir = unique_temp_dir("pi-ext");
+        let ext_path = dir.join("extensions").join(VERITY_PI_EXTENSION_FILENAME);
+
+        let first = ensure_verity_pi_extension_at(&ext_path).unwrap();
+        assert_eq!(first, ext_path);
+        assert_eq!(
+            fs::read_to_string(&ext_path).unwrap(),
+            VERITY_PI_EXTENSION_SOURCE
+        );
+
+        // Second call is an idempotent no-op when content matches.
+        let second = ensure_verity_pi_extension_at(&ext_path).unwrap();
+        assert_eq!(second, ext_path);
+
+        // Stale or corrupted content is atomically reconciled.
+        fs::write(&ext_path, "stale-content").unwrap();
+        let repaired = ensure_verity_pi_extension_at(&ext_path).unwrap();
+        assert_eq!(repaired, ext_path);
+        assert_eq!(
+            fs::read_to_string(&ext_path).unwrap(),
+            VERITY_PI_EXTENSION_SOURCE
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

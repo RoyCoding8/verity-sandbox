@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -92,6 +92,14 @@ impl PiSessionConfig {
             env: Vec::new(),
             command_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Appends `--extension <path>` to the Pi CLI arguments.
+    pub fn with_extension(mut self, extension_path: &Path) -> Self {
+        self.args.push("--extension".to_string());
+        self.args
+            .push(extension_path.to_string_lossy().to_string());
+        self
     }
 }
 
@@ -659,6 +667,15 @@ pub type ReloadHook = Arc<dyn Fn() + Send + Sync>;
 
 type PendingMap = HashMap<RequestId, mpsc::Sender<Result<PiRpcResponse, PiSessionError>>>;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn apply_no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 fn kill_tree(pid: u32) {
     #[cfg(unix)]
     {
@@ -669,9 +686,10 @@ fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
         let pid_str = pid.to_string();
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid_str, "/T", "/F"])
-            .status();
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid_str, "/T", "/F"]);
+        apply_no_window(&mut cmd);
+        let _ = cmd.status();
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -701,13 +719,16 @@ impl PiSessionSupervisor {
         reload_hook: ReloadHook,
     ) -> Result<Self, PiSessionError> {
         let resolved_program = resolve_pi_program(&config.program);
-        let mut child = Command::new(&resolved_program)
-            .args(&config.args)
+        let mut cmd = Command::new(&resolved_program);
+        cmd.args(&config.args)
             .current_dir(&config.cwd)
             .envs(config.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        apply_no_window(&mut cmd);
+        let mut child = cmd
             .spawn()
             .map_err(|e| PiSessionError::SpawnFailed(e.to_string()))?;
 
@@ -1709,5 +1730,21 @@ done
         )));
         drop(recorded);
         sup.shutdown();
+    }
+
+    #[test]
+    fn default_pi_with_extension_appends_extension_cli_flag() {
+        let cfg = PiSessionConfig::default_pi(PathBuf::from("/tmp/repo"))
+            .with_extension(Path::new("/Users/alice/.verity/extensions/verity-providers.js"));
+        assert_eq!(
+            cfg.args,
+            vec![
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--extension",
+                "/Users/alice/.verity/extensions/verity-providers.js",
+            ]
+        );
     }
 }

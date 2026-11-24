@@ -1,10 +1,11 @@
 use crate::attachments::PendingAttachment;
 use crate::extension_ui::{DialogId, ExtensionUiAnswer};
 use crate::pi_session::{
-    EventSink, PiRpcResponse, PiSessionConfig, PiSessionSupervisor, ReloadHook,
+    EventSink, PiRpcResponse, PiSessionConfig, PiSessionSupervisor, ReloadDisposition, ReloadHook,
 };
 use crate::providers::{
-    build_pi_provider_env, default_store_path, ProviderStore, PublicProviderProfile,
+    build_pi_provider_env, default_store_path, ensure_verity_pi_extension_path, ProviderStore,
+    PublicProviderProfile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -250,6 +251,19 @@ pub fn build_pi_launch_env(
         env_pairs.push(("VERITY_MCP_ARGS".to_string(), "mcp".to_string()));
     }
     env_pairs
+}
+
+/// Builds the default Pi RPC session configuration, attaching `--extension <path>`
+/// when the Verity provider registration extension is available.
+pub fn build_default_pi_config(
+    project_path: PathBuf,
+    extension_path: Option<&Path>,
+) -> PiSessionConfig {
+    let cfg = PiSessionConfig::default_pi(project_path);
+    match extension_path {
+        Some(path) => cfg.with_extension(path),
+        None => cfg,
+    }
 }
 
 // ============================================================
@@ -801,6 +815,7 @@ pub struct PiAppState {
     thinking_level: Mutex<ThinkingLevel>,
     model_pending_sync: AtomicBool,
     thinking_level_pending_sync: AtomicBool,
+    provider_reload_pending: Arc<AtomicBool>,
 }
 
 impl PiAppState {
@@ -816,6 +831,7 @@ impl PiAppState {
             thinking_level: Mutex::new(ThinkingLevel::Medium),
             model_pending_sync: AtomicBool::new(false),
             thinking_level_pending_sync: AtomicBool::new(false),
+            provider_reload_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -834,6 +850,7 @@ impl PiAppState {
             thinking_level: Mutex::new(ThinkingLevel::Medium),
             model_pending_sync: AtomicBool::new(false),
             thinking_level_pending_sync: AtomicBool::new(false),
+            provider_reload_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -857,6 +874,31 @@ impl PiAppState {
         self.ensure_supervisor_with_sink(sink)
     }
 
+    /// Notifies the running Pi supervisor that `providers.json` changed so Pi
+    /// restarts with updated `VERITY_DESKTOP_PROVIDERS` and `VERITY_DESKTOP_KEY_<ID>`
+    /// environment variables once idle (or immediately if already idle).
+    pub fn notify_providers_changed(&self) {
+        let live = {
+            let guard = self.supervisor.lock().expect("supervisor lock poisoned");
+            guard.as_ref().filter(|s| s.is_alive()).cloned()
+        };
+        let Some(sup) = live else {
+            return;
+        };
+        match sup.request_provider_reload() {
+            Ok(ReloadDisposition::ExecutedImmediately) => {
+                self.provider_reload_pending.store(false, Ordering::Release);
+                self.shutdown();
+            }
+            Ok(ReloadDisposition::DeferredUntilSettled) => {
+                // `reload_hook` will set `provider_reload_pending` once `agent_settled` arrives.
+            }
+            Err(_) => {
+                self.provider_reload_pending.store(true, Ordering::Release);
+            }
+        }
+    }
+
     /// Idempotently returns a live `PiSessionSupervisor`, reconciling any exited/stale instance
     /// and injecting `0o600` provider env vars + `VERITY_MCP_BIN` into the child process.
     pub fn ensure_supervisor_with_sink(
@@ -865,8 +907,13 @@ impl PiAppState {
     ) -> Result<Arc<PiSessionSupervisor>, String> {
         let mut guard = self.supervisor.lock().expect("supervisor lock poisoned");
         if let Some(existing) = guard.as_ref() {
-            if existing.is_alive() {
+            let should_recycle = self.provider_reload_pending.load(Ordering::Acquire)
+                && !existing.activity().is_streaming();
+            if existing.is_alive() && !should_recycle {
                 return Ok(Arc::clone(existing));
+            }
+            if should_recycle {
+                self.provider_reload_pending.store(false, Ordering::Release);
             }
             existing.shutdown();
             *guard = None;
@@ -879,11 +926,17 @@ impl PiAppState {
 
         let mut config = match &self.base_config {
             Some(cfg) => cfg.clone(),
-            None => PiSessionConfig::default_pi(project_path),
+            None => {
+                let ext_path = ensure_verity_pi_extension_path().ok();
+                build_default_pi_config(project_path, ext_path.as_deref())
+            }
         };
         config.env.extend(launch_env);
 
-        let reload_hook: ReloadHook = Arc::new(|| {});
+        let pending_flag = Arc::clone(&self.provider_reload_pending);
+        let reload_hook: ReloadHook = Arc::new(move || {
+            pending_flag.store(true, Ordering::Release);
+        });
         let spawned = PiSessionSupervisor::spawn(config, event_sink, reload_hook)
             .map_err(|e| e.to_string())?;
         let arc = Arc::new(spawned);
@@ -2210,6 +2263,95 @@ done
         let fallback = merge_models_with_fallback(Vec::new(), Vec::new(), Vec::new());
         assert_eq!(fallback, default_catalog_models());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_default_pi_config_attaches_extension_flag_when_present() {
+        let ext = PathBuf::from("/Users/alice/.verity/extensions/verity-providers.js");
+        let with_ext = build_default_pi_config(PathBuf::from("/tmp/repo"), Some(&ext));
+        assert_eq!(
+            with_ext.args,
+            vec![
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--extension",
+                "/Users/alice/.verity/extensions/verity-providers.js",
+            ]
+        );
+
+        let without_ext = build_default_pi_config(PathBuf::from("/tmp/repo"), None);
+        assert_eq!(without_ext.args, vec!["--mode", "rpc", "--no-session"]);
+    }
+
+    #[test]
+    fn notify_providers_changed_recycles_idle_supervisor_with_fresh_provider_env() {
+        let dir = unique_temp_dir("provider-reload");
+        let store_path = dir.join("providers.json");
+        let providers_dump = dir.join("providers_env.log");
+
+        let script = format!(
+            r#"
+printf '%s\n' "$VERITY_DESKTOP_PROVIDERS" >> "{dump}"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
+done
+"#,
+            dump = providers_dump.display()
+        );
+
+        let state = PiAppState::with_config(
+            dir.clone(),
+            store_path.clone(),
+            mock_sh_config(dir.clone(), &script),
+        );
+        let sink: EventSink = Arc::new(|_| {});
+
+        // First spawn sees empty provider list.
+        let sup1 = state
+            .ensure_supervisor_with_sink(Arc::clone(&sink))
+            .unwrap();
+        sup1.get_state().unwrap();
+
+        // Save a new custom provider and notify PiAppState while Idle.
+        let mut store = ProviderStore::default();
+        store
+            .upsert(ProviderProfileInput {
+                id: "openrouter".to_string(),
+                name: "OpenRouter".to_string(),
+                api: "openai-completions".to_string(),
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                sign_in_url: None,
+                models: vec!["qwen/qwen4-max:free".to_string()],
+                api_key: Some("sk-or-test-key".to_string()),
+            })
+            .unwrap();
+        store.save_atomic(&store_path).unwrap();
+        state.notify_providers_changed();
+        assert!(!state.has_live_supervisor());
+
+        // Next call spawns a fresh supervisor with the updated VERITY_DESKTOP_PROVIDERS.
+        let sup2 = state
+            .ensure_supervisor_with_sink(Arc::clone(&sink))
+            .unwrap();
+        sup2.get_state().unwrap();
+        assert!(!Arc::ptr_eq(&sup1, &sup2));
+
+        let lines: Vec<String> = fs::read_to_string(&providers_dump)
+            .unwrap()
+            .lines()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "[]");
+        assert!(lines[1].contains("openrouter"));
+        assert!(lines[1].contains("qwen/qwen4-max:free"));
+        assert!(!lines[1].contains("sk-or-test-key"));
+
+        state.shutdown();
         let _ = fs::remove_dir_all(&dir);
     }
 }
