@@ -366,7 +366,14 @@ const TERMINAL_ASSISTANT_STOP_REASONS = new Set<string>([
 ]);
 
 function isNonAssistantMessageRole(role: string | null | undefined): boolean {
-  return role === "user" || role === "toolResult" || role === "tool_result" || role === "tool";
+  return (
+    role === "user" ||
+    role === "system" ||
+    role === "developer" ||
+    role === "toolResult" ||
+    role === "tool_result" ||
+    role === "tool"
+  );
 }
 
 function isTurnScopedEvent(event: PiUiEvent): boolean {
@@ -546,6 +553,9 @@ function attachErrorToActiveTurn(
 }
 
 function isNonEmptyAssistantMessage(m: PiChatMessage): boolean {
+  if (m.role === "system") {
+    return m.content.trim().length > 0 || Boolean(m.attachments && m.attachments.length > 0);
+  }
   if (m.role !== "assistant") return true;
   const hasText = m.content.trim().length > 0;
   const hasThinking = Boolean(m.thinking && m.thinking.trim().length > 0);
@@ -605,10 +615,9 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         );
         return { ...state, isStreaming: true, messages };
       }
-      const role: PiChatMessage["role"] = event.role === "system" ? "system" : "assistant";
       const nextMessage: PiChatMessage = {
         id,
-        role,
+        role: "assistant",
         content: "",
         timestamp: nowTimeLabel(),
         streaming: true,

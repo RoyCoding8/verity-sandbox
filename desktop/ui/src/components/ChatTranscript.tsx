@@ -1265,6 +1265,12 @@ export function ChatTranscript({
                   message.thinking && message.thinking.trim().length > 0
                 );
                 const hasContent = message.content.trim().length > 0;
+                const hasAttachments = Boolean(
+                  message.attachments && message.attachments.length > 0
+                );
+                if (message.role === "system" && !hasContent && !hasAttachments) {
+                  return null;
+                }
                 const errorText = message.errorMessage?.trim() ?? "";
                 const isErrorTurn =
                   message.stopReason === "error" || errorText.length > 0;

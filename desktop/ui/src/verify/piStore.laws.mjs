@@ -654,6 +654,67 @@ async function main() {
     }]);
 
     // Run all deterministic scenarios
+    // Scenario 11: system/developer message_start never creates an empty System bubble
+    scenarios.push([
+      "system/developer message_start & message_end never leave empty System bubbles",
+      () => {
+        let s = createInitialPiState();
+        s = dispatchAction(
+          s,
+          {
+            type: "prompt_submitted",
+            message: { id: "u-sys-1", role: "user", content: "Hey", timestamp: "11:16 PM" },
+          },
+          "S11.prompt"
+        );
+        s = dispatchEvent(
+          s,
+          { type: "message_start", message: { id: "sys-1", role: "system" } },
+          "S11.system_start"
+        );
+        s = dispatchEvent(
+          s,
+          { type: "message_start", message: { id: "asst-1", role: "assistant" } },
+          "S11.assistant_start"
+        );
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_update",
+            message: { id: "asst-1" },
+            assistantMessageEvent: { type: "thinking_delta", delta: "Greeting user." },
+          },
+          "S11.thinking_delta"
+        );
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_update",
+            message: { id: "asst-1" },
+            assistantMessageEvent: { type: "text_delta", delta: "Hello!" },
+          },
+          "S11.text_delta"
+        );
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_end",
+            message: { id: "asst-1", role: "assistant", stopReason: "stop" },
+          },
+          "S11.message_end"
+        );
+        s = dispatchEvent(s, { type: "agent_end" }, "S11.agent_end");
+        assert.equal(
+          s.messages.some((m) => m.role === "system"),
+          false,
+          "system message_start must not create an empty system bubble"
+        );
+        assert.equal(s.messages.length, 2);
+        assert.equal(s.messages[1].content, "Hello!");
+        assert.equal(s.isStreaming, false);
+      },
+    ]);
+
     let scenariosPassed = 0;
     for (const [name, fn] of scenarios) {
       await fn();
