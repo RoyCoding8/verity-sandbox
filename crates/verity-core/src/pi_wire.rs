@@ -47,6 +47,89 @@ impl WireStopReason {
     }
 }
 
+/// Assistant message update event kind parsed at the Pi RPC wire boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantEventKind {
+    TextDelta,
+    TextEnd,
+    ThinkingStart,
+    ThinkingDelta,
+    ThinkingEnd,
+    ToolCall,
+    Ignored,
+}
+
+impl AssistantEventKind {
+    /// Parses a wire `assistantMessageEvent.type` string using an explicit allowlist.
+    ///
+    /// Tool-call and unknown strings NEVER fall through to `TextDelta` or `ThinkingDelta`.
+    pub fn parse_str(raw: &str) -> Self {
+        match raw {
+            "text_delta" => Self::TextDelta,
+            "text_end" => Self::TextEnd,
+            "thinking_start" => Self::ThinkingStart,
+            "thinking_delta" | "reasoning_delta" => Self::ThinkingDelta,
+            "thinking_end" => Self::ThinkingEnd,
+            "toolcall_start" | "toolcall_delta" | "toolcall_end" | "input_json_delta" => {
+                Self::ToolCall
+            }
+            _ => Self::Ignored,
+        }
+    }
+}
+
+/// Distinguishes server-issued Pi session entry IDs from client-local UI message IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryIdKind {
+    Server(u8),
+    ClientLocal(u8),
+}
+
+/// Validated rewind target returned by `resolve_rewind_target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindTarget {
+    ForkToServer(u8),
+    NewSession,
+}
+
+/// Error returned when a requested rewind entry ID cannot be safely resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertResolutionError {
+    UnresolvableEntryId,
+}
+
+/// Resolves a requested revert entry ID against the authoritative list of server entry IDs.
+///
+/// Guarantees:
+/// - If `requested == EntryIdKind::Server(id)` and `server_entries.contains(&id)`,
+///   returns `Ok(RewindTarget::ForkToServer(id))`.
+/// - Else if `user_turn_idx == Some(idx)` and `idx < server_entries.len()`,
+///   returns `Ok(RewindTarget::ForkToServer(server_entries[idx]))`.
+/// - Else if `user_turn_idx == Some(0)` and `server_entries.is_empty()`,
+///   returns `Ok(RewindTarget::NewSession)`.
+/// - Else returns `Err(RevertResolutionError::UnresolvableEntryId)`, NEVER returning
+///   a `ClientLocal` ID.
+pub fn resolve_rewind_target(
+    requested: EntryIdKind,
+    user_turn_idx: Option<usize>,
+    server_entries: &[u8],
+) -> Result<RewindTarget, RevertResolutionError> {
+    if let EntryIdKind::Server(id) = requested {
+        if server_entries.contains(&id) {
+            return Ok(RewindTarget::ForkToServer(id));
+        }
+    }
+    if let Some(idx) = user_turn_idx {
+        if idx < server_entries.len() {
+            return Ok(RewindTarget::ForkToServer(server_entries[idx]));
+        }
+        if idx == 0 && server_entries.is_empty() {
+            return Ok(RewindTarget::NewSession);
+        }
+    }
+    Err(RevertResolutionError::UnresolvableEntryId)
+}
+
 /// Lifecycle phase of the active chat turn in the desktop UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiTurnPhase {
@@ -66,6 +149,7 @@ pub struct UiTurnState {
     pub session_epoch: u8,
     pub has_assistant_text: bool,
     pub has_assistant_thinking: bool,
+    pub thinking_duration_sealed: bool,
     pub has_visible_error: bool,
     pub assistant_message_count: u8,
     pub running_tools: u8,
@@ -80,6 +164,7 @@ impl UiTurnState {
             session_epoch,
             has_assistant_text: false,
             has_assistant_thinking: false,
+            thinking_duration_sealed: false,
             has_visible_error: false,
             assistant_message_count: 0,
             running_tools: 0,
@@ -129,7 +214,13 @@ pub enum UiTurnEvent {
     ThinkingDelta {
         event_epoch: u8,
     },
+    ThinkingEnd {
+        event_epoch: u8,
+    },
     TextDelta {
+        event_epoch: u8,
+    },
+    ToolCallDelta {
         event_epoch: u8,
     },
     ToolStart {
@@ -169,7 +260,9 @@ impl UiTurnEvent {
         match *self {
             Self::MessageStart { event_epoch, .. }
             | Self::ThinkingDelta { event_epoch }
+            | Self::ThinkingEnd { event_epoch }
             | Self::TextDelta { event_epoch }
+            | Self::ToolCallDelta { event_epoch }
             | Self::ToolStart { event_epoch }
             | Self::ToolEnd { event_epoch }
             | Self::MessageEnd { event_epoch, .. }
@@ -213,6 +306,10 @@ const fn settled_non_streaming_phase(state: UiTurnState) -> UiTurnPhase {
 ///   `AgentSettled`, `ErrorEvent`, and `MessageEnd(Assistant, Error)`.
 /// - Monotonic thinking-to-text handoff: `TextDelta` turns off the thinking
 ///   indicator and prevents returning to `StreamingThinking` in the same turn.
+/// - Thinking duration sealing: `ThinkingEnd`, first `TextDelta`, or terminal
+///   settlement while `has_assistant_thinking` sets `thinking_duration_sealed = true`.
+/// - Tool-call delta isolation: `ToolCallDelta` leaves `has_assistant_text`,
+///   `has_assistant_thinking`, and `thinking_duration_sealed` strictly unchanged.
 /// - User-echo isolation: `MessageStart(User)` and `MessageEnd(User, _)` never
 ///   mutate assistant fields or counts.
 /// - Zero silent error erasure: once `has_visible_error` is set during a turn,
@@ -237,6 +334,7 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
                     session_epoch: state.session_epoch,
                     has_assistant_text: false,
                     has_assistant_thinking: false,
+                    thinking_duration_sealed: false,
                     has_visible_error: false,
                     assistant_message_count: 0,
                     running_tools: 0,
@@ -267,6 +365,20 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
                 UiTurnState {
                     phase,
                     has_assistant_thinking: true,
+                    thinking_duration_sealed: state.thinking_duration_sealed
+                        || state.has_assistant_text,
+                    ..state
+                }
+            }
+        }
+
+        UiTurnEvent::ThinkingEnd { .. } => {
+            if !state.is_streaming() {
+                state
+            } else {
+                UiTurnState {
+                    thinking_duration_sealed: state.thinking_duration_sealed
+                        || state.has_assistant_thinking,
                     ..state
                 }
             }
@@ -279,10 +391,14 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
                 UiTurnState {
                     phase: UiTurnPhase::StreamingText,
                     has_assistant_text: true,
+                    thinking_duration_sealed: state.thinking_duration_sealed
+                        || state.has_assistant_thinking,
                     ..state
                 }
             }
         }
+
+        UiTurnEvent::ToolCallDelta { .. } => state,
 
         UiTurnEvent::ToolStart { .. } => {
             if !state.is_streaming() {
@@ -323,6 +439,8 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
                     };
                     UiTurnState {
                         phase,
+                        thinking_duration_sealed: state.thinking_duration_sealed
+                            || state.has_assistant_thinking,
                         has_visible_error: true,
                         assistant_message_count: state.assistant_message_count.saturating_add(1),
                         running_tools: 0,
@@ -331,6 +449,8 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
                 } else if stop_reason == WireStopReason::Aborted {
                     UiTurnState {
                         phase: settled_non_streaming_phase(state),
+                        thinking_duration_sealed: state.thinking_duration_sealed
+                            || state.has_assistant_thinking,
                         assistant_message_count: state.assistant_message_count.saturating_add(1),
                         running_tools: 0,
                         ..state
@@ -340,6 +460,8 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
                 } else {
                     UiTurnState {
                         phase: resume_streaming_phase(state),
+                        thinking_duration_sealed: state.thinking_duration_sealed
+                            || state.has_assistant_thinking,
                         assistant_message_count: state.assistant_message_count.saturating_add(1),
                         ..state
                     }
@@ -370,6 +492,8 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
             } else {
                 UiTurnState {
                     phase: UiTurnPhase::Failed,
+                    thinking_duration_sealed: state.thinking_duration_sealed
+                        || state.has_assistant_thinking,
                     has_visible_error: true,
                     running_tools: 0,
                     ..state
@@ -385,6 +509,8 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
             };
             UiTurnState {
                 phase,
+                thinking_duration_sealed: state.thinking_duration_sealed
+                    || state.has_assistant_thinking,
                 has_visible_error: true,
                 running_tools: 0,
                 ..state
@@ -393,6 +519,8 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
 
         UiTurnEvent::ProcessExited => UiTurnState {
             phase: UiTurnPhase::Disconnected,
+            thinking_duration_sealed: state.thinking_duration_sealed
+                || state.has_assistant_thinking,
             has_visible_error: true,
             running_tools: 0,
             ..state
@@ -400,12 +528,16 @@ pub fn step_ui_turn(state: UiTurnState, event: UiTurnEvent) -> UiTurnState {
 
         UiTurnEvent::AgentSettled { .. } => UiTurnState {
             phase: settled_non_streaming_phase(state),
+            thinking_duration_sealed: state.thinking_duration_sealed
+                || state.has_assistant_thinking,
             running_tools: 0,
             ..state
         },
 
         UiTurnEvent::UserAbort => UiTurnState {
             phase: settled_non_streaming_phase(state),
+            thinking_duration_sealed: state.thinking_duration_sealed
+                || state.has_assistant_thinking,
             running_tools: 0,
             ..state
         },
@@ -434,5 +566,74 @@ mod tests {
             WireStopReason::Aborted
         );
         assert_eq!(WireStopReason::parse_str("other"), WireStopReason::Unknown);
+
+        assert_eq!(
+            AssistantEventKind::parse_str("text_delta"),
+            AssistantEventKind::TextDelta
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("text_end"),
+            AssistantEventKind::TextEnd
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("thinking_start"),
+            AssistantEventKind::ThinkingStart
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("thinking_delta"),
+            AssistantEventKind::ThinkingDelta
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("reasoning_delta"),
+            AssistantEventKind::ThinkingDelta
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("thinking_end"),
+            AssistantEventKind::ThinkingEnd
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("toolcall_start"),
+            AssistantEventKind::ToolCall
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("toolcall_delta"),
+            AssistantEventKind::ToolCall
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("toolcall_end"),
+            AssistantEventKind::ToolCall
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("input_json_delta"),
+            AssistantEventKind::ToolCall
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("unknown"),
+            AssistantEventKind::Ignored
+        );
+    }
+
+    #[test]
+    fn rewind_target_resolution_never_leaks_client_local_ids() {
+        assert_eq!(
+            resolve_rewind_target(EntryIdKind::Server(10), Some(0), &[10, 20]),
+            Ok(RewindTarget::ForkToServer(10))
+        );
+        assert_eq!(
+            resolve_rewind_target(EntryIdKind::ClientLocal(99), Some(1), &[10, 20]),
+            Ok(RewindTarget::ForkToServer(20))
+        );
+        assert_eq!(
+            resolve_rewind_target(EntryIdKind::ClientLocal(99), Some(0), &[]),
+            Ok(RewindTarget::NewSession)
+        );
+        assert_eq!(
+            resolve_rewind_target(EntryIdKind::ClientLocal(99), Some(2), &[10, 20]),
+            Err(RevertResolutionError::UnresolvableEntryId)
+        );
+        assert_eq!(
+            resolve_rewind_target(EntryIdKind::Server(77), None, &[10, 20]),
+            Err(RevertResolutionError::UnresolvableEntryId)
+        );
     }
 }

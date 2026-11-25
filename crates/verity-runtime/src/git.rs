@@ -1,6 +1,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use verity_core::{CommitOid, RelPath, TaskId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +45,7 @@ pub enum MergeOutcome {
 pub fn run_git(repo_dir: &Path, args: &[&str]) -> Result<Output, GitError> {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_dir)
+        .stdin(Stdio::null())
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -59,6 +60,13 @@ pub fn run_git(repo_dir: &Path, args: &[&str]) -> Result<Output, GitError> {
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .args(args);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     cmd.output().map_err(|e| GitError::Io(e.to_string()))
 }
