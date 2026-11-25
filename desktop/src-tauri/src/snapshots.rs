@@ -2,7 +2,7 @@ use crate::projects::{default_verity_home, normalize_project_path};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +25,8 @@ pub struct TargetedRevertOutcome {
 pub struct TurnCheckpoint {
     pub session_id: String,
     pub entry_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_index: Option<usize>,
     pub prompt_preview: String,
     pub tree_oid: String,
     pub created_at: String,
@@ -199,12 +201,20 @@ fn validate_rel_path(rel_path: &str) -> Result<PathBuf, String> {
 
 fn clean_git_command() -> Command {
     let mut cmd = Command::new("git");
-    cmd.env_remove("GIT_DIR")
+    cmd.stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd
 }
 
@@ -553,12 +563,19 @@ fn now_epoch_secs_string() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-pub fn load_checkpoint_store(project_dir: &Path) -> CheckpointStore {
+fn load_checkpoint_store_unlocked(project_dir: &Path) -> CheckpointStore {
     let path = checkpoints_path_for_project(project_dir);
     let Ok(raw) = fs::read_to_string(&path) else {
         return CheckpointStore::default();
     };
     serde_json::from_str(&raw).unwrap_or_default()
+}
+
+pub fn load_checkpoint_store(project_dir: &Path) -> CheckpointStore {
+    let _guard = SNAPSHOT_GIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    load_checkpoint_store_unlocked(project_dir)
 }
 
 pub fn save_checkpoint_store(project_dir: &Path, store: &CheckpointStore) -> Result<(), String> {
@@ -578,10 +595,12 @@ pub fn save_checkpoint_store(project_dir: &Path, store: &CheckpointStore) -> Res
     })
 }
 
+#[allow(dead_code)]
 pub fn record_turn_checkpoint(
     project_dir: &Path,
     session_id: String,
     entry_id: String,
+    turn_index: Option<usize>,
     prompt_preview: String,
     tree_oid: String,
 ) -> Result<TurnCheckpoint, String> {
@@ -589,10 +608,42 @@ pub fn record_turn_checkpoint(
     let _guard = SNAPSHOT_GIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut store = load_checkpoint_store(project_dir);
+    let mut store = load_checkpoint_store_unlocked(project_dir);
     let cp = TurnCheckpoint {
         session_id,
         entry_id,
+        turn_index,
+        prompt_preview: normalize_prompt_preview(&prompt_preview),
+        tree_oid,
+        created_at: now_epoch_secs_string(),
+    };
+    store.checkpoints.push(cp.clone());
+    save_checkpoint_store(project_dir, &store)?;
+    Ok(cp)
+}
+
+/// Captures a working-tree snapshot and atomically records a 0-based turn checkpoint
+/// under `SNAPSHOT_GIT_LOCK` so any subsequent revert serializes behind an in-flight capture.
+pub fn capture_and_record_turn_checkpoint(
+    project_dir: &Path,
+    session_id: String,
+    prompt_preview: String,
+) -> Result<TurnCheckpoint, String> {
+    let _guard = SNAPSHOT_GIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_, _, tree_oid) = capture_snapshot_locked(project_dir)?;
+    let mut store = load_checkpoint_store_unlocked(project_dir);
+    let turn_index = store
+        .checkpoints
+        .iter()
+        .filter(|c| c.session_id == session_id)
+        .count();
+    let entry_id = format!("turn-{}", store.checkpoints.len() + 1);
+    let cp = TurnCheckpoint {
+        session_id,
+        entry_id,
+        turn_index: Some(turn_index),
         prompt_preview: normalize_prompt_preview(&prompt_preview),
         tree_oid,
         created_at: now_epoch_secs_string(),
@@ -611,7 +662,7 @@ pub fn save_last_redo(
     let _guard = SNAPSHOT_GIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut store = load_checkpoint_store(project_dir);
+    let mut store = load_checkpoint_store_unlocked(project_dir);
     store.last_redo = Some(LastRedoState {
         redo_tree_oid,
         files,
@@ -627,22 +678,26 @@ pub fn clear_last_redo(project_dir: &Path) -> Result<(), String> {
     let _guard = SNAPSHOT_GIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut store = load_checkpoint_store(project_dir);
+    let mut store = load_checkpoint_store_unlocked(project_dir);
     store.last_redo = None;
     save_checkpoint_store(project_dir, &store)
 }
 
-/// Finds a turn checkpoint by exact `entry_id` first (preferring matching `session_id`),
-/// then by normalized `prompt_preview` (latest match).
+/// Finds a turn checkpoint in priority order:
+/// 1. `(session_id, entry_id)` (then any session with `entry_id`)
+/// 2. `(session_id, turn_index)` (falling back to `"default-session"`, or any session when `session_id` is absent)
+/// 3. `(session_id, normalized_prompt_preview)` (then any session with `normalized_prompt_preview`)
 pub fn find_checkpoint(
     store: &CheckpointStore,
     session_id: Option<&str>,
     entry_id: &str,
+    turn_index: Option<usize>,
     prompt_text: Option<&str>,
 ) -> Option<TurnCheckpoint> {
     let trimmed_entry = entry_id.trim();
+    let active_sid = session_id.filter(|s| !s.trim().is_empty());
 
-    if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+    if let Some(sid) = active_sid {
         if let Some(cp) = store
             .checkpoints
             .iter()
@@ -662,10 +717,38 @@ pub fn find_checkpoint(
         return Some(cp.clone());
     }
 
+    if let Some(idx) = turn_index {
+        if let Some(sid) = active_sid {
+            if let Some(cp) = store
+                .checkpoints
+                .iter()
+                .rev()
+                .find(|c| c.session_id == sid && c.turn_index == Some(idx))
+            {
+                return Some(cp.clone());
+            }
+            if let Some(cp) = store
+                .checkpoints
+                .iter()
+                .rev()
+                .find(|c| c.session_id == "default-session" && c.turn_index == Some(idx))
+            {
+                return Some(cp.clone());
+            }
+        } else if let Some(cp) = store
+            .checkpoints
+            .iter()
+            .rev()
+            .find(|c| c.turn_index == Some(idx))
+        {
+            return Some(cp.clone());
+        }
+    }
+
     if let Some(prompt) = prompt_text {
         let norm = normalize_prompt_preview(prompt);
         if !norm.is_empty() {
-            if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+            if let Some(sid) = active_sid {
                 if let Some(cp) = store
                     .checkpoints
                     .iter()
@@ -899,6 +982,7 @@ pub(crate) mod tests {
             &project.path,
             "sess-1".to_string(),
             "turn-1".to_string(),
+            Some(0),
             "  Fix   the login bug  ".to_string(),
             fake_oid.clone(),
         )
@@ -907,19 +991,47 @@ pub(crate) mod tests {
         let store = load_checkpoint_store(&project.path);
         assert_eq!(store.checkpoints.len(), 1);
         assert_eq!(store.checkpoints[0].prompt_preview, "Fix the login bug");
+        assert_eq!(store.checkpoints[0].turn_index, Some(0));
 
-        let by_id = find_checkpoint(&store, Some("sess-1"), "turn-1", None).unwrap();
+        let by_id = find_checkpoint(&store, Some("sess-1"), "turn-1", None, None).unwrap();
         assert_eq!(by_id.tree_oid, fake_oid);
+
+        let by_turn_idx =
+            find_checkpoint(&store, Some("sess-1"), "pi-entry-99", Some(0), None).unwrap();
+        assert_eq!(by_turn_idx.tree_oid, fake_oid);
 
         let by_prompt = find_checkpoint(
             &store,
             Some("sess-1"),
             "pi-entry-99",
+            Some(99),
             Some("Fix the login bug"),
         )
         .unwrap();
         assert_eq!(by_prompt.tree_oid, fake_oid);
 
-        assert!(find_checkpoint(&store, Some("sess-1"), "unknown", Some("other")).is_none());
+        assert!(
+            find_checkpoint(&store, Some("sess-1"), "unknown", Some(5), Some("other")).is_none()
+        );
+    }
+
+    #[test]
+    fn clean_git_command_suppresses_windows_console_and_terminal_prompts() {
+        let cmd = clean_git_command();
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "GIT_TERMINAL_PROMPT" && *v == Some(std::ffi::OsStr::new("0"))),
+            "clean_git_command must set GIT_TERMINAL_PROMPT=0"
+        );
+        let source = include_str!("snapshots.rs");
+        assert!(
+            source.contains("CREATE_NO_WINDOW"),
+            "snapshots.rs must configure CREATE_NO_WINDOW on Windows"
+        );
+        assert!(
+            source.contains("Stdio::null()"),
+            "snapshots.rs must attach Stdio::null() to git stdin"
+        );
     }
 }
