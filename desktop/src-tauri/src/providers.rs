@@ -12,9 +12,8 @@ use verity_core::provider::{validate_external_sign_in_url, validate_provider_url
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static STORE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-pub const VERITY_PI_EXTENSION_FILENAME: &str = "verity-providers.js";
-pub const VERITY_PI_EXTENSION_SOURCE: &str =
-    include_str!("../resources/verity-providers-extension.js");
+pub const VERITY_PI_EXTENSION_FILENAME: &str = "verity-extension.ts";
+pub const VERITY_PI_EXTENSION_SOURCE: &str = include_str!("../resources/verity-extension.ts");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderApi {
@@ -264,7 +263,7 @@ pub fn ensure_verity_pi_extension_at(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Ensures the embedded Verity Pi provider extension is materialized at
-/// `~/.verity/extensions/verity-providers.js`.
+/// `~/.verity/extensions/verity-extension.ts`.
 pub fn ensure_verity_pi_extension_path() -> Result<PathBuf, String> {
     ensure_verity_pi_extension_at(&default_pi_extension_path())
 }
@@ -1035,5 +1034,25 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedded_verity_extension_registers_providers_and_subagent_tools() {
+        assert_eq!(VERITY_PI_EXTENSION_FILENAME, "verity-extension.ts");
+        assert!(
+            VERITY_PI_EXTENSION_SOURCE.contains("registerProvider"),
+            "embedded extension must register custom providers"
+        );
+        for tool_name in [
+            "verity_run_readonly",
+            "verity_spawn_write",
+            "verity_list_handoffs",
+        ] {
+            assert!(
+                VERITY_PI_EXTENSION_SOURCE.contains(tool_name),
+                "embedded extension must register tool {}",
+                tool_name
+            );
+        }
     }
 }

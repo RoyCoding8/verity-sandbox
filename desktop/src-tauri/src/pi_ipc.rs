@@ -16,8 +16,9 @@ use crate::providers::{
     PublicProviderProfile,
 };
 use crate::snapshots::{
-    capture_snapshot, clear_last_redo, find_checkpoint, load_checkpoint_store, load_last_redo,
-    record_turn_checkpoint, redo_targeted_revert, revert_to_snapshot, save_last_redo,
+    capture_and_record_turn_checkpoint, clear_last_redo, find_checkpoint, load_checkpoint_store,
+    load_last_redo, normalize_prompt_preview, redo_targeted_revert, revert_to_snapshot,
+    save_last_redo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -520,6 +521,55 @@ pub fn parse_session_summary(
     }
 }
 
+fn flatten_history_tree_nodes(
+    items: &[JsonValue],
+    default_depth: usize,
+    out: &mut Vec<HistoryTreeNode>,
+) {
+    for item in items {
+        let node_obj = item
+            .get("entry")
+            .filter(|v| v.as_object().is_some())
+            .unwrap_or(item);
+        let msg_obj = node_obj.get("message").filter(|v| v.as_object().is_some());
+
+        let id = opt_str(node_obj, &["id", "entryId", "entry_id"])
+            .unwrap_or_else(|| format!("node-{}", out.len() + 1));
+        let parent_id = opt_str(node_obj, &["parentId", "parent_id"]);
+        let role = normalize_role(
+            opt_str(node_obj, &["role"]).or_else(|| msg_obj.and_then(|m| opt_str(m, &["role"]))),
+        );
+        let preview = opt_str(node_obj, &["preview", "text", "content"])
+            .or_else(|| msg_obj.map(extract_message_content))
+            .unwrap_or_default();
+        let timestamp = opt_timestamp(node_obj, &["timestamp", "createdAt", "created_at"])
+            .or_else(|| {
+                msg_obj.and_then(|m| opt_timestamp(m, &["timestamp", "createdAt", "created_at"]))
+            })
+            .unwrap_or_else(|| "now".to_string());
+        let depth = opt_usize(item, &["depth"])
+            .or_else(|| opt_usize(node_obj, &["depth"]))
+            .unwrap_or(default_depth);
+        let is_active_branch = opt_bool(item, &["isActiveBranch", "is_active_branch"])
+            .or_else(|| opt_bool(node_obj, &["isActiveBranch", "is_active_branch"]))
+            .unwrap_or(true);
+
+        out.push(HistoryTreeNode {
+            id,
+            parent_id,
+            role,
+            preview,
+            timestamp,
+            depth,
+            is_active_branch,
+        });
+
+        if let Some(children) = item.get("children").and_then(JsonValue::as_array) {
+            flatten_history_tree_nodes(children, depth + 1, out);
+        }
+    }
+}
+
 pub fn parse_history_tree(val: &JsonValue) -> Vec<HistoryTreeNode> {
     let items = match val {
         JsonValue::Array(arr) => arr,
@@ -535,22 +585,9 @@ pub fn parse_history_tree(val: &JsonValue) -> Vec<HistoryTreeNode> {
         _ => return Vec::new(),
     };
 
-    items
-        .iter()
-        .enumerate()
-        .map(|(idx, item)| HistoryTreeNode {
-            id: opt_str(item, &["id", "entryId", "entry_id"])
-                .unwrap_or_else(|| format!("node-{}", idx + 1)),
-            parent_id: opt_str(item, &["parentId", "parent_id"]),
-            role: normalize_role(opt_str(item, &["role"])),
-            preview: opt_str(item, &["preview", "text", "content"]).unwrap_or_default(),
-            timestamp: opt_timestamp(item, &["timestamp", "createdAt", "created_at"])
-                .unwrap_or_else(|| "now".to_string()),
-            depth: opt_usize(item, &["depth"]).unwrap_or(0),
-            is_active_branch: opt_bool(item, &["isActiveBranch", "is_active_branch"])
-                .unwrap_or(true),
-        })
-        .collect()
+    let mut out = Vec::new();
+    flatten_history_tree_nodes(items, 0, &mut out);
+    out
 }
 
 pub fn parse_fork_candidates(val: &JsonValue) -> Vec<ForkCandidate> {
@@ -1832,16 +1869,17 @@ impl PiAppState {
         images: Vec<PendingAttachment>,
     ) -> Result<(), String> {
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
-        self.record_pre_prompt_checkpoint(&message);
+        let bg_state = self.clone();
+        let bg_message = message.clone();
+        std::thread::spawn(move || {
+            bg_state.record_pre_prompt_checkpoint(&bg_message);
+        });
         sup.prompt(message, images).map_err(|e| e.to_string())?;
         Ok(())
     }
 
     fn record_pre_prompt_checkpoint(&self, message: &str) {
         let project_dir = self.project_path();
-        let Ok(tree_oid) = capture_snapshot(&project_dir) else {
-            return;
-        };
         let session_id = self
             .inner
             .active_session_id
@@ -1849,15 +1887,7 @@ impl PiAppState {
             .expect("active_session_id lock poisoned")
             .clone()
             .unwrap_or_else(|| "default-session".to_string());
-        let existing_count = load_checkpoint_store(&project_dir).checkpoints.len();
-        let entry_id = format!("turn-{}", existing_count + 1);
-        let _ = record_turn_checkpoint(
-            &project_dir,
-            session_id,
-            entry_id,
-            message.to_string(),
-            tree_oid,
-        );
+        let _ = capture_and_record_turn_checkpoint(&project_dir, session_id, message.to_string());
     }
 
     pub fn list_checkpoints(&self) -> Result<Vec<TurnCheckpointView>, String> {
@@ -1908,6 +1938,8 @@ impl PiAppState {
         event_sink: EventSink,
         entry_id: String,
         revert_code: bool,
+        user_turn_index: Option<usize>,
+        prompt_text: Option<String>,
     ) -> Result<RevertTurnResult, String> {
         let entry_id = require_non_empty("entryId", &entry_id)?;
         let sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink))?;
@@ -1925,109 +1957,152 @@ impl PiAppState {
                     .and_then(|v| opt_str(&v, &["id", "sessionId", "session_id"]))
             });
 
-        let tree = sup
-            .get_tree()
-            .ok()
-            .and_then(|r| parse_data_json(&r))
-            .map(|v| parse_history_tree(&v))
-            .unwrap_or_default();
+        // Step 1: Obtain Pi's authoritative user-turn fork candidates on the active branch.
         let fork_candidates = sup
             .get_fork_messages()
             .ok()
             .and_then(|r| parse_data_json(&r))
             .map(|v| parse_fork_candidates(&v))
             .unwrap_or_default();
-        let current_messages = sup
-            .get_messages()
-            .ok()
-            .and_then(|r| parse_data_json(&r))
-            .map(|v| parse_chat_messages(&v))
-            .unwrap_or_default();
 
-        let project_dir = self.project_path();
-        let store = load_checkpoint_store(&project_dir);
-
-        let restored_prompt = current_messages
+        // Step 2: Resolve target user turn in priority order:
+        // (1) exact entry_id match, (2) user_turn_index, (3) normalized prompt_text match.
+        let resolved: Option<(usize, &ForkCandidate)> = fork_candidates
             .iter()
-            .find(|m| m.id == entry_id)
-            .map(|m| m.content.clone())
+            .enumerate()
+            .find(|(_, c)| c.entry_id == entry_id)
+            .or_else(|| user_turn_index.and_then(|idx| fork_candidates.get(idx).map(|c| (idx, c))))
             .or_else(|| {
-                fork_candidates
-                    .iter()
-                    .find(|c| c.entry_id == entry_id)
-                    .map(|c| c.preview.clone())
-            })
-            .or_else(|| {
-                tree.iter()
-                    .find(|n| n.id == entry_id)
-                    .map(|n| n.preview.clone())
-            })
-            .or_else(|| {
-                store
-                    .checkpoints
-                    .iter()
-                    .rev()
-                    .find(|c| c.entry_id == entry_id)
-                    .map(|c| c.prompt_preview.clone())
+                prompt_text
+                    .as_deref()
+                    .map(normalize_prompt_preview)
+                    .filter(|norm| !norm.is_empty())
+                    .and_then(|norm| {
+                        fork_candidates
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find(|(_, c)| normalize_prompt_preview(&c.preview) == norm)
+                    })
             });
 
-        // Determine rewind target: fork to parent entry, or start a new session if reverting the first user turn.
-        enum RewindAction {
-            ForkTo(String),
-            NewSession,
-        }
+        let project_dir = self.project_path();
+        let project_id = project_from_path(&project_dir).id;
 
-        let rewind_action = if let Some(node) = tree.iter().find(|n| n.id == entry_id) {
-            match node
-                .parent_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                Some(parent) => RewindAction::ForkTo(parent.to_string()),
-                None => RewindAction::NewSession,
-            }
-        } else if let Some(idx) = current_messages.iter().position(|m| m.id == entry_id) {
-            if idx == 0 {
-                RewindAction::NewSession
-            } else {
-                RewindAction::ForkTo(current_messages[idx - 1].id.clone())
-            }
-        } else if let Some(idx) = fork_candidates.iter().position(|c| c.entry_id == entry_id) {
-            if idx == 0 {
-                RewindAction::NewSession
-            } else {
-                RewindAction::ForkTo(fork_candidates[idx - 1].entry_id.clone())
-            }
-        } else {
-            RewindAction::ForkTo(entry_id.clone())
-        };
-
-        let SessionWithMessages { session, messages } = match rewind_action {
-            RewindAction::ForkTo(parent_id) => {
-                let resp = sup.fork(&parent_id).map_err(|e| e.to_string())?;
-                self.parse_session_with_messages(&sup, &resp, "session-revert", "Reverted session")?
-            }
-            RewindAction::NewSession => {
+        let fallback_new_session =
+            |sup: &PiSessionSupervisor| -> Result<SessionWithMessages, String> {
                 let resp = sup.new_session(None).map_err(|e| e.to_string())?;
-                let project_id = project_from_path(&project_dir).id;
-                let summary = parse_data_json(&resp)
-                    .map(|v| parse_session_summary(&v, &project_id, "session-new", "New session"))
-                    .unwrap_or_else(|| PiSessionSummary {
+                let data = parse_data_json(&resp);
+                let has_session_id = data.as_ref().is_some_and(|v| {
+                    let obj = v.get("session").unwrap_or(v);
+                    opt_str(obj, &["id", "sessionId", "session_id"]).is_some()
+                });
+                let summary = if has_session_id {
+                    parse_session_summary(
+                        data.as_ref().unwrap(),
+                        &project_id,
+                        "session-new",
+                        "New session",
+                    )
+                } else if let Ok(state_resp) = sup.get_state() {
+                    parse_data_json(&state_resp)
+                        .map(|v| {
+                            parse_session_summary(&v, &project_id, "session-new", "New session")
+                        })
+                        .unwrap_or_else(|| PiSessionSummary {
+                            id: "session-new".to_string(),
+                            project_id: project_id.clone(),
+                            name: "New session".to_string(),
+                            path: String::new(),
+                            updated_at: "Just now".to_string(),
+                            message_count: 0,
+                            parent_session_id: None,
+                            archived: false,
+                        })
+                } else {
+                    PiSessionSummary {
                         id: "session-new".to_string(),
-                        project_id,
+                        project_id: project_id.clone(),
                         name: "New session".to_string(),
                         path: String::new(),
                         updated_at: "Just now".to_string(),
                         message_count: 0,
                         parent_session_id: None,
                         archived: false,
-                    });
-                SessionWithMessages {
+                    }
+                };
+                Ok(SessionWithMessages {
                     session: summary,
                     messages: Vec::new(),
-                }
+                })
+            };
+
+        let (
+            SessionWithMessages { session, messages },
+            restored_prompt,
+            resolved_entry_id,
+            resolved_turn_index,
+        ) = if let Some((target_idx, target)) = resolved {
+            // Never pass synthetic local/stream/msg IDs to Pi fork.
+            if is_synthetic_local_entry_id(&target.entry_id) {
+                return Err(format!(
+                    "Refusing to fork synthetic entry ID '{}'",
+                    target.entry_id
+                ));
             }
+
+            let target_entry_id = target.entry_id.clone();
+            let target_preview =
+                (!target.preview.trim().is_empty()).then(|| target.preview.clone());
+
+            match sup.fork(&target_entry_id) {
+                Ok(resp) => {
+                    let fork_data = parse_data_json(&resp);
+                    if fork_data.as_ref().and_then(|v| opt_bool(v, &["cancelled"])) == Some(true) {
+                        return Err("Revert was cancelled.".to_string());
+                    }
+                    let fork_text = fork_data
+                        .as_ref()
+                        .and_then(|v| opt_str(v, &["text"]))
+                        .filter(|s| !s.trim().is_empty());
+                    let prompt = fork_text.or(target_preview).or_else(|| {
+                        prompt_text
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(ToString::to_string)
+                    });
+                    let swm = self.parse_session_with_messages(
+                        &sup,
+                        &resp,
+                        "session-revert",
+                        "Reverted session",
+                    )?;
+                    (swm, prompt, target_entry_id, Some(target_idx))
+                }
+                Err(_) if target_idx == 0 => {
+                    let swm = fallback_new_session(&sup)?;
+                    let prompt = target_preview.or_else(|| {
+                        prompt_text
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(ToString::to_string)
+                    });
+                    (swm, prompt, target_entry_id, Some(0))
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        } else if fork_candidates.is_empty() && user_turn_index.unwrap_or(0) == 0 {
+            let swm = fallback_new_session(&sup)?;
+            let prompt = prompt_text
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(ToString::to_string);
+            (swm, prompt, entry_id.clone(), Some(0))
+        } else {
+            return Err(format!(
+                "Unable to resolve entry ID '{}' to a valid user turn for forking.",
+                entry_id
+            ));
         };
 
         *self
@@ -2036,11 +2111,13 @@ impl PiAppState {
             .lock()
             .expect("active_session_id lock poisoned") = Some(session.id.clone());
 
+        let store = load_checkpoint_store(&project_dir);
         let (code_reverted, reverted_files, can_redo, code_revert_note) = if revert_code {
             if let Some(cp) = find_checkpoint(
                 &store,
                 session_id.as_deref(),
-                &entry_id,
+                &resolved_entry_id,
+                resolved_turn_index,
                 restored_prompt.as_deref(),
             ) {
                 let outcome = revert_to_snapshot(&project_dir, &cp.tree_oid)?;
@@ -2447,23 +2524,57 @@ impl PiAppState {
     ) -> Result<SessionWithMessages, String> {
         let project_id = project_from_path(&self.project_path()).id;
         let data = parse_data_json(resp);
-        let mut session = data
-            .as_ref()
-            .map(|v| parse_session_summary(v, &project_id, fallback_id, fallback_name))
-            .unwrap_or_else(|| PiSessionSummary {
+        let has_session_id = data.as_ref().is_some_and(|v| {
+            let obj = v.get("session").unwrap_or(v);
+            opt_str(obj, &["id", "sessionId", "session_id"]).is_some()
+        });
+        let mut session = if has_session_id {
+            parse_session_summary(
+                data.as_ref().unwrap(),
+                &project_id,
+                fallback_id,
+                fallback_name,
+            )
+        } else if let Ok(state_resp) = sup.get_state() {
+            parse_data_json(&state_resp)
+                .map(|v| parse_session_summary(&v, &project_id, fallback_id, fallback_name))
+                .unwrap_or_else(|| PiSessionSummary {
+                    id: fallback_id.to_string(),
+                    project_id: project_id.clone(),
+                    name: fallback_name.to_string(),
+                    path: String::new(),
+                    updated_at: "Just now".to_string(),
+                    message_count: 0,
+                    parent_session_id: None,
+                    archived: false,
+                })
+        } else {
+            PiSessionSummary {
                 id: fallback_id.to_string(),
-                project_id,
+                project_id: project_id.clone(),
                 name: fallback_name.to_string(),
                 path: String::new(),
                 updated_at: "Just now".to_string(),
                 message_count: 0,
                 parent_session_id: None,
                 archived: false,
-            });
+            }
+        };
 
-        let mut messages = data.as_ref().map(parse_chat_messages).unwrap_or_default();
+        let has_messages = data
+            .as_ref()
+            .is_some_and(|v| v.get("messages").and_then(JsonValue::as_array).is_some());
+        let mut messages = if has_messages {
+            data.as_ref().map(parse_chat_messages).unwrap_or_default()
+        } else if let Ok(msgs_resp) = sup.get_messages() {
+            parse_data_json(&msgs_resp)
+                .map(|v| parse_chat_messages(&v))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
-        if messages.is_empty() {
+        if messages.is_empty() && !has_messages {
             if let Ok(msgs_resp) = sup.get_messages() {
                 if let Some(val) = parse_data_json(&msgs_resp) {
                     messages = parse_chat_messages(&val);
@@ -2475,6 +2586,11 @@ impl PiAppState {
         }
         Ok(SessionWithMessages { session, messages })
     }
+}
+
+fn is_synthetic_local_entry_id(id: &str) -> bool {
+    let trimmed = id.trim();
+    trimmed.starts_with("local-") || trimmed.starts_with("stream-") || trimmed.starts_with("msg-")
 }
 
 fn tauri_event_sink<R: Runtime>(app: &AppHandle<R>) -> EventSink {
@@ -2956,11 +3072,13 @@ pub async fn pi_revert_turn(
     state: State<'_, PiAppState>,
     entry_id: String,
     revert_code: bool,
+    user_turn_index: Option<usize>,
+    prompt_text: Option<String>,
 ) -> Result<RevertTurnResult, String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        app_state.revert_turn_with_sink(sink, entry_id, revert_code)
+        app_state.revert_turn_with_sink(sink, entry_id, revert_code, user_turn_index, prompt_text)
     })
     .await
     .map_err(|e| format!("blocking task failed: {}", e))?
@@ -4254,7 +4372,12 @@ while IFS= read -r line; do
       printf '{"type":"response","id":"%s","command":"get_messages","success":true,"data":{"messages":[{"id":"u-1","role":"user","content":"Refactor main","timestamp":"t1"},{"id":"u-2","role":"user","content":"Unrecorded turn","timestamp":"t3"}]}}\n' "$id"
       ;;
     fork)
-      printf '{"type":"response","id":"%s","command":"fork","success":true,"data":{"id":"sess-forked","name":"Forked","messages":[{"id":"u-1","role":"user","content":"Refactor main","timestamp":"t1"}]}}\n' "$id"
+      eid=$(printf '%s\n' "$line" | sed -n 's/.*"entryId":"\([^"]*\)".*/\1/p')
+      if [ "$eid" = "u-1" ]; then
+        printf '{"type":"response","id":"%s","command":"fork","success":false,"error":"cannot fork first turn"}\n' "$id"
+      else
+        printf '{"type":"response","id":"%s","command":"fork","success":true,"data":{"id":"sess-forked","name":"Forked","messages":[{"id":"u-1","role":"user","content":"Refactor main","timestamp":"t1"}]}}\n' "$id"
+      fi
       ;;
     prompt)
       printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
@@ -4288,7 +4411,15 @@ done
         settled_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("agent should settle after prompt");
-        let cps = state.list_checkpoints().unwrap();
+        // Background pre-prompt snapshot capture finishes shortly after prompt_with_sink returns.
+        let mut cps = Vec::new();
+        for _ in 0..40 {
+            cps = state.list_checkpoints().unwrap();
+            if !cps.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert_eq!(cps.len(), 1);
         assert!(cps[0].has_code_snapshot);
         assert_eq!(cps[0].prompt_preview, "Refactor main");
@@ -4296,7 +4427,7 @@ done
         fs::write(&code_file, "fn main() { /* v2 */ }\n").unwrap();
 
         let missing = state
-            .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true)
+            .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true, None, None)
             .unwrap();
         assert!(!missing.code_reverted);
         assert!(!missing.can_redo);
@@ -4310,7 +4441,7 @@ done
         );
 
         let reverted = state
-            .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true)
+            .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true, None, None)
             .unwrap();
         assert!(reverted.code_reverted);
         assert!(reverted.can_redo);
@@ -4514,5 +4645,167 @@ done
 
         state.shutdown();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_turn_resolves_local_ids_via_fork_messages_and_never_sends_local_id_to_fork() {
+        let dir = unique_temp_dir("revert-local-ids");
+        let project_dir = dir.join("repo");
+        fs::create_dir_all(&project_dir).unwrap();
+        let store_path = dir.join("providers.json");
+
+        // Fake Pi that strictly rejects any synthetic local-*/stream-*/msg-* ID on `fork`,
+        // and returns real Pi-shaped `{ text, cancelled }` without `{ session, messages }`.
+        let script = r#"
+FORK_COUNT=0
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    get_state)
+      if [ "$FORK_COUNT" -eq 0 ]; then
+        printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"id":"sess-live-1","name":"Live Session"}}\n' "$id"
+      else
+        printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"id":"sess-forked-%s","name":"Forked Real Session"}}\n' "$id" "$FORK_COUNT"
+      fi
+      ;;
+    get_fork_messages)
+      printf '{"type":"response","id":"%s","command":"get_fork_messages","success":true,"data":{"messages":[{"entryId":"srv-u1","role":"user","preview":"First real prompt","timestamp":"t1"},{"entryId":"srv-u2","role":"user","preview":"Second real prompt","timestamp":"t2"}]}}\n' "$id"
+      ;;
+    get_messages)
+      if [ "$FORK_COUNT" -eq 1 ]; then
+        printf '{"type":"response","id":"%s","command":"get_messages","success":true,"data":{"messages":[{"id":"srv-u1","role":"user","content":"First real prompt","timestamp":"t1"}]}}\n' "$id"
+      else
+        printf '{"type":"response","id":"%s","command":"get_messages","success":true,"data":{"messages":[]}}\n' "$id"
+      fi
+      ;;
+    fork)
+      eid=$(printf '%s\n' "$line" | sed -n 's/.*"entryId":"\([^"]*\)".*/\1/p')
+      case "$eid" in
+        local-*|stream-*|msg-*)
+          printf '{"type":"response","id":"%s","command":"fork","success":false,"error":"Invalid entry ID for forking"}\n' "$id"
+          ;;
+        srv-u2)
+          FORK_COUNT=1
+          printf '{"type":"response","id":"%s","command":"fork","success":true,"data":{"text":"Second real prompt","cancelled":false}}\n' "$id"
+          ;;
+        srv-u1)
+          FORK_COUNT=2
+          printf '{"type":"response","id":"%s","command":"fork","success":true,"data":{"text":"First real prompt","cancelled":false}}\n' "$id"
+          ;;
+        *)
+          printf '{"type":"response","id":"%s","command":"fork","success":false,"error":"Unknown entry ID"}\n' "$id"
+          ;;
+      esac
+      ;;
+    *)
+      printf '{"type":"response","id":"%s","command":"%s","success":true}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#;
+
+        let state = PiAppState::with_config(
+            project_dir.clone(),
+            store_path,
+            mock_sh_config(project_dir.clone(), script),
+        );
+        let sink: EventSink = Arc::new(|_| {});
+
+        // 1. Revert "local-2" resolved via user_turn_index = Some(1) -> forks "srv-u2" directly,
+        // refreshes real session metadata via get_state() + get_messages().
+        let rev2 = state
+            .revert_turn_with_sink(
+                Arc::clone(&sink),
+                "local-2".to_string(),
+                false,
+                Some(1),
+                Some("Second real prompt".to_string()),
+            )
+            .expect("local-2 must resolve to srv-u2 and succeed");
+        assert_eq!(rev2.session.id, "sess-forked-1");
+        assert_eq!(rev2.session.name, "Forked Real Session");
+        assert_eq!(rev2.messages.len(), 1);
+        assert_eq!(rev2.messages[0].id, "srv-u1");
+        assert_eq!(rev2.restored_prompt.as_deref(), Some("Second real prompt"));
+
+        // 2. Revert "local-1" resolved via normalized prompt_text (even without user_turn_index).
+        let rev1 = state
+            .revert_turn_with_sink(
+                Arc::clone(&sink),
+                "local-1".to_string(),
+                false,
+                None,
+                Some("  First   real prompt  ".to_string()),
+            )
+            .expect("local-1 must resolve via prompt_text to srv-u1 and succeed");
+        assert_eq!(rev1.session.id, "sess-forked-2");
+        assert!(rev1.messages.is_empty());
+        assert_eq!(rev1.restored_prompt.as_deref(), Some("First real prompt"));
+
+        // 3. Unresolved local ID with no matching index/prompt must fail cleanly without calling fork.
+        let err = state
+            .revert_turn_with_sink(
+                Arc::clone(&sink),
+                "local-999".to_string(),
+                false,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("Unable to resolve entry ID"),
+            "unexpected error: {}",
+            err
+        );
+
+        state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_history_tree_flattens_nested_pi_tree_entries() {
+        let nested = parse_json(
+            r#"{
+                "tree": [
+                    {
+                        "entry": {
+                            "id": "e1",
+                            "parentId": null,
+                            "type": "message",
+                            "timestamp": "2026-11-24T10:00:00Z",
+                            "message": { "role": "user", "content": "Hello" }
+                        },
+                        "children": [
+                            {
+                                "entry": {
+                                    "id": "e2",
+                                    "parentId": "e1",
+                                    "type": "message",
+                                    "timestamp": "2026-11-24T10:00:05Z",
+                                    "message": { "role": "assistant", "content": [{ "type": "text", "text": "Hi there" }] }
+                                },
+                                "children": []
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let nodes = parse_history_tree(&nested);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].id, "e1");
+        assert_eq!(nodes[0].parent_id, None);
+        assert_eq!(nodes[0].role, "user");
+        assert_eq!(nodes[0].preview, "Hello");
+        assert_eq!(nodes[0].depth, 0);
+
+        assert_eq!(nodes[1].id, "e2");
+        assert_eq!(nodes[1].parent_id.as_deref(), Some("e1"));
+        assert_eq!(nodes[1].role, "assistant");
+        assert_eq!(nodes[1].preview, "Hi there");
+        assert_eq!(nodes[1].depth, 1);
     }
 }

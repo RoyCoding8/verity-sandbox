@@ -469,6 +469,10 @@ pub enum PiUiEvent {
         delta: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thinking_delta: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_phase: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_content: Option<String>,
         raw_json: String,
     },
     MessageEnd {
@@ -500,6 +504,8 @@ pub enum PiUiEvent {
         tool_call_id: Option<String>,
         tool_name: Option<String>,
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
         raw_json: String,
     },
     CompactionStart {
@@ -620,11 +626,52 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
             raw_json,
         }),
         "message_update" | "content_block_delta" => {
+            let ame = val
+                .get("assistantMessageEvent")
+                .or_else(|| val.get("assistant_message_event"));
+            let ame_type = ame.and_then(|o| o.get("type")).and_then(JsonValue::as_str);
+
+            if matches!(
+                ame_type,
+                Some(
+                    "toolcall_start"
+                        | "toolcall_delta"
+                        | "toolcall_end"
+                        | "text_start"
+                        | "start"
+                        | "done"
+                )
+            ) {
+                return None;
+            }
+
+            let (thinking_phase, thinking_content) = match ame_type {
+                Some("thinking_start") => (Some("start".to_string()), None),
+                Some("thinking_end") => (
+                    Some("end".to_string()),
+                    ame.and_then(|o| {
+                        opt_non_empty_str(
+                            o,
+                            &[
+                                "content",
+                                "thinking",
+                                "reasoning",
+                                "reasoning_content",
+                                "text",
+                            ],
+                        )
+                    }),
+                ),
+                _ => (None, None),
+            };
+
             let (delta, thinking_delta) = parse_message_update_deltas(val);
             Some(PiUiEvent::MessageUpdate {
                 message_id: opt_str_or_nested(val, "message", &["messageId", "message_id", "id"]),
                 delta,
                 thinking_delta,
+                thinking_phase,
+                thinking_content,
                 raw_json,
             })
         }
@@ -652,7 +699,7 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
         "tool_execution_update" => Some(PiUiEvent::ToolExecutionUpdate {
             tool_call_id: opt_str(val, &["toolCallId", "tool_call_id", "id"]),
             tool_name: opt_str(val, &["toolName", "tool_name", "name"]),
-            partial_result: opt_str_or_json(
+            partial_result: opt_tool_output_text(
                 val,
                 &["partialResult", "partial_result", "output", "delta"],
             ),
@@ -666,6 +713,16 @@ pub fn parse_pi_ui_event(val: &JsonValue, raw_json: &str) -> Option<PiUiEvent> {
                 .or_else(|| val.get("is_error"))
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false),
+            result: opt_tool_output_text(
+                val,
+                &[
+                    "result",
+                    "output",
+                    "content",
+                    "partialResult",
+                    "partial_result",
+                ],
+            ),
             raw_json,
         }),
         "compaction_start" => Some(PiUiEvent::CompactionStart {
@@ -792,6 +849,55 @@ fn opt_str_or_json(val: &JsonValue, keys: &[&str]) -> Option<String> {
     })
 }
 
+/// Unwraps Pi/Anthropic tool result JSON envelopes (`{"content":[{"type":"text","text":"..."}]}`,
+/// `{"content":[{"text":"..."}]}`, `{"output":"..."}`, `{"text":"..."}`) into clean plain text,
+/// falling back to compact JSON serialization for arbitrary non-text payloads.
+pub fn extract_tool_output_text(val: &JsonValue) -> Option<String> {
+    match val {
+        JsonValue::Null => None,
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Object(_) => {
+            if let Some(content) = val.get("content") {
+                match content {
+                    JsonValue::String(s) => return Some(s.clone()),
+                    JsonValue::Array(blocks) => {
+                        let mut parts = Vec::new();
+                        for block in blocks {
+                            if let Some(s) = block.as_str() {
+                                parts.push(s.to_string());
+                            } else if block.as_object().is_some() {
+                                let is_text_or_untyped = matches!(
+                                    block.get("type").and_then(JsonValue::as_str),
+                                    Some("text") | None
+                                );
+                                if is_text_or_untyped {
+                                    if let Some(t) = opt_str(block, &["text", "content"]) {
+                                        parts.push(t);
+                                    }
+                                }
+                            }
+                        }
+                        if !parts.is_empty() {
+                            return Some(parts.join("\n"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(s) = opt_str(val, &["output", "text"]) {
+                return Some(s);
+            }
+            Some(to_json_string(val))
+        }
+        other => Some(to_json_string(other)),
+    }
+}
+
+fn opt_tool_output_text(val: &JsonValue, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| val.get(k).and_then(extract_tool_output_text))
+}
+
 fn opt_str_or_nested(val: &JsonValue, nested_key: &str, keys: &[&str]) -> Option<String> {
     opt_str(val, keys).or_else(|| val.get(nested_key).and_then(|obj| opt_str(obj, keys)))
 }
@@ -843,12 +949,22 @@ fn parse_nested_delta_object(delta_obj: &JsonValue) -> (Option<String>, Option<S
         Some("text_delta") => (opt_non_empty_str(delta_obj, &["text", "delta"]), None),
         Some("thinking_delta") | Some("reasoning_delta") => (
             None,
-            opt_non_empty_str(delta_obj, &["thinking", "text", "delta"]),
+            opt_non_empty_str(
+                delta_obj,
+                &[
+                    "thinking",
+                    "reasoning",
+                    "reasoning_content",
+                    "text",
+                    "delta",
+                ],
+            ),
         ),
-        _ => (
+        None => (
             opt_non_empty_str(delta_obj, &["text", "delta"]),
-            opt_non_empty_str(delta_obj, &["thinking"]),
+            opt_non_empty_str(delta_obj, &["thinking", "reasoning", "reasoning_content"]),
         ),
+        Some(_) => (None, None),
     }
 }
 
@@ -860,9 +976,19 @@ fn parse_message_update_deltas(val: &JsonValue) -> (Option<String>, Option<Strin
         if let Some(ame_type) = ame.get("type").and_then(JsonValue::as_str) {
             return match ame_type {
                 "text_delta" => (opt_non_empty_str(ame, &["delta", "text"]), None),
-                "thinking_delta" | "reasoning_delta" => {
-                    (None, opt_non_empty_str(ame, &["delta", "thinking", "text"]))
-                }
+                "thinking_delta" | "reasoning_delta" => (
+                    None,
+                    opt_non_empty_str(
+                        ame,
+                        &[
+                            "delta",
+                            "thinking",
+                            "reasoning",
+                            "reasoning_content",
+                            "text",
+                        ],
+                    ),
+                ),
                 "content_block_delta" => {
                     if let Some(delta_obj) = ame.get("delta").filter(|d| d.as_object().is_some()) {
                         parse_nested_delta_object(delta_obj)
@@ -871,7 +997,15 @@ fn parse_message_update_deltas(val: &JsonValue) -> (Option<String>, Option<Strin
                             opt_non_empty_str(ame, &["delta", "text"]),
                             opt_non_empty_str(
                                 ame,
-                                &["thinking", "thinking_delta", "thinkingDelta"],
+                                &[
+                                    "thinking",
+                                    "thinking_delta",
+                                    "thinkingDelta",
+                                    "reasoning",
+                                    "reasoning_content",
+                                    "reasoning_delta",
+                                    "reasoningDelta",
+                                ],
                             ),
                         )
                     }
@@ -893,6 +1027,8 @@ fn parse_message_update_deltas(val: &JsonValue) -> (Option<String>, Option<Strin
             "thinkingDelta",
             "reasoning_delta",
             "reasoningDelta",
+            "reasoning",
+            "reasoning_content",
         ],
     );
     if flat_delta.is_some() || flat_thinking.is_some() {
@@ -911,6 +1047,8 @@ fn parse_message_update_deltas(val: &JsonValue) -> (Option<String>, Option<Strin
                 "thinkingDelta",
                 "reasoning_delta",
                 "reasoningDelta",
+                "reasoning",
+                "reasoning_content",
             ],
         );
         if msg_delta.is_some() || msg_thinking.is_some() {
@@ -2444,6 +2582,8 @@ done
                 message_id: Some("msg-42".to_string()),
                 delta: None,
                 thinking_delta: Some("Checking imports".to_string()),
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: think_delta_raw.to_string(),
             }
         );
@@ -2460,6 +2600,8 @@ done
                 message_id: Some("msg-42".to_string()),
                 delta: None,
                 thinking_delta: Some("Step 2".to_string()),
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: reasoning_delta_raw.to_string(),
             }
         );
@@ -2473,6 +2615,8 @@ done
                 message_id: Some("msg-42".to_string()),
                 delta: Some("Hello!".to_string()),
                 thinking_delta: None,
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: text_delta_raw.to_string(),
             }
         );
@@ -2487,6 +2631,8 @@ done
                 message_id: Some("msg-42".to_string()),
                 delta: None,
                 thinking_delta: None,
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: text_end_raw.to_string(),
             }
         );
@@ -2502,6 +2648,8 @@ done
                 message_id: Some("m-flat".to_string()),
                 delta: None,
                 thinking_delta: Some("flat thought".to_string()),
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: flat_think_raw.to_string(),
             }
         );
@@ -2795,6 +2943,8 @@ done
                 message_id: Some("m1".to_string()),
                 delta: Some(" ".to_string()),
                 thinking_delta: None,
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: space_raw.to_string(),
             }
         );
@@ -2807,6 +2957,8 @@ done
                 message_id: Some("m1".to_string()),
                 delta: Some("\n".to_string()),
                 thinking_delta: None,
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: nl_raw.to_string(),
             }
         );
@@ -2824,6 +2976,8 @@ done
                 message_id: None,
                 delta: Some("chunk-a".to_string()),
                 thinking_delta: None,
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: anthropic_text_raw.to_string(),
             }
         );
@@ -2840,6 +2994,8 @@ done
                 message_id: Some("m2".to_string()),
                 delta: None,
                 thinking_delta: Some("deep thought".to_string()),
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: anthropic_think_raw.to_string(),
             }
         );
@@ -2854,6 +3010,8 @@ done
                 message_id: Some("m3".to_string()),
                 delta: Some("inc".to_string()),
                 thinking_delta: None,
+                thinking_phase: None,
+                thinking_content: None,
                 raw_json: msg_delta_raw.to_string(),
             }
         );
@@ -2936,5 +3094,127 @@ done
         );
 
         sup.shutdown();
+    }
+
+    #[test]
+    fn suppresses_non_prose_toolcall_and_lifecycle_message_updates() {
+        for raw in [
+            r#"{"type":"message_update","message":{"id":"m1"},"assistantMessageEvent":{"type":"toolcall_start","toolCall":{"id":"tc1","name":"bash"}}}"#,
+            r#"{"type":"message_update","message":{"id":"m1"},"assistantMessageEvent":{"type":"toolcall_delta","delta":"{\"cmd\":\"ls\"}"}}"#,
+            r#"{"type":"message_update","message":{"id":"m1"},"assistantMessageEvent":{"type":"toolcall_end","toolCall":{"id":"tc1"}}}"#,
+            r#"{"type":"message_update","message":{"id":"m1"},"assistantMessageEvent":{"type":"text_start"}}"#,
+            r#"{"type":"message_update","message":{"id":"m1"},"assistantMessageEvent":{"type":"start"}}"#,
+            r#"{"type":"message_update","message":{"id":"m1"},"assistantMessageEvent":{"type":"done"}}"#,
+        ] {
+            let val = parse_json(raw).unwrap();
+            assert!(
+                parse_pi_ui_event(&val, raw).is_none(),
+                "expected None for non-prose assistantMessageEvent: {}",
+                raw
+            );
+        }
+
+        // Unknown nested content_block_delta type (e.g. input_json_delta) must NOT leak partial JSON as prose.
+        let input_json_raw = r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}","delta":"{\"path\":\"a.rs\"}"}}"#;
+        let input_json_ev =
+            parse_pi_ui_event(&parse_json(input_json_raw).unwrap(), input_json_raw).unwrap();
+        assert_eq!(
+            input_json_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: None,
+                delta: None,
+                thinking_delta: None,
+                thinking_phase: None,
+                thinking_content: None,
+                raw_json: input_json_raw.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unwraps_tool_execution_update_and_end_json_wrappers() {
+        let upd_raw = r#"{"type":"tool_execution_update","toolCallId":"tc-1","toolName":"bash","partialResult":{"content":[{"type":"text","text":"line 1"},{"text":"line 2"}]}}"#;
+        let upd_ev = parse_pi_ui_event(&parse_json(upd_raw).unwrap(), upd_raw).unwrap();
+        assert_eq!(
+            upd_ev,
+            PiUiEvent::ToolExecutionUpdate {
+                tool_call_id: Some("tc-1".to_string()),
+                tool_name: Some("bash".to_string()),
+                partial_result: Some("line 1\nline 2".to_string()),
+                raw_json: upd_raw.to_string(),
+            }
+        );
+
+        let end_raw = r#"{"type":"tool_execution_end","toolCallId":"tc-1","toolName":"read","isError":false,"result":{"content":[{"type":"text","text":"file body"}]}}"#;
+        let end_ev = parse_pi_ui_event(&parse_json(end_raw).unwrap(), end_raw).unwrap();
+        assert_eq!(
+            end_ev,
+            PiUiEvent::ToolExecutionEnd {
+                tool_call_id: Some("tc-1".to_string()),
+                tool_name: Some("read".to_string()),
+                is_error: false,
+                result: Some("file body".to_string()),
+                raw_json: end_raw.to_string(),
+            }
+        );
+
+        assert_eq!(
+            extract_tool_output_text(&parse_json(r#"{"output":"clean output"}"#).unwrap()),
+            Some("clean output".to_string())
+        );
+        assert_eq!(
+            extract_tool_output_text(&parse_json(r#"{"text":"clean text"}"#).unwrap()),
+            Some("clean text".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_thinking_start_end_lifecycle_and_reasoning_keys() {
+        let start_raw = r#"{"type":"message_update","message":{"id":"m-th"},"assistantMessageEvent":{"type":"thinking_start"}}"#;
+        let start_ev = parse_pi_ui_event(&parse_json(start_raw).unwrap(), start_raw).unwrap();
+        assert_eq!(
+            start_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("m-th".to_string()),
+                delta: None,
+                thinking_delta: None,
+                thinking_phase: Some("start".to_string()),
+                thinking_content: None,
+                raw_json: start_raw.to_string(),
+            }
+        );
+
+        let end_raw = r#"{"type":"message_update","message":{"id":"m-th"},"assistantMessageEvent":{"type":"thinking_end","content":"Full reasoning trace"}}"#;
+        let end_ev = parse_pi_ui_event(&parse_json(end_raw).unwrap(), end_raw).unwrap();
+        assert_eq!(
+            end_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("m-th".to_string()),
+                delta: None,
+                thinking_delta: None,
+                thinking_phase: Some("end".to_string()),
+                thinking_content: Some("Full reasoning trace".to_string()),
+                raw_json: end_raw.to_string(),
+            }
+        );
+
+        let reasoning_content_raw =
+            r#"{"type":"message_update","messageId":"m-rc","reasoning_content":"step by step"}"#;
+        let rc_ev = parse_pi_ui_event(
+            &parse_json(reasoning_content_raw).unwrap(),
+            reasoning_content_raw,
+        )
+        .unwrap();
+        assert_eq!(
+            rc_ev,
+            PiUiEvent::MessageUpdate {
+                message_id: Some("m-rc".to_string()),
+                delta: None,
+                thinking_delta: Some("step by step".to_string()),
+                thinking_phase: None,
+                thinking_content: None,
+                raw_json: reasoning_content_raw.to_string(),
+            }
+        );
     }
 }
