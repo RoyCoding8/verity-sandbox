@@ -3,7 +3,13 @@
 //!    `NullOrEmpty`, `SameAsCurrent`) and Thinking Level cycling (`off..=xhigh`).
 //! 2. Targeted Revert & Lossless Redo laws (chat-only isolation, targeted
 //!    `mtime` preservation, exact restoration & deletion, lossless redo
-//!    round-trip, and missing/failed snapshot rejection).
+//!    round-trip, missing/failed snapshot rejection, and server-entry rewind
+//!    resolution ensuring `ClientLocal` IDs never leak into `ForkToServer`).
+
+#[cfg(kani)]
+use verity_core::pi_wire::{
+    resolve_rewind_target, EntryIdKind, RevertResolutionError, RewindTarget,
+};
 
 /// Maximum number of configured models in the bounded Cycle Model contract.
 pub const MAX_MODELS: usize = 4;
@@ -512,9 +518,9 @@ pub fn prove_cycle_model_and_thinking_laws() {
     );
 }
 
-/// Harness 2 — Targeted Revert & Lossless Redo Safety Laws.
+/// Harness 2 — Targeted Revert, Lossless Redo, & Rewind Entry Resolution Safety Laws.
 ///
-/// Proves all 5 safety invariants across bounded symbolic traces of
+/// Proves all 6 safety invariants across bounded symbolic traces of
 /// `edit_file`, `capture_snapshot`, `revert_chat_only`,
 /// `revert_chat_and_code`, and `redo_revert` on a 3-file workspace:
 /// 1. Chat-only isolation (`revert_chat_only` preserves every `content` and `mtime`).
@@ -527,6 +533,10 @@ pub fn prove_cycle_model_and_thinking_laws() {
 ///    touching `mtime` of unaffected files).
 /// 5. No silent stale/missing revert (missing snapshot ID or failed snapshot
 ///    capture returns `Err` and mutates zero files and zero `mtime`s).
+/// 6. Server-entry rewind resolution (`resolve_rewind_target`): any returned
+///    `RewindTarget::ForkToServer(id)` ALWAYS satisfies `server_entries.contains(&id)`
+///    (a `ClientLocal` ID can NEVER leak into `ForkToServer`), and unresolved
+///    entry IDs mutate ZERO files and ZERO `mtime`s.
 #[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(6)]
@@ -544,6 +554,17 @@ pub fn prove_targeted_revert_and_redo_laws() {
         f += 1;
     }
 
+    // Authoritative server entry IDs for `resolve_rewind_target`.
+    let server_len: usize = kani::any();
+    kani::assume(server_len <= MAX_SNAPSHOTS);
+    let mut server_entries_buf = [0u8; MAX_SNAPSHOTS];
+    let mut s_idx = 0usize;
+    while s_idx < server_len {
+        server_entries_buf[s_idx] = kani::any();
+        s_idx += 1;
+    }
+    let server_entries = &server_entries_buf[..server_len];
+
     let mut ws = WorkspaceModel::new(init_files, kani::any());
 
     // Tracks the exact pre-revert files when the immediately preceding step
@@ -555,6 +576,9 @@ pub fn prove_targeted_revert_and_redo_laws() {
     let mut saw_new_file_deleted = false;
     let mut saw_lossless_redo_round_trip = false;
     let mut saw_missing_snapshot_rejected = false;
+    let mut saw_client_local_fallback_to_server = false;
+    let mut saw_new_session_rewind = false;
+    let mut saw_unresolvable_entry_rejected = false;
 
     let steps: u8 = kani::any();
     kani::assume(steps <= 4);
@@ -603,68 +627,119 @@ pub fn prove_targeted_revert_and_redo_laws() {
                 immediate_pre_revert = None;
             }
             3 => {
-                // revert_chat_and_code — Laws 2, 3, 5.
-                let snap_id: usize = kani::any();
-                kani::assume(snap_id <= MAX_SNAPSHOTS);
-                let target_turn: u8 = kani::any();
-                let capture_redo_ok: bool = kani::any();
-
-                let res = ws.revert_chat_and_code(snap_id, target_turn, capture_redo_ok);
-                if snap_id >= ws.snap_count {
-                    // Law 5a: Missing snapshot ID rejected with zero mutations.
-                    assert_eq!(res, Err(RevertError::MissingSnapshot));
-                    assert_eq!(
-                        ws.files, before_files,
-                        "missing snapshot must mutate zero files and zero mtimes"
-                    );
-                    saw_missing_snapshot_rejected = true;
-                    immediate_pre_revert = None;
-                } else if !capture_redo_ok {
-                    // Law 5b: Failed redo snapshot capture rejected with zero mutations.
-                    assert_eq!(res, Err(RevertError::SnapshotCaptureFailed));
-                    assert_eq!(
-                        ws.files, before_files,
-                        "failed snapshot capture must mutate zero files and zero mtimes"
-                    );
-                    immediate_pre_revert = None;
+                // revert_chat_and_code — Laws 2, 3, 5, 6.
+                let req_id: u8 = kani::any();
+                let requested = if kani::any() {
+                    EntryIdKind::Server(req_id)
                 } else {
-                    assert_eq!(res, Ok(()));
-                    let target_tree = ws.snapshots[snap_id];
+                    EntryIdKind::ClientLocal(req_id)
+                };
+                let user_turn_idx: Option<usize> = if kani::any() {
+                    let idx: usize = kani::any();
+                    kani::assume(idx <= MAX_SNAPSHOTS);
+                    Some(idx)
+                } else {
+                    None
+                };
 
-                    let mut any_reverted = false;
-                    let mut any_untouched = false;
-                    let mut any_deleted = false;
-
-                    let mut i = 0usize;
-                    while i < NUM_FILES {
-                        // Law 3: Exact restoration & deletion.
+                match resolve_rewind_target(requested, user_turn_idx, server_entries) {
+                    Err(RevertResolutionError::UnresolvableEntryId) => {
+                        // Law 6b: Unresolved entry ID mutates ZERO files and ZERO mtimes.
                         assert_eq!(
-                            ws.files[i].content, target_tree[i],
-                            "reverted file content must exactly match target snapshot"
+                            ws.files, before_files,
+                            "unresolvable entry ID must mutate zero files and zero mtimes"
                         );
-                        if before_files[i].content == target_tree[i] {
-                            // Law 2: Targeted mtime preservation.
-                            assert_eq!(
-                                ws.files[i].mtime, before_files[i].mtime,
-                                "unchanged file must keep its exact original mtime"
-                            );
-                            any_untouched = true;
-                        } else {
-                            any_reverted = true;
-                            if before_files[i].content != 0 && target_tree[i] == 0 {
-                                any_deleted = true;
+                        saw_unresolvable_entry_rejected = true;
+                        immediate_pre_revert = None;
+                    }
+                    Ok(target) => {
+                        match target {
+                            RewindTarget::ForkToServer(resolved_id) => {
+                                // Law 6a: ForkToServer(id) ALWAYS satisfies server_entries.contains(&id).
+                                assert!(
+                                    server_entries.contains(&resolved_id),
+                                    "ForkToServer ID must always belong to server_entries"
+                                );
+                                if let EntryIdKind::ClientLocal(local_id) = requested {
+                                    if !server_entries.contains(&local_id) {
+                                        assert_ne!(
+                                            resolved_id, local_id,
+                                            "ClientLocal ID must never leak into ForkToServer"
+                                        );
+                                        saw_client_local_fallback_to_server = true;
+                                    }
+                                }
+                            }
+                            RewindTarget::NewSession => {
+                                assert!(server_entries.is_empty());
+                                assert_eq!(user_turn_idx, Some(0));
+                                saw_new_session_rewind = true;
                             }
                         }
-                        i += 1;
-                    }
 
-                    if any_reverted && any_untouched {
-                        saw_targeted_revert_untouched_preserved = true;
+                        let snap_id: usize = kani::any();
+                        kani::assume(snap_id <= MAX_SNAPSHOTS);
+                        let target_turn: u8 = kani::any();
+                        let capture_redo_ok: bool = kani::any();
+
+                        let res = ws.revert_chat_and_code(snap_id, target_turn, capture_redo_ok);
+                        if snap_id >= ws.snap_count {
+                            // Law 5a: Missing snapshot ID rejected with zero mutations.
+                            assert_eq!(res, Err(RevertError::MissingSnapshot));
+                            assert_eq!(
+                                ws.files, before_files,
+                                "missing snapshot must mutate zero files and zero mtimes"
+                            );
+                            saw_missing_snapshot_rejected = true;
+                            immediate_pre_revert = None;
+                        } else if !capture_redo_ok {
+                            // Law 5b: Failed redo snapshot capture rejected with zero mutations.
+                            assert_eq!(res, Err(RevertError::SnapshotCaptureFailed));
+                            assert_eq!(
+                                ws.files, before_files,
+                                "failed snapshot capture must mutate zero files and zero mtimes"
+                            );
+                            immediate_pre_revert = None;
+                        } else {
+                            assert_eq!(res, Ok(()));
+                            let target_tree = ws.snapshots[snap_id];
+
+                            let mut any_reverted = false;
+                            let mut any_untouched = false;
+                            let mut any_deleted = false;
+
+                            let mut i = 0usize;
+                            while i < NUM_FILES {
+                                // Law 3: Exact restoration & deletion.
+                                assert_eq!(
+                                    ws.files[i].content, target_tree[i],
+                                    "reverted file content must exactly match target snapshot"
+                                );
+                                if before_files[i].content == target_tree[i] {
+                                    // Law 2: Targeted mtime preservation.
+                                    assert_eq!(
+                                        ws.files[i].mtime, before_files[i].mtime,
+                                        "unchanged file must keep its exact original mtime"
+                                    );
+                                    any_untouched = true;
+                                } else {
+                                    any_reverted = true;
+                                    if before_files[i].content != 0 && target_tree[i] == 0 {
+                                        any_deleted = true;
+                                    }
+                                }
+                                i += 1;
+                            }
+
+                            if any_reverted && any_untouched {
+                                saw_targeted_revert_untouched_preserved = true;
+                            }
+                            if any_deleted {
+                                saw_new_file_deleted = true;
+                            }
+                            immediate_pre_revert = Some(before_files);
+                        }
                     }
-                    if any_deleted {
-                        saw_new_file_deleted = true;
-                    }
-                    immediate_pre_revert = Some(before_files);
                 }
             }
             _ => {
@@ -737,5 +812,17 @@ pub fn prove_targeted_revert_and_redo_laws() {
     kani::cover!(
         saw_missing_snapshot_rejected,
         "missing_snapshot_rejected_without_mutation"
+    );
+    kani::cover!(
+        saw_client_local_fallback_to_server,
+        "client_local_id_resolves_to_server_entry"
+    );
+    kani::cover!(
+        saw_new_session_rewind,
+        "empty_server_entries_turn_zero_resolves_new_session"
+    );
+    kani::cover!(
+        saw_unresolvable_entry_rejected,
+        "unresolvable_entry_id_rejected_without_mutation"
     );
 }
