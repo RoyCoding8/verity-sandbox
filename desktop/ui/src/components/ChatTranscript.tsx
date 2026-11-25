@@ -41,7 +41,8 @@ export interface ChatTranscriptProps {
   readonly onRevertTurn?: (
     entryId: string,
     revertCode: boolean,
-    fallbackPromptText?: string
+    fallbackPromptText?: string,
+    userTurnIndex?: number
   ) => void;
   readonly onRedoRevert?: () => void;
 }
@@ -1173,28 +1174,44 @@ function ThinkingPanel({
   thinking,
   streaming,
   hasContent,
+  thinkingStreaming,
+  thinkingDurationMs,
 }: {
   readonly thinking: string;
   readonly streaming: boolean;
   readonly hasContent: boolean;
+  readonly thinkingStreaming?: boolean;
+  readonly thinkingDurationMs?: number;
 }) {
-  const isThinkingActive = streaming && !hasContent;
+  const isThinkingActive = streaming && (thinkingStreaming ?? !hasContent);
   const [expanded, setExpanded] = useState(() => isThinkingActive);
   const userToggledRef = useRef(false);
-  const prevHasContentRef = useRef(hasContent);
+  const prevThinkingActiveRef = useRef(isThinkingActive);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const contentJustArrived = !prevHasContentRef.current && hasContent;
-    prevHasContentRef.current = hasContent;
+    const thinkingJustFinished = prevThinkingActiveRef.current && !isThinkingActive;
+    prevThinkingActiveRef.current = isThinkingActive;
 
     if (userToggledRef.current) return;
 
     if (isThinkingActive) {
       setExpanded(true);
-    } else if (contentJustArrived || !streaming) {
+    } else if (thinkingJustFinished || !streaming) {
       setExpanded(false);
     }
-  }, [isThinkingActive, hasContent, streaming]);
+  }, [isThinkingActive, streaming]);
+
+  useEffect(() => {
+    if (isThinkingActive && expanded && bodyRef.current) {
+      bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+    }
+  }, [isThinkingActive, expanded, thinking]);
+
+  const completedLabel =
+    thinkingDurationMs !== undefined && Number.isFinite(thinkingDurationMs)
+      ? `Thought for ${Math.max(1, Math.round(thinkingDurationMs / 1000))}s`
+      : "Thought";
 
   return (
     <div
@@ -1210,9 +1227,15 @@ function ThinkingPanel({
         }}
       >
         <span className="pi-thinking-header-left">
-          <ThinkingConstellation animated={isThinkingActive} />
+          {isThinkingActive ? (
+            <ThinkingConstellation animated />
+          ) : (
+            <span className="pi-thinking-done-icon" aria-hidden="true">
+              <CheckIcon size={13} />
+            </span>
+          )}
           <span className="pi-thinking-label">
-            {isThinkingActive ? "Thinking..." : "Thinking"}
+            {isThinkingActive ? "Thinking..." : completedLabel}
           </span>
         </span>
         <span className={`pi-thinking-chevron${expanded ? " expanded" : ""}`}>
@@ -1221,7 +1244,7 @@ function ThinkingPanel({
       </button>
 
       {expanded && (
-        <div className="pi-thinking-body">
+        <div ref={bodyRef} className="pi-thinking-body">
           <pre className="pi-thinking-content">
             {thinking}
             {isThinkingActive && (
@@ -1314,6 +1337,18 @@ export function ChatTranscript({
   const hasStreamingAssistantMessage = messages.some(
     (m) => m.role === "assistant" && Boolean(m.streaming)
   );
+
+  const userTurnIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    let userIdx = 0;
+    for (const msg of messages) {
+      if (msg.role === "user") {
+        map.set(msg.id, userIdx);
+        userIdx += 1;
+      }
+    }
+    return map;
+  }, [messages]);
 
   const visibleLiveTools = useMemo(() => {
     if (liveTools.length === 0) return liveTools;
@@ -1459,6 +1494,8 @@ export function ChatTranscript({
                               thinking={message.thinking ?? ""}
                               streaming={isAssistantStreaming}
                               hasContent={hasContent}
+                              thinkingStreaming={message.thinkingStreaming}
+                              thinkingDurationMs={message.thinkingDurationMs}
                             />
                           ) : (
                             isAssistantStreaming && !hasContent && <ThinkingIndicator />
@@ -1568,7 +1605,12 @@ export function ChatTranscript({
                             disabled={isStreaming}
                             onClick={() => {
                               setRevertPopoverMessageId(null);
-                              onRevertTurn(message.id, false, message.content);
+                              onRevertTurn(
+                                message.id,
+                                false,
+                                message.content,
+                                userTurnIndexById.get(message.id)
+                              );
                             }}
                           >
                             Revert chat only
@@ -1580,7 +1622,12 @@ export function ChatTranscript({
                             disabled={isStreaming}
                             onClick={() => {
                               setRevertPopoverMessageId(null);
-                              onRevertTurn(message.id, true, message.content);
+                              onRevertTurn(
+                                message.id,
+                                true,
+                                message.content,
+                                userTurnIndexById.get(message.id)
+                              );
                             }}
                           >
                             Revert chat &amp; code
