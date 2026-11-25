@@ -132,6 +132,9 @@ export interface PiChatMessage {
   readonly role: "user" | "assistant" | "system";
   readonly content: string;
   readonly thinking?: string;
+  readonly thinkingStartedAtMs?: number;
+  readonly thinkingDurationMs?: number;
+  readonly thinkingStreaming?: boolean;
   readonly timestamp: string;
   readonly streaming?: boolean;
   readonly attachments?: readonly PendingAttachment[];
@@ -180,6 +183,8 @@ export type PiUiEvent =
       readonly delta: string | null;
       readonly thinking_delta?: string | null;
       readonly content?: string | null;
+      readonly thinking_content?: string | null;
+      readonly thinking_phase?: "start" | "delta" | "end" | null;
     }
   | {
       readonly type: "message_end";
@@ -209,6 +214,7 @@ export type PiUiEvent =
       readonly tool_call_id: string | null;
       readonly tool_name: string | null;
       readonly is_error: boolean;
+      readonly result?: string | null;
     }
   | {
       readonly type: "compaction_start";
@@ -432,25 +438,74 @@ function readNonEmptyRawString(obj: Record<string, unknown>, key: string): strin
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
+type ThinkingPhase = "start" | "delta" | "end";
+
 interface ExtractedStreamingDelta {
   readonly delta: string | null;
   readonly thinkingDelta: string | null;
   readonly content: string | null;
+  readonly thinkingContent: string | null;
+  readonly thinkingPhase: ThinkingPhase | null;
+}
+
+const EMPTY_STREAMING_DELTA: ExtractedStreamingDelta = {
+  delta: null,
+  thinkingDelta: null,
+  content: null,
+  thinkingContent: null,
+  thinkingPhase: null,
+};
+
+function readThinkingPhase(obj: Record<string, unknown>): ThinkingPhase | null {
+  const raw = readString(obj, "thinking_phase") ?? readString(obj, "thinkingPhase");
+  return raw === "start" || raw === "delta" || raw === "end" ? raw : null;
 }
 
 function extractDeltaFromNestedEvent(
   ev: Record<string, unknown> | null
 ): ExtractedStreamingDelta {
-  if (!ev) return { delta: null, thinkingDelta: null, content: null };
+  if (!ev) return EMPTY_STREAMING_DELTA;
   const evType = readString(ev, "type");
+  if (evType === "thinking_start") {
+    const initialThinking =
+      readNonEmptyRawString(ev, "delta") ??
+      readNonEmptyRawString(ev, "thinking") ??
+      readNonEmptyRawString(ev, "reasoning") ??
+      readNonEmptyRawString(ev, "reasoning_content");
+    return {
+      delta: null,
+      thinkingDelta: initialThinking,
+      content: null,
+      thinkingContent: null,
+      thinkingPhase: "start",
+    };
+  }
+  if (evType === "thinking_end") {
+    return {
+      delta: null,
+      thinkingDelta: null,
+      content: null,
+      thinkingContent:
+        readNonEmptyRawString(ev, "content") ??
+        readNonEmptyRawString(ev, "thinking") ??
+        readNonEmptyRawString(ev, "reasoning") ??
+        readNonEmptyRawString(ev, "reasoning_content") ??
+        readNonEmptyRawString(ev, "text"),
+      thinkingPhase: "end",
+    };
+  }
   if (evType === "thinking_delta" || evType === "reasoning_delta") {
     return {
       delta: null,
       thinkingDelta:
         readNonEmptyRawString(ev, "delta") ??
         readNonEmptyRawString(ev, "thinking") ??
+        readNonEmptyRawString(ev, "reasoning") ??
+        readNonEmptyRawString(ev, "reasoning_content") ??
         readNonEmptyRawString(ev, "text"),
       content: null,
+      thinkingContent: null,
+      thinkingPhase: "delta",
     };
   }
   if (evType === "text_delta") {
@@ -458,6 +513,8 @@ function extractDeltaFromNestedEvent(
       delta: readNonEmptyRawString(ev, "delta") ?? readNonEmptyRawString(ev, "text"),
       thinkingDelta: null,
       content: null,
+      thinkingContent: null,
+      thinkingPhase: null,
     };
   }
   if (evType === "text_end") {
@@ -465,6 +522,8 @@ function extractDeltaFromNestedEvent(
       delta: null,
       thinkingDelta: null,
       content: readNonEmptyRawString(ev, "content") ?? readNonEmptyRawString(ev, "text"),
+      thinkingContent: null,
+      thinkingPhase: null,
     };
   }
   if (evType === "content_block_delta") {
@@ -472,26 +531,41 @@ function extractDeltaFromNestedEvent(
     if (isRecord(innerDelta)) {
       return extractDeltaFromNestedEvent(innerDelta);
     }
+    const thinkingDelta =
+      readNonEmptyRawString(ev, "thinking_delta") ??
+      readNonEmptyRawString(ev, "thinkingDelta") ??
+      readNonEmptyRawString(ev, "thinking") ??
+      readNonEmptyRawString(ev, "reasoning") ??
+      readNonEmptyRawString(ev, "reasoning_content");
     return {
       delta: readNonEmptyRawString(ev, "delta") ?? readNonEmptyRawString(ev, "text"),
-      thinkingDelta:
-        readNonEmptyRawString(ev, "thinking_delta") ??
-        readNonEmptyRawString(ev, "thinkingDelta") ??
-        readNonEmptyRawString(ev, "thinking"),
+      thinkingDelta,
       content: null,
+      thinkingContent: null,
+      thinkingPhase: thinkingDelta !== null ? "delta" : null,
     };
+  }
+  // Guard: never let non-prose nested event types (e.g. toolcall_delta, input_json_delta)
+  // fall through and leak into prose `delta` or `thinkingDelta`.
+  if (evType !== null) {
+    return EMPTY_STREAMING_DELTA;
   }
   const nestedDelta = ev["delta"];
   if (isRecord(nestedDelta)) {
     return extractDeltaFromNestedEvent(nestedDelta);
   }
+  const thinkingDelta =
+    readNonEmptyRawString(ev, "thinking_delta") ??
+    readNonEmptyRawString(ev, "thinkingDelta") ??
+    readNonEmptyRawString(ev, "thinking") ??
+    readNonEmptyRawString(ev, "reasoning") ??
+    readNonEmptyRawString(ev, "reasoning_content");
   return {
     delta: readNonEmptyRawString(ev, "delta") ?? readNonEmptyRawString(ev, "text"),
-    thinkingDelta:
-      readNonEmptyRawString(ev, "thinking_delta") ??
-      readNonEmptyRawString(ev, "thinkingDelta") ??
-      readNonEmptyRawString(ev, "thinking"),
+    thinkingDelta,
     content: null,
+    thinkingContent: null,
+    thinkingPhase: thinkingDelta !== null ? "delta" : null,
   };
 }
 
@@ -526,24 +600,52 @@ function readStringArray(obj: Record<string, unknown>, key: string): readonly st
   return v.filter((item): item is string => typeof item === "string");
 }
 
+function unwrapToolOutputString(rawStr: string): string {
+  const trimmed = rawStr.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (isRecord(parsed)) {
+        const extracted = extractMessageContentParts(parsed);
+        if (extracted.text !== null) return extracted.text;
+        const fallback =
+          readString(parsed, "output") ?? readString(parsed, "text");
+        if (fallback !== null) return fallback;
+      }
+    } catch {
+      // Not valid JSON; preserve the raw string.
+    }
+  }
+  return rawStr;
+}
+
+function unwrapToolOutputValue(value: unknown): string | null {
+  if (typeof value === "string") {
+    return unwrapToolOutputString(value);
+  }
+  if (isRecord(value)) {
+    const extracted = extractMessageContentParts(value);
+    if (extracted.text !== null) return extracted.text;
+    const resultText =
+      readString(value, "output") ?? readString(value, "text");
+    if (resultText !== null) return unwrapToolOutputString(resultText);
+  }
+  return null;
+}
+
 function extractPartialToolOutput(raw: Record<string, unknown>): string | null {
   const direct =
     readString(raw, "partial_output") ??
     readString(raw, "partialOutput") ??
     readString(raw, "output") ??
     readString(raw, "delta") ??
-    readString(raw, "text");
-  if (direct !== null) return direct;
+    readString(raw, "text") ??
+    readString(raw, "result");
+  if (direct !== null) return unwrapToolOutputString(direct);
 
-  const partialResult = raw["partialResult"] ?? raw["partial_result"];
-  if (typeof partialResult === "string") return partialResult;
-  if (isRecord(partialResult)) {
-    const extracted = extractMessageContentParts(partialResult);
-    if (extracted.text !== null) return extracted.text;
-    const resultText =
-      readString(partialResult, "output") ?? readString(partialResult, "text");
-    if (resultText !== null) return resultText;
-  }
+  const partialResult = raw["partialResult"] ?? raw["partial_result"] ?? raw["result"];
+  const unwrappedPartial = unwrapToolOutputValue(partialResult);
+  if (unwrappedPartial !== null) return unwrappedPartial;
 
   const rawJson = parseRawJsonRecord(raw);
   if (rawJson) {
@@ -551,14 +653,13 @@ function extractPartialToolOutput(raw: Record<string, unknown>): string | null {
       readString(rawJson, "partial_output") ??
       readString(rawJson, "partialOutput") ??
       readString(rawJson, "output") ??
-      readString(rawJson, "delta");
-    if (nested !== null) return nested;
-    const nestedPartial = rawJson["partialResult"] ?? rawJson["partial_result"];
-    if (typeof nestedPartial === "string") return nestedPartial;
-    if (isRecord(nestedPartial)) {
-      const extracted = extractMessageContentParts(nestedPartial);
-      if (extracted.text !== null) return extracted.text;
-    }
+      readString(rawJson, "delta") ??
+      readString(rawJson, "result");
+    if (nested !== null) return unwrapToolOutputString(nested);
+    const nestedPartial =
+      rawJson["partialResult"] ?? rawJson["partial_result"] ?? rawJson["result"];
+    const unwrappedNested = unwrapToolOutputValue(nestedPartial);
+    if (unwrappedNested !== null) return unwrappedNested;
   }
   return null;
 }
@@ -578,29 +679,43 @@ function extractMessageContentParts(
   messageObj: Record<string, unknown> | null
 ): { readonly text: string | null; readonly thinking: string | null } {
   if (!messageObj) return { text: null, thinking: null };
+  const fallbackThinking =
+    readString(messageObj, "thinking") ??
+    readString(messageObj, "reasoning") ??
+    readString(messageObj, "reasoning_content");
   const rawContent = messageObj["content"];
   if (typeof rawContent === "string") {
-    return { text: rawContent || null, thinking: null };
+    return { text: rawContent || null, thinking: fallbackThinking || null };
   }
   if (!Array.isArray(rawContent)) {
-    return { text: null, thinking: null };
+    return { text: null, thinking: fallbackThinking || null };
   }
   const textParts: string[] = [];
   const thinkingParts: string[] = [];
   for (const item of rawContent) {
     if (!isRecord(item)) continue;
     const blockType = readString(item, "type");
-    if (blockType === "text") {
+    if (blockType === "text" || blockType === null) {
       const t = readString(item, "text");
       if (t) textParts.push(t);
-    } else if (blockType === "thinking") {
-      const th = readString(item, "thinking") ?? readString(item, "text");
+    } else if (
+      blockType === "thinking" ||
+      blockType === "reasoning" ||
+      blockType === "reasoning_content"
+    ) {
+      const th =
+        readString(item, "thinking") ??
+        readString(item, "reasoning") ??
+        readString(item, "reasoning_content") ??
+        readString(item, "text");
       if (th) thinkingParts.push(th);
     }
   }
+  const combinedThinking =
+    thinkingParts.length > 0 ? thinkingParts.join("") : fallbackThinking;
   return {
     text: textParts.length > 0 ? textParts.join("") : null,
-    thinking: thinkingParts.length > 0 ? thinkingParts.join("") : null,
+    thinking: combinedThinking || null,
   };
 }
 
@@ -669,18 +784,28 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
       let delta = readNonEmptyRawString(raw, "delta");
       let thinkingDelta =
         readNonEmptyRawString(raw, "thinking_delta") ??
-        readNonEmptyRawString(raw, "thinkingDelta");
+        readNonEmptyRawString(raw, "thinkingDelta") ??
+        readNonEmptyRawString(raw, "reasoning_delta") ??
+        readNonEmptyRawString(raw, "reasoningDelta") ??
+        readNonEmptyRawString(raw, "reasoning") ??
+        readNonEmptyRawString(raw, "reasoning_content");
       let content: string | null = null;
+      let thinkingContent: string | null =
+        readNonEmptyRawString(raw, "thinking_content") ??
+        readNonEmptyRawString(raw, "thinkingContent");
+      let thinkingPhase: ThinkingPhase | null = readThinkingPhase(raw);
 
       // Handle Anthropic-style nested `delta: { type: "text_delta", text }` / `{ type: "thinking_delta", thinking }`
-      if (!delta && !thinkingDelta && isRecord(raw["delta"])) {
+      if (!delta && !thinkingDelta && !thinkingContent && !thinkingPhase && isRecord(raw["delta"])) {
         const extracted = extractDeltaFromNestedEvent(raw["delta"]);
         delta = extracted.delta;
         thinkingDelta = extracted.thinkingDelta;
         content = extracted.content;
+        thinkingContent = extracted.thinkingContent;
+        thinkingPhase = extracted.thinkingPhase;
       }
 
-      if (!delta && !thinkingDelta && !content) {
+      if (!delta && !thinkingDelta && !content && !thinkingContent && !thinkingPhase) {
         const directNestedEvent =
           (isRecord(raw["assistantMessageEvent"]) ? raw["assistantMessageEvent"] : null) ??
           (isRecord(raw["assistant_message_event"]) ? raw["assistant_message_event"] : null) ??
@@ -715,11 +840,35 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
           delta = extracted.delta;
           thinkingDelta = extracted.thinkingDelta;
           content = extracted.content;
+          thinkingContent = extracted.thinkingContent;
+          thinkingPhase = extracted.thinkingPhase;
         } else if (rawJson) {
-          delta = readNonEmptyRawString(rawJson, "delta");
-          thinkingDelta =
-            readNonEmptyRawString(rawJson, "thinking_delta") ??
-            readNonEmptyRawString(rawJson, "thinkingDelta");
+          const rawJsonType = readString(rawJson, "type");
+          if (
+            rawJsonType === null ||
+            rawJsonType === "message_update" ||
+            rawJsonType === "content_block_delta"
+          ) {
+            delta = readNonEmptyRawString(rawJson, "delta");
+            thinkingDelta =
+              readNonEmptyRawString(rawJson, "thinking_delta") ??
+              readNonEmptyRawString(rawJson, "thinkingDelta") ??
+              readNonEmptyRawString(rawJson, "reasoning_delta") ??
+              readNonEmptyRawString(rawJson, "reasoningDelta") ??
+              readNonEmptyRawString(rawJson, "reasoning") ??
+              readNonEmptyRawString(rawJson, "reasoning_content");
+            thinkingContent =
+              readNonEmptyRawString(rawJson, "thinking_content") ??
+              readNonEmptyRawString(rawJson, "thinkingContent");
+            thinkingPhase = readThinkingPhase(rawJson);
+          } else {
+            const extracted = extractDeltaFromNestedEvent(rawJson);
+            delta = extracted.delta;
+            thinkingDelta = extracted.thinkingDelta;
+            content = extracted.content;
+            thinkingContent = extracted.thinkingContent;
+            thinkingPhase = extracted.thinkingPhase;
+          }
         }
       }
       return {
@@ -728,6 +877,8 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
         delta,
         thinking_delta: thinkingDelta,
         ...(content !== null ? { content } : {}),
+        ...(thinkingContent !== null ? { thinking_content: thinkingContent } : {}),
+        ...(thinkingPhase !== null ? { thinking_phase: thinkingPhase } : {}),
       };
     }
     case "message_end": {
@@ -847,7 +998,8 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
           readString(raw, "name"),
         partial_output: extractPartialToolOutput(raw),
       };
-    case "tool_execution_end":
+    case "tool_execution_end": {
+      const result = extractPartialToolOutput(raw);
       return {
         type,
         tool_call_id:
@@ -859,7 +1011,9 @@ export function parsePiUiEventPayload(raw: unknown): PiUiEvent | null {
           readString(raw, "toolName") ??
           readString(raw, "name"),
         is_error: readBool(raw, "is_error") ?? readBool(raw, "isError") ?? false,
+        ...(result !== null ? { result } : {}),
       };
+    }
     case "queue_update":
       return {
         type,
@@ -1868,11 +2022,36 @@ class BrowserPreviewRuntime {
       }));
   }
 
-  revertTurn(entryId: string, revertCode: boolean): RevertTurnResult {
+  revertTurn(
+    entryId: string,
+    revertCode: boolean,
+    userTurnIndex?: number,
+    promptText?: string
+  ): RevertTurnResult {
     this.cancelInFlightWork();
     const source = this.messagesBySession.get(this.activeSessionId) ?? [];
-    const idx = source.findIndex((m) => m.id === entryId);
-    const restoredPrompt = idx >= 0 ? source[idx].content : null;
+    let idx = source.findIndex((m) => m.id === entryId);
+    if (idx < 0 && userTurnIndex !== undefined && userTurnIndex >= 0) {
+      let seenUsers = 0;
+      for (let i = 0; i < source.length; i += 1) {
+        if (source[i].role === "user") {
+          if (seenUsers === userTurnIndex) {
+            idx = i;
+            break;
+          }
+          seenUsers += 1;
+        }
+      }
+    }
+    if (idx < 0 && promptText !== undefined) {
+      const trimmedTarget = promptText.trim();
+      if (trimmedTarget.length > 0) {
+        idx = source.findIndex(
+          (m) => m.role === "user" && m.content.trim() === trimmedTarget
+        );
+      }
+    }
+    const restoredPrompt = idx >= 0 ? source[idx].content : (promptText ?? null);
     const sliced = idx >= 0 ? source.slice(0, idx) : [...source];
     this.messagesBySession.set(this.activeSessionId, sliced);
     this.updateSessionCount(this.activeSessionId);
@@ -2313,11 +2492,21 @@ export const tauriApi = {
     return invoke<TurnCheckpointView[]>("pi_list_checkpoints");
   },
 
-  async piRevertTurn(entryId: string, revertCode: boolean): Promise<RevertTurnResult> {
+  async piRevertTurn(
+    entryId: string,
+    revertCode: boolean,
+    userTurnIndex?: number,
+    promptText?: string
+  ): Promise<RevertTurnResult> {
     if (!isTauriRuntime()) {
-      return previewRuntime.revertTurn(entryId, revertCode);
+      return previewRuntime.revertTurn(entryId, revertCode, userTurnIndex, promptText);
     }
-    return invoke<RevertTurnResult>("pi_revert_turn", { entryId, revertCode });
+    return invoke<RevertTurnResult>("pi_revert_turn", {
+      entryId,
+      revertCode,
+      userTurnIndex: userTurnIndex ?? null,
+      promptText: promptText ?? null,
+    });
   },
 
   async piRedoRevert(): Promise<RedoRevertResult> {
@@ -2520,8 +2709,13 @@ export const piCycleThinkingLevel = (): Promise<PiCycleThinkingPayload | null> =
   tauriApi.piCycleThinkingLevel();
 export const piListCheckpoints = (): Promise<TurnCheckpointView[]> =>
   tauriApi.piListCheckpoints();
-export const piRevertTurn = (entryId: string, revertCode: boolean): Promise<RevertTurnResult> =>
-  tauriApi.piRevertTurn(entryId, revertCode);
+export const piRevertTurn = (
+  entryId: string,
+  revertCode: boolean,
+  userTurnIndex?: number,
+  promptText?: string
+): Promise<RevertTurnResult> =>
+  tauriApi.piRevertTurn(entryId, revertCode, userTurnIndex, promptText);
 export const piRedoRevert = (): Promise<RedoRevertResult> =>
   tauriApi.piRedoRevert();
 export const piGetCommands = (): Promise<PiCommandInfo[]> =>

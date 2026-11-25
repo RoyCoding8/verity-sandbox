@@ -68,7 +68,42 @@ function assertNoDuplicateToolIds(state, context) {
   }
 }
 
-function assertStepInvariants(prevState, action, nextState, context) {
+function isNonProseToolcallRaw(rawPayload) {
+  if (!rawPayload || typeof rawPayload !== "object") return false;
+  const checkNested = (obj) => {
+    if (!obj || typeof obj !== "object") return false;
+    if (obj.type === "toolcall_delta" || obj.type === "input_json_delta") return true;
+    if (obj.delta && typeof obj.delta === "object") {
+      if (obj.delta.type === "toolcall_delta" || obj.delta.type === "input_json_delta") return true;
+    }
+    return false;
+  };
+  if (
+    checkNested(rawPayload.assistantMessageEvent) ||
+    checkNested(rawPayload.assistant_message_event) ||
+    checkNested(rawPayload.delta)
+  ) {
+    return true;
+  }
+  if (typeof rawPayload.raw_json === "string") {
+    try {
+      const parsed = JSON.parse(rawPayload.raw_json);
+      if (
+        checkNested(parsed) ||
+        checkNested(parsed?.assistantMessageEvent) ||
+        checkNested(parsed?.assistant_message_event) ||
+        checkNested(parsed?.delta)
+      ) {
+        return true;
+      }
+    } catch {
+      // ignore unparseable raw_json
+    }
+  }
+  return false;
+}
+
+function assertStepInvariants(prevState, action, nextState, context, rawPayload = null) {
   // Law 4: No duplicate tool IDs ever appear across messages or liveTools.
   assertNoDuplicateToolIds(nextState, context);
 
@@ -127,6 +162,75 @@ function assertStepInvariants(prevState, action, nextState, context) {
       `${context}: Law 3 violated (${action.event.type}(user) changed assistant message count)`
     );
   }
+
+  // Law 6: Non-prose toolcall_delta / input_json_delta inside raw_json NEVER leaks into msg.content or msg.thinking.
+  if (action.type === "pi_event" && isNonProseToolcallRaw(rawPayload)) {
+    assert.equal(
+      action.event.delta ?? null,
+      null,
+      `${context}: Law 6 violated (toolcall_delta leaked into event.delta)`
+    );
+    assert.equal(
+      action.event.thinking_delta ?? null,
+      null,
+      `${context}: Law 6 violated (toolcall_delta leaked into event.thinking_delta)`
+    );
+    const prevById = new Map(prevState.messages.map((m) => [m.id, m]));
+    for (const msg of nextState.messages) {
+      if (msg.role !== "assistant") continue;
+      const prev = prevById.get(msg.id);
+      assert.equal(
+        msg.content,
+        prev ? prev.content : "",
+        `${context}: Law 6 violated (msg "${msg.id}" content mutated by toolcall_delta)`
+      );
+      assert.equal(
+        msg.thinking ?? "",
+        prev ? (prev.thinking ?? "") : "",
+        `${context}: Law 6 violated (msg "${msg.id}" thinking mutated by toolcall_delta)`
+      );
+    }
+  }
+
+  // Law 7: No tool.partialOutput or tool.detail begins with '{"content":[' when unwrapped from a Pi content-block wrapper.
+  const allTools = [...nextState.liveTools];
+  for (const msg of nextState.messages) {
+    if (msg.toolCalls) {
+      for (const tool of msg.toolCalls) allTools.push(tool);
+    }
+  }
+  for (const tool of allTools) {
+    if (typeof tool.partialOutput === "string") {
+      assert.equal(
+        tool.partialOutput.trimStart().startsWith('{"content":['),
+        false,
+        `${context}: Law 7 violated (tool "${tool.id}" partialOutput still JSON-wrapped)`
+      );
+    }
+    if (typeof tool.detail === "string") {
+      assert.equal(
+        tool.detail.trimStart().startsWith('{"content":['),
+        false,
+        `${context}: Law 7 violated (tool "${tool.id}" detail still JSON-wrapped)`
+      );
+    }
+  }
+
+  // Law 8: Whenever a message has thinkingStartedAtMs and is no longer thinkingStreaming (or !streaming),
+  // thinkingDurationMs is a non-negative finite number.
+  for (const msg of nextState.messages) {
+    if (
+      msg.thinkingStartedAtMs !== undefined &&
+      (msg.thinkingStreaming === false || msg.streaming !== true)
+    ) {
+      assert.ok(
+        typeof msg.thinkingDurationMs === "number" &&
+          Number.isFinite(msg.thinkingDurationMs) &&
+          msg.thinkingDurationMs >= 0,
+        `${context}: Law 8 violated (msg "${msg.id}" missing valid thinkingDurationMs=${msg.thinkingDurationMs})`
+      );
+    }
+  }
 }
 
 async function main() {
@@ -159,7 +263,7 @@ async function main() {
       assert.ok(event !== null, `${label}: parsePiUiEventPayload returned null`);
       const action = { type: "pi_event", event };
       const next = piReducer(state, action);
-      assertStepInvariants(state, action, next, label);
+      assertStepInvariants(state, action, next, label, rawPayload);
       return next;
     }
 
@@ -197,6 +301,18 @@ async function main() {
         {
           type: "message_update",
           message: { id: "or-msg-1" },
+          assistantMessageEvent: { type: "thinking_start" },
+        },
+        "S1.thinking_start"
+      );
+      assert.equal(s.messages.find((m) => m.id === "or-msg-1")?.thinkingStreaming, true);
+      assert.equal(typeof s.messages.find((m) => m.id === "or-msg-1")?.thinkingStartedAtMs, "number");
+
+      s = dispatchEvent(
+        s,
+        {
+          type: "message_update",
+          message: { id: "or-msg-1" },
           assistantMessageEvent: { type: "thinking_delta", delta: "Planning 🚀" },
         },
         "S1.thinking_delta"
@@ -210,6 +326,23 @@ async function main() {
         },
         "S1.reasoning_delta"
       );
+      s = dispatchEvent(
+        s,
+        {
+          type: "message_update",
+          message: { id: "or-msg-1" },
+          assistantMessageEvent: { type: "thinking_end", content: "Planning 🚀 + math ∑" },
+        },
+        "S1.thinking_end"
+      );
+      const afterThinkingEnd = s.messages.find((m) => m.id === "or-msg-1");
+      assert.equal(afterThinkingEnd?.thinkingStreaming, false);
+      assert.ok(
+        typeof afterThinkingEnd?.thinkingDurationMs === "number" &&
+          afterThinkingEnd.thinkingDurationMs >= 0,
+        "S1: thinkingDurationMs must be recorded on thinking_end"
+      );
+
       s = dispatchEvent(
         s,
         {
@@ -888,6 +1021,20 @@ async function main() {
         assert.equal(s.liveTools[0].partialOutput, "running test 1/3...");
         assert.equal(s.liveTools[0].detail, "running test 1/3...");
 
+        // Stringified Pi content-block wrapper WITHOUT "type":"text" must unwrap cleanly
+        s = dispatchEvent(
+          s,
+          {
+            type: "tool_execution_update",
+            tool_call_id: "tc-stream-1",
+            tool_name: "bash",
+            partial_output: JSON.stringify({ content: [{ text: "running test 2/3..." }] }),
+          },
+          "S15.update_wrapped_str"
+        );
+        assert.equal(s.liveTools[0].partialOutput, "running test 2/3...");
+        assert.equal(s.liveTools[0].detail, "running test 2/3...");
+
         s = dispatchEvent(
           s,
           {
@@ -906,6 +1053,28 @@ async function main() {
         );
         assert.equal(s.liveTools[0].status, "done");
         assert.equal(s.liveTools[0].partialOutput, "running test 3/3... ok");
+
+        // tool_execution_end with stringified wrapper result populates partialOutput/detail when absent
+        s = dispatchEvent(
+          s,
+          { type: "tool_execution_start", tool_call_id: "tc-stream-2", tool_name: "read" },
+          "S15.start2"
+        );
+        s = dispatchEvent(
+          s,
+          {
+            type: "tool_execution_end",
+            tool_call_id: "tc-stream-2",
+            tool_name: "read",
+            is_error: false,
+            result: JSON.stringify({ content: [{ text: "fn main() {}\nline 2" }] }),
+          },
+          "S15.end2"
+        );
+        const t2 = s.liveTools.find((t) => t.id === "tc-stream-2");
+        assert.equal(t2?.status, "done");
+        assert.equal(t2?.partialOutput, "fn main() {}\nline 2");
+        assert.equal(t2?.detail, "fn main() {}");
       },
     ]);
 
@@ -1155,16 +1324,29 @@ async function main() {
         assert.equal(s.canRedoRevert, false);
         assert.equal(s.editorPrefillText, "First prompt");
 
-        // BrowserPreviewRuntime IPC wrappers work end-to-end
-        const checkpoints = await tauriApi.piListCheckpoints();
-        assert.ok(Array.isArray(checkpoints));
-        if (checkpoints.length > 0) {
-          const rev = await tauriApi.piRevertTurn(checkpoints[0].entryId, true);
-          assert.equal(rev.codeReverted, true);
-          assert.equal(rev.canRedo, true);
-          const redone = await tauriApi.piRedoRevert();
-          assert.ok(redone.restoredFiles.length >= 1);
-        }
+        // BrowserPreviewRuntime IPC wrappers work end-to-end, including local-* ID resolution via userTurnIndex/promptText
+        const freshSession = await tauriApi.newSession("proj-verity");
+        await tauriApi.sendPrompt("Local turn one", []);
+        await tauriApi.abort();
+        await tauriApi.sendPrompt("Local turn two", []);
+        await tauriApi.abort();
+
+        // Revert "local-2" by userTurnIndex=1
+        const revLocal2 = await tauriApi.piRevertTurn("local-2", false, 1, "Local turn two");
+        assert.equal(revLocal2.restoredPrompt, "Local turn two");
+        assert.equal(revLocal2.messages.filter((m) => m.role === "user").length, 1);
+
+        // Revert "local-1" by promptText fallback (no userTurnIndex)
+        const revLocal1 = await tauriApi.piRevertTurn("local-1", true, undefined, "Local turn one");
+        assert.equal(revLocal1.restoredPrompt, "Local turn one");
+        assert.equal(revLocal1.messages.length, 0);
+        assert.equal(revLocal1.codeReverted, true);
+        assert.equal(revLocal1.canRedo, true);
+        const redone = await tauriApi.piRedoRevert();
+        assert.ok(redone.restoredFiles.length >= 1);
+
+        // Clean up temporary preview session so Scenario 20 starts on default active session
+        await tauriApi.piDeleteSession(freshSession.id);
       },
     ]);
 
@@ -1257,6 +1439,40 @@ async function main() {
           "S19.d5_nested_delta"
         );
         assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello world\nLine 2");
+
+        // Rust-emitted toolcall_delta and input_json_delta inside raw_json must NEVER leak into prose or thinking
+        s = dispatchEvent(
+          s,
+          {
+            type: "message_update",
+            message_id: "m-19",
+            delta: null,
+            raw_json: JSON.stringify({
+              type: "message_update",
+              message: { id: "m-19", role: "assistant" },
+              assistantMessageEvent: {
+                type: "toolcall_delta",
+                delta: '{"path":"crates/verity-core/src/scope.rs"}',
+              },
+            }),
+          },
+          "S19.toolcall_delta_raw_json"
+        );
+        s = dispatchEvent(
+          s,
+          {
+            type: "content_block_delta",
+            message_id: "m-19",
+            delta: {
+              type: "input_json_delta",
+              partial_json: '{"command":"cargo test"}',
+              delta: '{"command":"cargo test"}',
+            },
+          },
+          "S19.input_json_delta"
+        );
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.content, "Hello world\nLine 2");
+        assert.equal(s.messages.find((m) => m.id === "m-19")?.thinking, "Step 1\nStep 2");
 
         // text_end after deltas must NOT duplicate or overwrite streamed content
         s = dispatchEvent(
@@ -1426,14 +1642,32 @@ async function main() {
       // Raw Pi JSONL events parsed through parsePiUiEventPayload
       let raw;
       const er = rand();
-      if (er < 0.14) {
+      if (er < 0.12) {
         raw = { type: "message_start", message_id: pick(rand, msgIdPool), role: pick(rand, roles) };
-      } else if (er < 0.30) {
+      } else if (er < 0.22) {
         raw = {
           type: "message_update",
           message_id: pick(rand, msgIdPool),
           delta: pick(rand, textPool),
           thinking_delta: pick(rand, textPool),
+        };
+      } else if (er < 0.28) {
+        const nestedKind = pick(rand, ["thinking_start", "thinking_delta", "thinking_end", "toolcall_delta", "input_json_delta"]);
+        raw = {
+          type: "message_update",
+          message_id: pick(rand, msgIdPool),
+          delta: null,
+          raw_json: JSON.stringify({
+            type: "message_update",
+            assistantMessageEvent:
+              nestedKind === "thinking_start"
+                ? { type: "thinking_start" }
+                : nestedKind === "thinking_end"
+                  ? { type: "thinking_end", content: "thought summary" }
+                  : nestedKind === "thinking_delta"
+                    ? { type: "thinking_delta", delta: "hmm " }
+                    : { type: nestedKind, delta: '{"arg":"val"}' },
+          }),
         };
       } else if (er < 0.44) {
         const sr = pick(rand, stopReasons);
@@ -1453,18 +1687,25 @@ async function main() {
           tool_name: pick(rand, toolNamePool),
         };
       } else if (er < 0.61) {
+        const wrapped = rand() < 0.5;
         raw = {
           type: "tool_execution_update",
           tool_call_id: pick(rand, toolIdPool),
           tool_name: pick(rand, toolNamePool),
-          partial_output: pick(rand, textPool),
+          partial_output: wrapped
+            ? JSON.stringify({ content: [{ text: "unwrapped chunk" }] })
+            : pick(rand, textPool),
         };
       } else if (er < 0.66) {
+        const withWrappedResult = rand() < 0.4;
         raw = {
           type: "tool_execution_end",
           tool_call_id: pick(rand, toolIdPool),
           tool_name: pick(rand, toolNamePool),
           is_error: rand() < 0.3,
+          ...(withWrappedResult
+            ? { result: JSON.stringify({ content: [{ text: "final tool text" }] }) }
+            : {}),
         };
       } else if (er < 0.74) {
         raw = { type: "queue_update", pending_count: pick(rand, [0, 1, 2, 5]) };
@@ -1493,19 +1734,24 @@ async function main() {
 
       const event = parsePiUiEventPayload(raw);
       assert.ok(event !== null, `Fuzzer generated unparseable event: ${JSON.stringify(raw)}`);
-      return { type: "pi_event", event };
+      return { type: "pi_event", event, __raw: raw };
     }
 
     for (let trace = 0; trace < TRACE_COUNT; trace += 1) {
       let state = createInitialPiState();
       const steps = 25 + Math.floor(rand() * 21);
       for (let step = 0; step < steps; step += 1) {
-        const action = randomAction(step);
+        const actionWithMeta = randomAction(step);
+        const rawPayload = actionWithMeta.__raw ?? null;
+        const action =
+          actionWithMeta.type === "pi_event"
+            ? { type: "pi_event", event: actionWithMeta.event }
+            : actionWithMeta;
         const ctx = `Trace ${trace + 1} step ${step + 1} (${action.type}${
           action.type === "pi_event" ? `:${action.event.type}` : ""
         })`;
         const next = piReducer(state, action);
-        assertStepInvariants(state, action, next, ctx);
+        assertStepInvariants(state, action, next, ctx, rawPayload);
 
         // Law 2 trailing-agent_settled probe from every process_exited state
         if (action.type === "pi_event" && action.event.type === "process_exited") {
@@ -1531,7 +1777,7 @@ async function main() {
     }
 
     console.log(
-      `\nALL PASSED: ${scenariosPassed}/${scenarios.length} realistic scenarios + ${TRACE_COUNT}/${TRACE_COUNT} property-based traces (${totalSteps} steps, 5 laws verified at every step).`
+      `\nALL PASSED: ${scenariosPassed}/${scenarios.length} realistic scenarios + ${TRACE_COUNT}/${TRACE_COUNT} property-based traces (${totalSteps} steps, 8 laws verified at every step).`
     );
   } finally {
     await server.close();

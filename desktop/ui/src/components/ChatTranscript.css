@@ -858,6 +858,18 @@
   }
 }
 
+.pi-thinking-done-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--md-sys-color-primary) 12%, transparent);
+  color: var(--md-sys-color-primary);
+}
+
 .pi-thinking-label {
   font-family: var(--font-sans);
   font-size: var(--text-sm);

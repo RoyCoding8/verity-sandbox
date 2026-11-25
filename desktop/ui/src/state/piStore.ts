@@ -722,10 +722,29 @@ function findLatestAssistantIndexInCurrentTurn(messages: readonly PiChatMessage[
   return -1;
 }
 
+function finalizeMessageThinking(m: PiChatMessage, nowMs: number): PiChatMessage {
+  const needsStopStreaming = m.streaming === true;
+  const needsStopThinking = m.thinkingStreaming === true;
+  const needsDuration =
+    m.thinkingStartedAtMs !== undefined && m.thinkingDurationMs === undefined;
+  if (!needsStopStreaming && !needsStopThinking && !needsDuration) {
+    return m;
+  }
+  return {
+    ...m,
+    streaming: false,
+    ...(m.thinkingStreaming !== undefined ? { thinkingStreaming: false } : {}),
+    ...(needsDuration && m.thinkingStartedAtMs !== undefined
+      ? { thinkingDurationMs: Math.max(0, nowMs - m.thinkingStartedAtMs) }
+      : {}),
+  };
+}
+
 function attachToolsAndClearStreaming(
   messages: readonly PiChatMessage[],
   toolsToAttach: readonly PiToolCallState[]
 ): readonly PiChatMessage[] {
+  const nowMs = Date.now();
   const latestAssistantIdx =
     toolsToAttach.length > 0 ? findLatestAssistantIndexInCurrentTurn(messages) : -1;
   const uniqueTools =
@@ -734,11 +753,11 @@ function attachToolsAndClearStreaming(
       : [];
   return messages.map((m, idx) => {
     const shouldAttach = idx === latestAssistantIdx && uniqueTools.length > 0;
-    if (!m.streaming && !shouldAttach) return m;
+    const finalized = finalizeMessageThinking(m, nowMs);
+    if (finalized === m && !shouldAttach) return m;
     return {
-      ...m,
-      streaming: false,
-      toolCalls: shouldAttach ? mergeToolCalls(m.toolCalls, uniqueTools) : m.toolCalls,
+      ...finalized,
+      toolCalls: shouldAttach ? mergeToolCalls(finalized.toolCalls, uniqueTools) : finalized.toolCalls,
     };
   });
 }
@@ -749,6 +768,7 @@ function attachErrorToActiveTurn(
   isStreaming: boolean,
   errorMessage: string
 ): readonly PiChatMessage[] {
+  const nowMs = Date.now();
   const settledTools = settleRunningTools(liveTools);
   const latestAssistantIdx = findLatestAssistantIndexInCurrentTurn(messages);
   if (latestAssistantIdx >= 0) {
@@ -757,20 +777,21 @@ function attachErrorToActiveTurn(
       const uniqueTools = filterUniqueIncomingTools(messages, latestAssistantIdx, settledTools);
       return messages.map((m, idx) => {
         if (idx === latestAssistantIdx) {
+          const finalized = finalizeMessageThinking(m, nowMs);
           return {
-            ...m,
+            ...finalized,
             streaming: false,
             stopReason: "error",
             errorMessage,
-            toolCalls: mergeToolCalls(m.toolCalls, uniqueTools),
+            toolCalls: mergeToolCalls(finalized.toolCalls, uniqueTools),
           };
         }
-        return m.streaming ? { ...m, streaming: false } : m;
+        return finalizeMessageThinking(m, nowMs);
       });
     }
   }
   if (!isStreaming) {
-    return messages.map((m) => (m.streaming ? { ...m, streaming: false } : m));
+    return messages.map((m) => finalizeMessageThinking(m, nowMs));
   }
   const uniqueTools = filterUniqueIncomingTools(messages, -1, settledTools);
   const failedTurn: PiChatMessage = {
@@ -784,7 +805,7 @@ function attachErrorToActiveTurn(
     toolCalls: uniqueTools.length > 0 ? uniqueTools : undefined,
   };
   return [
-    ...messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+    ...messages.map((m) => finalizeMessageThinking(m, nowMs)),
     failedTurn,
   ];
 }
@@ -875,9 +896,12 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
       const delta = event.delta ?? "";
       const thinkingDelta = event.thinking_delta ?? "";
       const textEndContent = event.content ?? "";
-      if (!delta && !thinkingDelta && !textEndContent) {
+      const thinkingEndContent = event.thinking_content ?? "";
+      const thinkingPhase = event.thinking_phase ?? null;
+      if (!delta && !thinkingDelta && !textEndContent && !thinkingEndContent && !thinkingPhase) {
         return state.isStreaming ? state : { ...state, isStreaming: true };
       }
+      const nowMs = Date.now();
       const target = resolveAssistantTarget(state.messages, event.message_id);
       if (target.kind === "user_message") {
         return state;
@@ -890,20 +914,60 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
             : m.content.length === 0 && textEndContent
               ? textEndContent
               : m.content;
+          const nextThinking = thinkingDelta
+            ? (m.thinking ?? "") + thinkingDelta
+            : (!m.thinking || m.thinking.length === 0) && thinkingEndContent
+              ? thinkingEndContent
+              : m.thinking;
+
+          let nextThinkingStreaming = m.thinkingStreaming;
+          let nextThinkingStartedAtMs = m.thinkingStartedAtMs;
+          let nextThinkingDurationMs = m.thinkingDurationMs;
+
+          if (thinkingPhase === "start" || thinkingDelta.length > 0) {
+            nextThinkingStreaming = true;
+            nextThinkingStartedAtMs = m.thinkingStartedAtMs ?? nowMs;
+          }
+          if (
+            thinkingPhase === "end" ||
+            (delta.length > 0 && (nextThinkingStreaming === true || m.thinkingStreaming === true))
+          ) {
+            nextThinkingStreaming = false;
+            if (nextThinkingStartedAtMs !== undefined) {
+              nextThinkingDurationMs = Math.max(0, nowMs - nextThinkingStartedAtMs);
+            }
+          }
+
           return {
             ...m,
             content: nextContent,
-            thinking: thinkingDelta ? (m.thinking ?? "") + thinkingDelta : m.thinking,
+            thinking: nextThinking,
+            thinkingStreaming: nextThinkingStreaming,
+            thinkingStartedAtMs: nextThinkingStartedAtMs,
+            thinkingDurationMs: nextThinkingDurationMs,
             streaming: true,
           };
         });
         return { ...state, isStreaming: true, messages };
       }
+
+      const startsThinking = thinkingPhase === "start" || thinkingDelta.length > 0;
+      const endsThinking = thinkingPhase === "end" || (delta.length > 0 && startsThinking);
+      const thinkingStartedAtMs = startsThinking ? nowMs : undefined;
+      const thinkingStreaming = endsThinking ? false : startsThinking ? true : undefined;
+      const thinkingDurationMs =
+        endsThinking && thinkingStartedAtMs !== undefined
+          ? Math.max(0, nowMs - thinkingStartedAtMs)
+          : undefined;
+
       const created: PiChatMessage = {
         id: event.message_id ?? nextClientId("stream"),
         role: "assistant",
         content: delta || textEndContent,
-        thinking: thinkingDelta || undefined,
+        thinking: thinkingDelta || thinkingEndContent || undefined,
+        thinkingStartedAtMs,
+        thinkingDurationMs,
+        thinkingStreaming,
         timestamp: nowTimeLabel(),
         streaming: true,
         toolCalls: [],
@@ -919,6 +983,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
       if (isNonAssistantMessageRole(event.role)) {
         return state;
       }
+      const nowMs = Date.now();
       const finalText = event.text ?? null;
       const finalThinking = event.thinking ?? null;
       const stopReason = event.stop_reason ?? null;
@@ -940,18 +1005,20 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         );
         const messages = state.messages.map((m, idx) => {
           if (idx !== target.index) {
-            return isTerminalStop && m.streaming ? { ...m, streaming: false } : m;
+            return isTerminalStop ? finalizeMessageThinking(m, nowMs) : m;
           }
           const hydratedContent = m.content.length === 0 && finalText ? finalText : m.content;
           const hydratedThinking =
             (!m.thinking || m.thinking.length === 0) && finalThinking
               ? finalThinking
               : m.thinking;
+          const finalized = finalizeMessageThinking(m, nowMs);
           return {
-            ...m,
+            ...finalized,
             content: hydratedContent,
             thinking: hydratedThinking,
             streaming: false,
+            thinkingStreaming: false,
             stopReason: stopReason ?? m.stopReason,
             errorMessage: errorMessage ?? m.errorMessage,
             toolCalls: mergeToolCalls(m.toolCalls, uniqueTools),
@@ -979,7 +1046,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
           pendingQueueCount: 0,
           retryBanner: null,
           liveTools: [],
-          messages: state.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)),
+          messages: state.messages.map((m) => finalizeMessageThinking(m, nowMs)),
         };
       }
       const completed: PiChatMessage = {
@@ -987,6 +1054,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         role: "assistant",
         content: finalText ?? "",
         thinking: finalThinking ?? undefined,
+        thinkingStreaming: false,
         timestamp: nowTimeLabel(),
         streaming: false,
         stopReason,
@@ -994,7 +1062,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         toolCalls: uniqueTools.length > 0 ? uniqueTools : undefined,
       };
       const baseMessages = isTerminalStop
-        ? state.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m))
+        ? state.messages.map((m) => finalizeMessageThinking(m, nowMs))
         : state.messages;
       return {
         ...state,
@@ -1072,18 +1140,30 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
     case "tool_execution_end": {
       const id = event.tool_call_id;
       const nextStatus: PiToolCallState["status"] = event.is_error ? "error" : "done";
+      const endResult = event.result ?? null;
+      const endDetail =
+        endResult !== null
+          ? endResult.trim().split(/\r?\n/)[0]?.slice(0, 120) || undefined
+          : undefined;
+      const finalizeTool = (t: PiToolCallState): PiToolCallState => ({
+        ...t,
+        status: nextStatus,
+        partialOutput:
+          (!t.partialOutput || t.partialOutput.trim().length === 0) && endResult !== null
+            ? endResult
+            : t.partialOutput,
+        detail:
+          (!t.detail || t.detail.trim().length === 0) && endDetail !== undefined
+            ? endDetail
+            : t.detail,
+      });
       if (id) {
         if (state.liveTools.some((t) => t.id === id)) {
-          const liveTools = state.liveTools.map((t) =>
-            t.id === id ? { ...t, status: nextStatus } : t
-          );
+          const liveTools = state.liveTools.map((t) => (t.id === id ? finalizeTool(t) : t));
           return { ...state, liveTools };
         }
         if (hasToolIdInMessages(state.messages, id)) {
-          const messages = updateToolInMessages(state.messages, id, (t) => ({
-            ...t,
-            status: nextStatus,
-          }));
+          const messages = updateToolInMessages(state.messages, id, finalizeTool);
           return { ...state, messages };
         }
         return state;
@@ -1095,7 +1175,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         return state;
       }
       const liveTools = state.liveTools.map((t, idx) =>
-        idx === matchIdx ? { ...t, status: nextStatus } : t
+        idx === matchIdx ? finalizeTool(t) : t
       );
       return { ...state, liveTools };
     }
@@ -1653,17 +1733,17 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
       };
     }
 
-    case "prompt_failed":
+    case "prompt_failed": {
+      const nowMs = Date.now();
       return {
         ...state,
         isStreaming: false,
         liveTools: [],
         retryBanner: null,
         pendingQueueCount: 0,
-        messages: state.messages.map((m) =>
-          m.streaming ? { ...m, streaming: false } : m
-        ),
+        messages: state.messages.map((m) => finalizeMessageThinking(m, nowMs)),
       };
+    }
 
     case "turn_aborted": {
       const settledTools = settleRunningTools(state.liveTools);
@@ -2462,10 +2542,28 @@ export function usePiWorkspace() {
   }, [notify, pushToast, selectThinkingLevel]);
 
   const revertTurn = useCallback(
-    async (entryId: string, revertCode: boolean, fallbackPromptText?: string) => {
+    async (
+      entryId: string,
+      revertCode: boolean,
+      fallbackPromptText?: string,
+      userTurnIndex?: number
+    ) => {
       const reqId = ++sessionRequestIdRef.current;
+      const resolvedUserTurnIndex =
+        userTurnIndex !== undefined
+          ? userTurnIndex
+          : (() => {
+              const userMessages = stateRef.current.messages.filter((m) => m.role === "user");
+              const idx = userMessages.findIndex((m) => m.id === entryId);
+              return idx >= 0 ? idx : undefined;
+            })();
       try {
-        const result = await tauriApi.piRevertTurn(entryId, revertCode);
+        const result = await tauriApi.piRevertTurn(
+          entryId,
+          revertCode,
+          resolvedUserTurnIndex,
+          fallbackPromptText
+        );
         if (reqId !== sessionRequestIdRef.current) return;
         const restoredPrompt = result.restoredPrompt ?? fallbackPromptText ?? null;
         dispatch({
