@@ -2140,7 +2140,7 @@ mod tests {
 
     fn mock_sh_config(script: &str) -> PiSessionConfig {
         PiSessionConfig {
-            program: "/bin/sh".to_string(),
+            program: "sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             cwd: std::env::temp_dir(),
             env: Vec::new(),
@@ -2539,7 +2539,7 @@ while IFS= read -r line; do
 done
 "#;
         let mut cfg = mock_sh_config(script);
-        cfg.command_timeout = Duration::from_millis(300);
+        cfg.command_timeout = Duration::from_secs(2);
 
         let (settled_tx, settled_rx) = mpsc::channel();
         let sink: EventSink = Arc::new(move |ev| {

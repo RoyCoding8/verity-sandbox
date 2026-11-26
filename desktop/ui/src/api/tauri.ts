@@ -397,9 +397,12 @@ export interface TurnCheckpointView {
   readonly createdAt: string;
 }
 
-export interface RevertTurnResult {
+export interface SessionWithMessages {
   readonly session: PiSessionSummary;
   readonly messages: readonly PiChatMessage[];
+}
+
+export interface RevertTurnResult extends SessionWithMessages {
   readonly restoredPrompt: string | null;
   readonly codeReverted: boolean;
   readonly revertedFiles: readonly string[];
@@ -1477,14 +1480,13 @@ class BrowserPreviewRuntime {
     };
   }
 
-  switchSession(sessionId: string): readonly PiChatMessage[] {
+  switchSession(sessionId: string): SessionWithMessages | null {
+    const session = this.sessions.find((entry) => entry.id === sessionId);
+    if (!session) return null;
     this.cancelInFlightWork();
-    const found = this.sessions.find((s) => s.id === sessionId);
-    if (found) {
-      this.activeSessionId = found.id;
-      this.activeProjectId = found.projectId;
-    }
-    return [...(this.messagesBySession.get(this.activeSessionId) ?? [])];
+    this.activeSessionId = session.id;
+    this.activeProjectId = session.projectId;
+    return { session, messages: [...(this.messagesBySession.get(session.id) ?? [])] };
   }
 
   newSession(projectId: string, parentSessionId?: string): PiSessionSummary {
@@ -1546,12 +1548,8 @@ class BrowserPreviewRuntime {
     if (this.activeSessionId === sessionId) {
       const nextActive =
         this.sessions.find((s) => s.projectId === this.activeProjectId && !s.archived) ??
-        this.sessions.find((s) => !s.archived) ??
-        this.sessions[0];
-      this.activeSessionId = nextActive?.id ?? "";
-      if (nextActive) {
-        this.activeProjectId = nextActive.projectId;
-      }
+        this.newSession(this.activeProjectId);
+      this.activeSessionId = nextActive.id;
     }
     return this.bootstrap();
   }
@@ -2223,28 +2221,38 @@ export const tauriApi = {
     return { ...state, providers };
   },
 
-  async switchSession(sessionPath: string, sessionId: string): Promise<readonly PiChatMessage[]> {
+  async switchSession(session: PiSessionSummary): Promise<SessionWithMessages | null> {
     if (!isTauriRuntime()) {
-      return previewRuntime.switchSession(sessionId);
+      return previewRuntime.switchSession(session.id);
     }
-    return invoke<PiChatMessage[]>("pi_switch_session", { sessionPath });
+    return invoke<SessionWithMessages | null>("pi_switch_session", {
+      sessionId: session.id,
+      projectId: session.projectId,
+    });
   },
 
-  async newSession(projectId: string, parentSession?: string): Promise<PiSessionSummary> {
+  async newSession(projectId: string, parentSession?: string): Promise<SessionWithMessages | null> {
     if (!isTauriRuntime()) {
-      return previewRuntime.newSession(projectId, parentSession);
+      return { session: previewRuntime.newSession(projectId, parentSession), messages: [] };
     }
-    return invoke<PiSessionSummary>("pi_new_session", {
+    return invoke<SessionWithMessages | null>("pi_new_session", {
       projectId,
       parentSession: parentSession ?? null,
     });
   },
 
-  async renameSession(sessionId: string, name: string): Promise<PiSessionSummary | null> {
+  async renameSession(
+    session: PiSessionSummary,
+    name: string
+  ): Promise<PiSessionSummary | null> {
     if (!isTauriRuntime()) {
-      return previewRuntime.renameSession(sessionId, name);
+      return previewRuntime.renameSession(session.id, name);
     }
-    return invoke<PiSessionSummary>("pi_set_session_name", { sessionId, name });
+    return invoke<PiSessionSummary>("pi_set_session_name", {
+      projectId: session.projectId,
+      sessionId: session.id,
+      name,
+    });
   },
 
   async piArchiveSession(sessionId: string, archived: boolean): Promise<PiBootstrapData> {
@@ -2277,7 +2285,7 @@ export const tauriApi = {
 
   async forkSession(
     entryId: string
-  ): Promise<{ session: PiSessionSummary; messages: readonly PiChatMessage[] }> {
+  ): Promise<SessionWithMessages> {
     if (!isTauriRuntime()) {
       return previewRuntime.forkAt(entryId);
     }
@@ -2288,7 +2296,7 @@ export const tauriApi = {
 
   async cloneSession(
     entryId?: string
-  ): Promise<{ session: PiSessionSummary; messages: readonly PiChatMessage[] }> {
+  ): Promise<SessionWithMessages> {
     if (!isTauriRuntime()) {
       return previewRuntime.cloneSession();
     }
@@ -2320,12 +2328,16 @@ export const tauriApi = {
     return invoke<ThinkingLevel>("pi_set_thinking_level", { level });
   },
 
-  async sendPrompt(message: string, images: readonly PendingAttachment[]): Promise<void> {
+  async sendPrompt(
+    message: string,
+    images: readonly PendingAttachment[],
+    target: { readonly projectId: string; readonly sessionId: string }
+  ): Promise<void> {
     if (!isTauriRuntime()) {
       previewRuntime.sendPrompt(message, images);
       return;
     }
-    await invoke<void>("pi_prompt", { message, images });
+    await invoke<void>("pi_prompt", { message, images, ...target });
   },
 
   async steer(message: string, images: readonly PendingAttachment[]): Promise<void> {

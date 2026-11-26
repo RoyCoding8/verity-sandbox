@@ -237,6 +237,7 @@ async function main() {
   const server = await createServer({
     root: uiRoot,
     server: { middlewareMode: true },
+    optimizeDeps: { noDiscovery: true, include: [] },
     appType: "custom",
     logLevel: "error",
   });
@@ -745,12 +746,21 @@ async function main() {
         s,
         {
           type: "session_switched",
-          sessionId: "sess-b",
-          projectId: "proj-1",
+          session: {
+            id: "sess-b",
+            projectId: "proj-b",
+            name: "Saved chat",
+            path: "/tmp/sess-b.jsonl",
+            updatedAt: "09:01",
+            messageCount: 2,
+          },
           messages: sessionBMessages,
         },
         "S10.switchB"
       );
+      assert.equal(s.activeProjectId, "proj-b");
+      assert.equal(s.activeSessionId, "sess-b");
+      assert.equal(s.sessions.find((session) => session.id === s.activeSessionId)?.path, "/tmp/sess-b.jsonl");
       // Stale events from Session A arrive after switching to Session B.
       s = dispatchEvent(s, { type: "message_update", message_id: "m-a", delta: "STALE A" }, "S10.staleUpdate1");
       s = dispatchEvent(s, { type: "message_update", message_id: null, delta: "STALE NULL" }, "S10.staleUpdate2");
@@ -1325,10 +1335,13 @@ async function main() {
         assert.equal(s.editorPrefillText, "First prompt");
 
         // BrowserPreviewRuntime IPC wrappers work end-to-end, including local-* ID resolution via userTurnIndex/promptText
-        const freshSession = await tauriApi.newSession("proj-verity");
-        await tauriApi.sendPrompt("Local turn one", []);
+        const fresh = await tauriApi.newSession("proj-verity");
+        assert.ok(fresh);
+        const freshSession = fresh.session;
+        const target = { projectId: freshSession.projectId, sessionId: freshSession.id };
+        await tauriApi.sendPrompt("Local turn one", [], target);
         await tauriApi.abort();
-        await tauriApi.sendPrompt("Local turn two", []);
+        await tauriApi.sendPrompt("Local turn two", [], target);
         await tauriApi.abort();
 
         // Revert "local-2" by userTurnIndex=1
@@ -1576,6 +1589,39 @@ async function main() {
       },
     ]);
 
+    scenarios.push([
+      "Desktop session commands carry the selected project and chat over IPC",
+      async () => {
+        const before = globalThis.window;
+        const calls = [];
+        const session = { id: "saved-chat", projectId: "other-project" };
+        const target = { sessionId: session.id, projectId: session.projectId };
+        try {
+          globalThis.window = {
+            __TAURI_INTERNALS__: {
+              invoke: async (command, args) => {
+                calls.push([command, args]);
+                return null;
+              },
+            },
+          };
+          assert.equal(await tauriApi.switchSession(session), null);
+          assert.equal(await tauriApi.newSession(session.projectId), null);
+          await tauriApi.renameSession(session, "Renamed chat");
+          await tauriApi.sendPrompt("Check the project", [], target);
+          assert.deepEqual(calls, [
+            ["pi_switch_session", target],
+            ["pi_new_session", { projectId: target.projectId, parentSession: null }],
+            ["pi_set_session_name", { ...target, name: "Renamed chat" }],
+            ["pi_prompt", { ...target, message: "Check the project", images: [] }],
+          ]);
+        } finally {
+          if (before === undefined) delete globalThis.window;
+          else globalThis.window = before;
+        }
+      },
+    ]);
+
     let scenariosPassed = 0;
     for (const [name, fn] of scenarios) {
       await fn();
@@ -1615,8 +1661,7 @@ async function main() {
       if (r < 0.21) {
         return {
           type: "session_switched",
-          sessionId: `sess-${stepIdx}`,
-          projectId: "proj-1",
+          session: { id: `sess-${stepIdx}`, projectId: "proj-1" },
           messages: [
             { id: `hist-u-${stepIdx}`, role: "user", content: "hist", timestamp: "09:00" },
           ],

@@ -492,15 +492,20 @@ pub fn set_active_project(
 /// Encodes a project `cwd` path into Pi's `~/.pi/agent/sessions/<encoded-cwd>` directory name.
 pub fn encode_pi_session_dir_name(cwd: &Path) -> String {
     let raw = cwd.to_string_lossy();
-    let trimmed = raw.trim_start_matches(['/', '\\']);
-    let replaced: String = trimmed
+    let (path, prefix) = if let Some(path) = raw.strip_prefix(r"\\?\UNC\") {
+        (path, "-")
+    } else {
+        let path = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+        (path.strip_prefix(['/', '\\']).unwrap_or(path), "")
+    };
+    let replaced: String = path
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' => '-',
             other => other,
         })
         .collect();
-    format!("--{}--", replaced)
+    format!("--{prefix}{replaced}--")
 }
 
 /// Resolves Pi's global sessions root (`$PI_CODING_AGENT_DIR/sessions` or `~/.pi/agent/sessions`).
@@ -581,7 +586,7 @@ pub fn scan_project_sessions_with_root_and_archived(
         if root.is_dir() {
             let encoded_dir = root.join(encode_pi_session_dir_name(&canonical_cwd));
             if encoded_dir.is_dir() && seen_dirs.insert(encoded_dir.clone()) {
-                candidate_dirs.push((encoded_dir, false));
+                candidate_dirs.push((encoded_dir, true));
             }
             if let Ok(entries) = fs::read_dir(root) {
                 for entry in entries.flatten() {
@@ -663,15 +668,10 @@ pub fn parse_jsonl_session_file(
     let header_line = lines.find_map(|l| l.ok().filter(|s| !s.trim().is_empty()))?;
     let header = parse_json(&header_line).ok()?;
 
-    if let Some(header_cwd) = opt_json_str(&header, &["cwd"]) {
-        if require_cwd_match {
-            let norm_header_cwd = normalize_project_path(Path::new(&header_cwd));
-            if norm_header_cwd != expected_cwd {
-                return None;
-            }
-        }
-    } else if require_cwd_match {
-        return None;
+    match opt_json_str(&header, &["cwd"]) {
+        Some(cwd) if normalize_project_path(Path::new(&cwd)) != expected_cwd => return None,
+        None if require_cwd_match => return None,
+        _ => {}
     }
 
     let file_stem = file_path
@@ -866,7 +866,7 @@ mod tests {
     fn scans_pi_disk_sessions_from_encoded_and_local_dirs_and_merges_live() {
         let root = unique_temp_dir("scanner");
         let proj = root.join("my-repo");
-        let other_proj = root.join("other-repo");
+        let other_proj = root.join("my").join("repo");
         let pi_sessions_root = root.join("pi-sessions");
         fs::create_dir_all(&proj).unwrap();
         fs::create_dir_all(&other_proj).unwrap();
@@ -882,14 +882,14 @@ mod tests {
             &s1_path,
             format!(
                 concat!(
-                    r#"{{"type":"session","version":3,"id":"sess-1","timestamp":"2026-11-20T10:00:00Z","cwd":"{}"}}"#,
+                    r#"{{"type":"session","version":3,"id":"sess-1","timestamp":"2026-11-20T10:00:00Z","cwd":{}}}"#,
                     "\n",
                     r#"{{"type":"message","id":"m1","timestamp":"2026-11-20T10:01:00Z","message":{{"role":"user","content":"hi"}}}}"#,
                     "\n",
                     r#"{{"type":"session_info","name":"Auth Refactor","timestamp":"2026-11-20T10:02:00Z"}}"#,
                     "\n"
                 ),
-                canon_proj.display()
+                verity_core::json::escape_json_string(&canon_proj.to_string_lossy())
             ),
         )
         .unwrap();
@@ -901,20 +901,20 @@ mod tests {
         fs::write(
             &s2_path,
             format!(
-                r#"{{"type":"session","id":"sess-2","name":"Local Scratch","timestamp":"2026-11-21T12:00:00Z","cwd":"{}"}}"#,
-                canon_proj.display()
+                r#"{{"type":"session","id":"sess-2","name":"Local Scratch","timestamp":"2026-11-21T12:00:00Z","cwd":{}}}"#,
+                verity_core::json::escape_json_string(&canon_proj.to_string_lossy())
             ),
         )
         .unwrap();
 
         // 3. Another project's session in pi_sessions_root must NOT be included
         let other_encoded = pi_sessions_root.join(encode_pi_session_dir_name(&canon_other));
-        fs::create_dir_all(&other_encoded).unwrap();
+        assert_eq!(other_encoded, encoded_dir);
         fs::write(
             other_encoded.join("other.jsonl"),
             format!(
-                r#"{{"type":"session","id":"sess-other","name":"Other","timestamp":"2026-11-22T00:00:00Z","cwd":"{}"}}"#,
-                canon_other.display()
+                r#"{{"type":"session","id":"sess-other","name":"Other","timestamp":"2026-11-22T00:00:00Z","cwd":{}}}"#,
+                verity_core::json::escape_json_string(&canon_other.to_string_lossy())
             ),
         )
         .unwrap();
@@ -962,16 +962,16 @@ mod tests {
         fs::write(
             &s1,
             format!(
-                r#"{{"type":"session","id":"sess-a","name":"Alpha","timestamp":"2026-11-20T10:00:00Z","cwd":"{}"}}"#,
-                canon_proj.display()
+                r#"{{"type":"session","id":"sess-a","name":"Alpha","timestamp":"2026-11-20T10:00:00Z","cwd":{}}}"#,
+                verity_core::json::escape_json_string(&canon_proj.to_string_lossy())
             ),
         )
         .unwrap();
         fs::write(
             &s2,
             format!(
-                r#"{{"type":"session","id":"sess-b","name":"Beta","timestamp":"2026-11-21T10:00:00Z","cwd":"{}"}}"#,
-                canon_proj.display()
+                r#"{{"type":"session","id":"sess-b","name":"Beta","timestamp":"2026-11-21T10:00:00Z","cwd":{}}}"#,
+                verity_core::json::escape_json_string(&canon_proj.to_string_lossy())
             ),
         )
         .unwrap();

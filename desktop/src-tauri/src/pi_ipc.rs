@@ -1,8 +1,8 @@
 use crate::attachments::PendingAttachment;
-use crate::extension_ui::{DialogId, ExtensionUiAnswer};
+use crate::extension_ui::{DialogId, ExtensionUiAnswer, ExtensionUiError};
 use crate::pi_session::{
-    EventSink, PiRpcResponse, PiSessionConfig, PiSessionSupervisor, PiUiEvent, ReloadDisposition,
-    ReloadHook,
+    EventSink, PiRpcResponse, PiSessionConfig, PiSessionError, PiSessionSupervisor, PiUiEvent,
+    ReloadDisposition, ReloadHook,
 };
 use crate::projects::{
     default_projects_store_path, default_session_meta_path, delete_session_file,
@@ -16,9 +16,8 @@ use crate::providers::{
     PublicProviderProfile,
 };
 use crate::snapshots::{
-    capture_and_record_turn_checkpoint, clear_last_redo, find_checkpoint, load_checkpoint_store,
-    load_last_redo, normalize_prompt_preview, redo_targeted_revert, revert_to_snapshot,
-    save_last_redo,
+    capture_and_record_turn_checkpoint, find_checkpoint, load_checkpoint_store,
+    normalize_prompt_preview, redo_last_revert, revert_to_snapshot, save_last_redo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -226,11 +225,11 @@ pub struct PiBootstrapData {
 // ============================================================
 
 /// Resolves the local `verity` CLI binary for `verity mcp` launch wiring.
-pub fn resolve_verity_mcp_bin(project_path: &Path) -> Option<PathBuf> {
+pub fn resolve_verity_mcp_bin() -> Option<PathBuf> {
     if let Ok(explicit) = env::var("VERITY_MCP_BIN") {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
+        let path = PathBuf::from(explicit.trim());
+        if path.is_absolute() && path.is_file() {
+            return Some(path);
         }
     }
 
@@ -249,18 +248,8 @@ pub fn resolve_verity_mcp_bin(project_path: &Path) -> Option<PathBuf> {
         }
     }
 
-    for rel in [
-        Path::new("target").join("release").join(bin_name),
-        Path::new("target").join("debug").join(bin_name),
-    ] {
-        let candidate = project_path.join(rel);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
     if let Some(paths) = env::var_os("PATH") {
-        for dir in env::split_paths(&paths) {
+        for dir in env::split_paths(&paths).filter(|dir| dir.is_absolute()) {
             let candidate = dir.join(bin_name);
             if candidate.is_file() {
                 return Some(candidate);
@@ -279,13 +268,12 @@ pub fn build_pi_launch_env(
     verity_mcp_bin: Option<&Path>,
 ) -> Vec<(String, String)> {
     let mut env_pairs = build_pi_provider_env(store);
-    if let Some(bin) = verity_mcp_bin {
-        env_pairs.push((
-            "VERITY_MCP_BIN".to_string(),
-            bin.to_string_lossy().to_string(),
-        ));
-        env_pairs.push(("VERITY_MCP_ARGS".to_string(), "mcp".to_string()));
-    }
+    let bin = verity_mcp_bin
+        .map(|path| path.to_string_lossy())
+        .unwrap_or_default();
+    let args = if bin.is_empty() { "" } else { "mcp" };
+    env_pairs.push(("VERITY_MCP_ARGS".to_string(), args.to_string()));
+    env_pairs.push(("VERITY_MCP_BIN".to_string(), bin.into_owned()));
     env_pairs
 }
 
@@ -994,6 +982,8 @@ struct PiAppStateInner {
     projects_store_path: PathBuf,
     session_meta_path: PathBuf,
     registry: Mutex<ProjectRegistry>,
+    workspace_transition: Mutex<()>,
+    pending_supervisor: Mutex<Option<Arc<PiSessionSupervisor>>>,
     provider_store_path: PathBuf,
     base_config: Option<PiSessionConfig>,
     selected_model: Mutex<Option<ModelOption>>,
@@ -1044,6 +1034,8 @@ impl PiAppState {
                 projects_store_path,
                 session_meta_path,
                 registry: Mutex::new(registry),
+                workspace_transition: Mutex::new(()),
+                pending_supervisor: Mutex::new(None),
                 provider_store_path: default_store_path(),
                 base_config: None,
                 selected_model: Mutex::new(None),
@@ -1072,6 +1064,8 @@ impl PiAppState {
                 projects_store_path,
                 session_meta_path,
                 registry: Mutex::new(registry),
+                workspace_transition: Mutex::new(()),
+                pending_supervisor: Mutex::new(None),
                 provider_store_path,
                 base_config: Some(base_config),
                 selected_model: Mutex::new(None),
@@ -1122,6 +1116,7 @@ impl PiAppState {
     /// restarts with updated `VERITY_DESKTOP_PROVIDERS` and `VERITY_DESKTOP_KEY_<ID>`
     /// environment variables once idle (or immediately if already idle).
     pub fn notify_providers_changed(&self) {
+        let _workspace = self.lock_workspace();
         let live = {
             let guard = self
                 .inner
@@ -1158,36 +1153,48 @@ impl PiAppState {
         &self,
         event_sink: EventSink,
     ) -> Result<Arc<PiSessionSupervisor>, String> {
-        let to_shutdown = {
-            let mut guard = self
-                .inner
-                .supervisor
-                .lock()
-                .expect("supervisor lock poisoned");
-            if let Some(existing) = guard.as_ref() {
-                let should_recycle = self.inner.provider_reload_pending.load(Ordering::Acquire)
-                    && existing.activity().is_idle();
-                if existing.is_alive() && !should_recycle {
-                    return Ok(Arc::clone(existing));
-                }
-                if should_recycle {
-                    self.inner
-                        .provider_reload_pending
-                        .store(false, Ordering::Release);
-                }
-                guard.take()
-            } else {
-                None
+        let registry = self.inner.registry.lock().expect("registry lock poisoned");
+        let mut supervisor = self
+            .inner
+            .supervisor
+            .lock()
+            .expect("supervisor lock poisoned");
+        if let Some(existing) = supervisor.as_ref() {
+            let should_recycle = self.inner.provider_reload_pending.load(Ordering::Acquire)
+                && existing.activity().is_idle();
+            if existing.is_alive() && !should_recycle {
+                return Ok(Arc::clone(existing));
             }
-        };
+            if should_recycle {
+                self.inner
+                    .provider_reload_pending
+                    .store(false, Ordering::Release);
+            }
+        }
 
-        if let Some(old) = to_shutdown {
+        let project_path = registry
+            .active_project()
+            .map(|project| PathBuf::from(&project.path))
+            .unwrap_or_else(|| self.inner.default_cwd.clone());
+        let arc = self.spawn_supervisor(project_path, event_sink)?;
+        let old = supervisor.replace(Arc::clone(&arc));
+        drop(supervisor);
+        drop(registry);
+        if let Some(old) = old {
             old.shutdown();
         }
 
-        let project_path = self.project_path();
+        self.replay_pending_preferences(&arc);
+        Ok(arc)
+    }
+
+    fn spawn_supervisor(
+        &self,
+        project_path: PathBuf,
+        event_sink: EventSink,
+    ) -> Result<Arc<PiSessionSupervisor>, String> {
         let store = ProviderStore::load(&self.inner.provider_store_path).unwrap_or_default();
-        let verity_bin = resolve_verity_mcp_bin(&project_path);
+        let verity_bin = resolve_verity_mcp_bin();
         let launch_env = build_pi_launch_env(&store, verity_bin.as_deref());
 
         let mut config = match &self.inner.base_config {
@@ -1209,34 +1216,33 @@ impl PiAppState {
         });
         let spawned = PiSessionSupervisor::spawn(config, event_sink, reload_hook)
             .map_err(|e| e.to_string())?;
-        let arc = Arc::new(spawned);
+        Ok(Arc::new(spawned))
+    }
 
-        let loser = {
-            let mut guard = self
-                .inner
-                .supervisor
-                .lock()
-                .expect("supervisor lock poisoned");
-            if let Some(existing) = guard.as_ref() {
-                if existing.is_alive() {
-                    let winner = Arc::clone(existing);
-                    drop(guard);
-                    arc.shutdown();
-                    return Ok(winner);
-                }
-            }
-            guard.replace(Arc::clone(&arc))
-        };
-        if let Some(old) = loser {
-            old.shutdown();
-        }
-
-        self.replay_pending_preferences(&arc);
-        Ok(arc)
+    fn lock_workspace(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner
+            .workspace_transition
+            .lock()
+            .expect("workspace lock poisoned")
     }
 
     /// Replays any model or thinking-level selections made while Pi was unavailable
     /// so a newly started supervisor converges idempotently to `PiAppState`.
+    fn require_idle_supervisor(&self) -> Result<(), String> {
+        let supervisor = self
+            .inner
+            .supervisor
+            .lock()
+            .expect("supervisor lock poisoned");
+        if supervisor
+            .as_ref()
+            .is_some_and(|sup| sup.is_alive() && !sup.activity().is_idle())
+        {
+            return Err("Wait for Pi to finish before switching projects.".to_string());
+        }
+        Ok(())
+    }
+
     fn replay_pending_preferences(&self, sup: &PiSessionSupervisor) {
         if self.inner.model_pending_sync.load(Ordering::Acquire) {
             let pending_model = self
@@ -1484,11 +1490,15 @@ impl PiAppState {
         event_sink: EventSink,
         path: String,
     ) -> Result<PiBootstrapData, String> {
+        let _workspace = self.lock_workspace();
+        self.require_idle_supervisor()?;
         let trimmed = require_non_empty("path", &path)?;
         {
             let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
-            reg.add_project(Path::new(&trimmed))?;
-            reg.save_atomic(&self.inner.projects_store_path)?;
+            let mut next = reg.clone();
+            next.add_project(Path::new(&trimmed))?;
+            next.save_atomic(&self.inner.projects_store_path)?;
+            *reg = next;
         }
         self.shutdown();
         Ok(self.bootstrap_with_sink(event_sink))
@@ -1499,11 +1509,15 @@ impl PiAppState {
         event_sink: EventSink,
         path: String,
     ) -> Result<PiBootstrapData, String> {
+        let _workspace = self.lock_workspace();
+        self.require_idle_supervisor()?;
         let trimmed = require_non_empty("path", &path)?;
         let active_changed = {
             let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
-            let (_removed, active_was_removed, _next) = reg.remove_project(Path::new(&trimmed))?;
-            reg.save_atomic(&self.inner.projects_store_path)?;
+            let mut next = reg.clone();
+            let (_removed, active_was_removed, _next) = next.remove_project(Path::new(&trimmed))?;
+            next.save_atomic(&self.inner.projects_store_path)?;
+            *reg = next;
             active_was_removed
         };
         if active_changed {
@@ -1517,11 +1531,15 @@ impl PiAppState {
         event_sink: EventSink,
         path: String,
     ) -> Result<PiBootstrapData, String> {
+        let _workspace = self.lock_workspace();
+        self.require_idle_supervisor()?;
         let trimmed = require_non_empty("path", &path)?;
         {
             let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
-            reg.set_active_project(Path::new(&trimmed))?;
-            reg.save_atomic(&self.inner.projects_store_path)?;
+            let mut next = reg.clone();
+            next.set_active_project(Path::new(&trimmed))?;
+            next.save_atomic(&self.inner.projects_store_path)?;
+            *reg = next;
         }
         self.shutdown();
         Ok(self.bootstrap_with_sink(event_sink))
@@ -1533,6 +1551,7 @@ impl PiAppState {
         session_id: String,
         archived: bool,
     ) -> Result<PiBootstrapData, String> {
+        let _workspace = self.lock_workspace();
         let session_id = require_non_empty("sessionId", &session_id)?;
         set_session_archived_at(&self.inner.session_meta_path, &session_id, archived)?;
         Ok(self.bootstrap_with_sink(event_sink))
@@ -1543,6 +1562,7 @@ impl PiAppState {
         event_sink: EventSink,
         session_id: String,
     ) -> Result<PiBootstrapData, String> {
+        let _workspace = self.lock_workspace();
         let session_id = require_non_empty("sessionId", &session_id)?;
         let (projects, active_project) = self.snapshot_projects();
         let archived_ids = load_archived_session_ids_from(&self.inner.session_meta_path);
@@ -1583,64 +1603,208 @@ impl PiAppState {
                 .as_ref()
                 .is_some_and(|live| live.id == session_id);
 
-        // Remove from archived metadata store first.
-        let _ = set_session_archived_at(&self.inner.session_meta_path, &session_id, false);
-
         // If deleting the active session, switch to the next non-archived session in the same
         // project or start a fresh session before deleting the file on disk.
         if is_active {
-            if let Some(ref sup) = live_sup {
-                let next_in_project = disk_sessions.iter().find(|s| {
-                    s.project_id == active_project.id
-                        && s.id != session_id
-                        && !s.archived
-                        && !s.path.trim().is_empty()
-                });
-                if let Some(next_sess) = next_in_project {
-                    let _ = sup.switch_session(&next_sess.path);
-                    *self
-                        .inner
-                        .active_session_id
-                        .lock()
-                        .expect("active_session_id lock poisoned") = Some(next_sess.id.clone());
-                } else {
-                    let _ = sup.new_session(None);
-                    *self
-                        .inner
-                        .active_session_id
-                        .lock()
-                        .expect("active_session_id lock poisoned") = None;
-                }
+            let sup = live_sup
+                .as_ref()
+                .ok_or("Cannot leave the active chat while Pi is unavailable.")?;
+            let replacement = disk_sessions.iter().find(|session| {
+                session.project_id == active_project.id
+                    && session.id != session_id
+                    && !session.archived
+                    && !session.path.trim().is_empty()
+            });
+            let response = if let Some(next) = replacement {
+                sup.switch_session(&next.path)
+            } else {
+                sup.new_session(None)
             }
+            .map_err(|e| e.to_string())?;
+            if activation_cancelled(&response) {
+                return Err("Pi cancelled leaving the active chat.".to_string());
+            }
+            let confirmed = self.active_session_summary(sup, &active_project.id)?;
+            if confirmed.id == session_id || replacement.is_some_and(|next| next.id != confirmed.id)
+            {
+                return Err("Pi did not leave the active chat.".to_string());
+            }
+            *self
+                .inner
+                .active_session_id
+                .lock()
+                .expect("active_session_id lock poisoned") = Some(confirmed.id);
         }
 
         if !target_path.trim().is_empty() {
             delete_session_file(&target_path)?;
         }
+        set_session_archived_at(&self.inner.session_meta_path, &session_id, false)?;
 
         Ok(self.bootstrap_with_sink(event_sink))
+    }
+
+    fn active_session_summary(
+        &self,
+        sup: &PiSessionSupervisor,
+        project_id: &str,
+    ) -> Result<PiSessionSummary, String> {
+        let state = sup.get_state().map_err(|e| e.to_string())?;
+        let data = parse_data_json(&state).ok_or("Pi did not return its active session.")?;
+        let mut session = parse_session_summary(&data, project_id, "", "Current session");
+        if session.id.is_empty() || session.project_id != project_id {
+            return Err(
+                "Pi did not confirm the active session for the selected project.".to_string(),
+            );
+        }
+        session.archived =
+            load_archived_session_ids_from(&self.inner.session_meta_path).contains(&session.id);
+        Ok(session)
+    }
+
+    fn confirmed_session(
+        &self,
+        sup: &PiSessionSupervisor,
+        project_id: &str,
+    ) -> Result<SessionWithMessages, String> {
+        let mut session = self.active_session_summary(sup, project_id)?;
+        let response = sup.get_messages().map_err(|e| e.to_string())?;
+        let messages = parse_data_json(&response)
+            .map(|data| parse_chat_messages(&data))
+            .ok_or("Pi did not return its active transcript.")?;
+        session.message_count = messages.len();
+        Ok(SessionWithMessages { session, messages })
+    }
+
+    fn staged_supervisor(
+        &self,
+        project: &PiProject,
+        event_sink: EventSink,
+    ) -> Result<(Arc<PiSessionSupervisor>, Arc<AtomicBool>), String> {
+        let committed = Arc::new(AtomicBool::new(false));
+        let route_events = Arc::clone(&committed);
+        let sink: EventSink = Arc::new(move |event| {
+            if route_events.load(Ordering::Acquire)
+                || matches!(event, PiUiEvent::ExtensionUiRequest { .. })
+            {
+                event_sink(event);
+            }
+        });
+        let sup = self.spawn_supervisor(PathBuf::from(&project.path), sink)?;
+        Ok((sup, committed))
+    }
+
+    fn run_staged<R>(
+        &self,
+        candidate: &Arc<PiSessionSupervisor>,
+        operation: impl FnOnce(&PiSessionSupervisor) -> R,
+    ) -> R {
+        *self
+            .inner
+            .pending_supervisor
+            .lock()
+            .expect("pending supervisor lock poisoned") = Some(Arc::clone(candidate));
+        let result = operation(candidate);
+        self.inner
+            .pending_supervisor
+            .lock()
+            .expect("pending supervisor lock poisoned")
+            .take();
+        result
+    }
+
+    fn select_workspace_session(
+        &self,
+        event_sink: EventSink,
+        project_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        operation: impl FnOnce(&PiSessionSupervisor, &PiProject) -> Result<PiRpcResponse, String>,
+    ) -> Result<Option<SessionWithMessages>, String> {
+        let _workspace = self.lock_workspace();
+        let (projects, current_project) = self.snapshot_projects();
+        let target = match project_id {
+            Some(id) => projects
+                .iter()
+                .find(|project| project.id == id)
+                .ok_or("Unknown project.")?,
+            None => &current_project,
+        };
+        let cross_project = current_project.id != target.id;
+        let (candidate, staged) = if cross_project {
+            self.require_idle_supervisor()?;
+            let (candidate, committed) = self.staged_supervisor(target, event_sink)?;
+            (candidate, Some(committed))
+        } else {
+            (self.ensure_supervisor_with_sink(event_sink)?, None)
+        };
+        let response = if staged.is_some() {
+            self.run_staged(&candidate, |sup| operation(sup, target))
+        } else {
+            operation(&candidate, target)
+        }?;
+        if activation_cancelled(&response) {
+            return Ok(None);
+        }
+        let confirmed = self.confirmed_session(&candidate, &target.id)?;
+        if expected_session_id.is_some_and(|expected| expected != confirmed.session.id) {
+            return Err("Pi did not open the selected chat.".to_string());
+        }
+        if let Some(committed) = staged {
+            let mut registry = self.inner.registry.lock().expect("registry lock poisoned");
+            let mut updated = registry.clone();
+            updated.set_active_project(Path::new(&target.path))?;
+            updated.save_atomic(&self.inner.projects_store_path)?;
+            let mut supervisor = self
+                .inner
+                .supervisor
+                .lock()
+                .expect("supervisor lock poisoned");
+            *registry = updated;
+            let old = supervisor.replace(Arc::clone(&candidate));
+            committed.store(true, Ordering::Release);
+            drop(supervisor);
+            drop(registry);
+            if let Some(old) = old {
+                old.shutdown();
+            }
+            self.replay_pending_preferences(&candidate);
+        }
+        *self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned") = Some(confirmed.session.id.clone());
+        Ok(Some(confirmed))
+    }
+
+    fn saved_session(
+        &self,
+        project: &PiProject,
+        session_id: &str,
+    ) -> Result<PiSessionSummary, String> {
+        let archived = load_archived_session_ids_from(&self.inner.session_meta_path);
+        scan_project_sessions_with_archived(&project.id, Path::new(&project.path), &archived)
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "The selected chat is unavailable in this project.".to_string())
     }
 
     pub fn switch_session_with_sink(
         &self,
         event_sink: EventSink,
-        session_path: String,
-    ) -> Result<Vec<PiChatMessage>, String> {
-        let session_path = require_non_empty("sessionPath", &session_path)?;
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
-        let resp = sup
-            .switch_session(session_path)
-            .map_err(|e| e.to_string())?;
-        if let Some(val) = parse_data_json(&resp) {
-            let msgs = parse_chat_messages(&val);
-            if !msgs.is_empty() {
-                return Ok(msgs);
-            }
-        }
-        let msgs_resp = sup.get_messages().map_err(|e| e.to_string())?;
-        Ok(parse_data_json(&msgs_resp)
-            .map(|v| parse_chat_messages(&v))
-            .unwrap_or_default())
+        project_id: String,
+        session_id: String,
+    ) -> Result<Option<SessionWithMessages>, String> {
+        let session_id = require_non_empty("sessionId", &session_id)?;
+        self.select_workspace_session(
+            event_sink,
+            Some(&project_id),
+            Some(&session_id),
+            |sup, project| {
+                let session = self.saved_session(project, &session_id)?;
+                sup.switch_session(&session.path).map_err(|e| e.to_string())
+            },
+        )
     }
 
     pub fn new_session_with_sink(
@@ -1648,82 +1812,56 @@ impl PiAppState {
         event_sink: EventSink,
         project_id: Option<String>,
         parent_session: Option<String>,
-    ) -> Result<PiSessionSummary, String> {
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
-        let resp = sup
-            .new_session(parent_session.clone())
-            .map_err(|e| e.to_string())?;
-        let fallback_project_id =
-            project_id.unwrap_or_else(|| project_from_path(&self.project_path()).id);
-        let mut summary = parse_data_json(&resp)
-            .map(|v| parse_session_summary(&v, &fallback_project_id, "session-new", "New session"))
-            .unwrap_or_else(|| PiSessionSummary {
-                id: "session-new".to_string(),
-                project_id: fallback_project_id,
-                name: "New session".to_string(),
-                path: String::new(),
-                updated_at: "Just now".to_string(),
-                message_count: 0,
-                parent_session_id: parent_session.clone(),
-                archived: false,
-            });
-        if summary.parent_session_id.is_none() {
-            summary.parent_session_id = parent_session;
+    ) -> Result<Option<SessionWithMessages>, String> {
+        let mut result =
+            self.select_workspace_session(event_sink, project_id.as_deref(), None, |sup, _| {
+                sup.new_session(parent_session.clone())
+                    .map_err(|e| e.to_string())
+            })?;
+        if let Some(confirmed) = result.as_mut() {
+            confirmed.session.parent_session_id = parent_session;
         }
-        Ok(summary)
+        Ok(result)
     }
 
     pub fn set_session_name_with_sink(
         &self,
         event_sink: EventSink,
+        project_id: String,
         session_id: String,
         name: String,
-        session_path: Option<String>,
     ) -> Result<PiSessionSummary, String> {
+        let _workspace = self.lock_workspace();
         let session_id = require_non_empty("sessionId", &session_id)?;
         let name = require_non_empty("name", &name)?;
-        let sup = self.ensure_supervisor_with_sink(event_sink)?;
+        let (projects, active_project) = self.snapshot_projects();
+        let project = projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .ok_or("Unknown project.")?;
 
-        if let Some(target_path) = session_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let current_path = sup
-                .get_state()
-                .ok()
-                .and_then(|r| parse_data_json(&r))
-                .and_then(|v| {
-                    opt_str(
-                        &v,
-                        &[
-                            "path",
-                            "sessionPath",
-                            "session_path",
-                            "sessionFile",
-                            "session_file",
-                        ],
-                    )
-                });
-            if current_path.as_deref() != Some(target_path) {
-                sup.switch_session(target_path).map_err(|e| e.to_string())?;
+        if active_project.id == project_id {
+            let sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink))?;
+            if self.active_session_summary(&sup, &project_id)?.id == session_id {
+                sup.set_session_name(&name).map_err(|e| e.to_string())?;
+                return self.active_session_summary(&sup, &project_id);
             }
         }
 
-        let resp = sup.set_session_name(&name).map_err(|e| e.to_string())?;
-        let project_id = project_from_path(&self.project_path()).id;
-        Ok(parse_data_json(&resp)
-            .map(|v| parse_session_summary(&v, &project_id, &session_id, &name))
-            .unwrap_or_else(|| PiSessionSummary {
-                id: session_id,
-                project_id,
-                name,
-                path: session_path.unwrap_or_default(),
-                updated_at: "Just now".to_string(),
-                message_count: 0,
-                parent_session_id: None,
-                archived: false,
-            }))
+        let mut saved = self.saved_session(project, &session_id)?;
+        let (candidate, _) = self.staged_supervisor(project, event_sink)?;
+        self.run_staged(&candidate, |sup| {
+            let response = sup.switch_session(&saved.path).map_err(|e| e.to_string())?;
+            if activation_cancelled(&response) {
+                return Err("Pi cancelled opening the selected chat.".to_string());
+            }
+            if self.active_session_summary(sup, &project_id)?.id != session_id {
+                return Err("Pi did not open the selected chat.".to_string());
+            }
+            sup.set_session_name(&name).map_err(|e| e.to_string())?;
+            saved.name = self.active_session_summary(sup, &project_id)?.name;
+            Ok(saved)
+        })
     }
 
     pub fn get_tree_with_sink(
@@ -1754,9 +1892,20 @@ impl PiAppState {
         entry_id: String,
     ) -> Result<SessionWithMessages, String> {
         let entry_id = require_non_empty("entryId", &entry_id)?;
+        let _workspace = self.lock_workspace();
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
         let resp = sup.fork(&entry_id).map_err(|e| e.to_string())?;
-        self.parse_session_with_messages(&sup, &resp, "session-fork", "Forked session")
+        if activation_cancelled(&resp) {
+            return Err("Pi cancelled the chat operation.".to_string());
+        }
+        let result =
+            self.parse_session_with_messages(&sup, &resp, "session-fork", "Forked session")?;
+        *self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned") = Some(result.session.id.clone());
+        Ok(result)
     }
 
     pub fn clone_with_sink(
@@ -1764,9 +1913,20 @@ impl PiAppState {
         event_sink: EventSink,
         entry_id: Option<String>,
     ) -> Result<SessionWithMessages, String> {
+        let _workspace = self.lock_workspace();
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
         let resp = sup.clone_session(entry_id).map_err(|e| e.to_string())?;
-        self.parse_session_with_messages(&sup, &resp, "session-clone", "Cloned session")
+        if activation_cancelled(&resp) {
+            return Err("Pi cancelled the chat operation.".to_string());
+        }
+        let result =
+            self.parse_session_with_messages(&sup, &resp, "session-clone", "Cloned session")?;
+        *self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned") = Some(result.session.id.clone());
+        Ok(result)
     }
 
     pub fn export_html_with_sink(
@@ -1867,27 +2027,25 @@ impl PiAppState {
         event_sink: EventSink,
         message: String,
         images: Vec<PendingAttachment>,
+        project_id: String,
+        session_id: String,
     ) -> Result<(), String> {
+        let _workspace = self.lock_workspace();
+        let (_, current_project) = self.snapshot_projects();
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
-        let bg_state = self.clone();
-        let bg_message = message.clone();
+        let response = sup.get_state().map_err(|e| e.to_string())?;
+        let current_session = parse_data_json(&response)
+            .and_then(|data| opt_str(&data, &["sessionId", "id", "session_id"]));
+        if current_project.id != project_id || current_session.as_deref() != Some(&session_id) {
+            return Err("The active chat changed. Reopen the chat before sending.".to_string());
+        }
+        let project_dir = PathBuf::from(current_project.path);
+        let checkpoint_prompt = message.clone();
         std::thread::spawn(move || {
-            bg_state.record_pre_prompt_checkpoint(&bg_message);
+            let _ = capture_and_record_turn_checkpoint(&project_dir, session_id, checkpoint_prompt);
         });
         sup.prompt(message, images).map_err(|e| e.to_string())?;
         Ok(())
-    }
-
-    fn record_pre_prompt_checkpoint(&self, message: &str) {
-        let project_dir = self.project_path();
-        let session_id = self
-            .inner
-            .active_session_id
-            .lock()
-            .expect("active_session_id lock poisoned")
-            .clone()
-            .unwrap_or_else(|| "default-session".to_string());
-        let _ = capture_and_record_turn_checkpoint(&project_dir, session_id, message.to_string());
     }
 
     pub fn list_checkpoints(&self) -> Result<Vec<TurnCheckpointView>, String> {
@@ -1942,6 +2100,7 @@ impl PiAppState {
         prompt_text: Option<String>,
     ) -> Result<RevertTurnResult, String> {
         let entry_id = require_non_empty("entryId", &entry_id)?;
+        let _workspace = self.lock_workspace();
         let sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink))?;
 
         let session_id = self
@@ -1992,6 +2151,9 @@ impl PiAppState {
         let fallback_new_session =
             |sup: &PiSessionSupervisor| -> Result<SessionWithMessages, String> {
                 let resp = sup.new_session(None).map_err(|e| e.to_string())?;
+                if activation_cancelled(&resp) {
+                    return Err("Revert was cancelled.".to_string());
+                }
                 let data = parse_data_json(&resp);
                 let has_session_id = data.as_ref().is_some_and(|v| {
                     let obj = v.get("session").unwrap_or(v);
@@ -2120,13 +2282,27 @@ impl PiAppState {
                 resolved_turn_index,
                 restored_prompt.as_deref(),
             ) {
-                let outcome = revert_to_snapshot(&project_dir, &cp.tree_oid)?;
-                save_last_redo(
-                    &project_dir,
-                    outcome.redo_tree_oid.clone(),
-                    outcome.reverted_files.clone(),
-                )?;
-                (true, outcome.reverted_files, true, None)
+                match revert_to_snapshot(&project_dir, &cp.tree_oid) {
+                    Ok(outcome) => {
+                        let save_result = save_last_redo(
+                            &project_dir,
+                            outcome.redo_tree_oid,
+                            outcome.reverted_files.clone(),
+                            outcome.target_tree_oid,
+                            &session.id,
+                        );
+                        let note = save_result.err().map(|err| {
+                            format!("Reverted chat and code. The redo checkpoint could not be saved. {err}")
+                        });
+                        (true, outcome.reverted_files, note.is_none(), note)
+                    }
+                    Err(err) => (
+                        false,
+                        Vec::new(),
+                        false,
+                        Some(format!("Chat was reverted. Code restore failed. {err}")),
+                    ),
+                }
             } else {
                 (
                     false,
@@ -2151,11 +2327,15 @@ impl PiAppState {
     }
 
     pub fn redo_revert_with_sink(&self) -> Result<RedoRevertResult, String> {
+        let _workspace = self.lock_workspace();
         let project_dir = self.project_path();
-        let redo = load_last_redo(&project_dir)
-            .ok_or_else(|| "No revert operation is available to redo.".to_string())?;
-        let restored_files = redo_targeted_revert(&project_dir, &redo.redo_tree_oid, &redo.files)?;
-        clear_last_redo(&project_dir)?;
+        let session_id = self
+            .inner
+            .active_session_id
+            .lock()
+            .expect("active_session_id lock poisoned")
+            .clone();
+        let restored_files = redo_last_revert(&project_dir, session_id.as_deref())?;
         Ok(RedoRevertResult { restored_files })
     }
 
@@ -2245,6 +2425,19 @@ impl PiAppState {
         answer: ExtensionUiAnswer,
     ) -> Result<(), String> {
         let parsed_id = DialogId::parse(dialog_id).map_err(|e| e.to_string())?;
+        let pending = self
+            .inner
+            .pending_supervisor
+            .lock()
+            .expect("pending supervisor lock poisoned")
+            .clone();
+        if let Some(pending) = pending {
+            match pending.extension_ui_response(&parsed_id, answer.clone()) {
+                Ok(_) => return Ok(()),
+                Err(PiSessionError::ExtensionUi(ExtensionUiError::UnknownDialog(_))) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
         sup.extension_ui_response(&parsed_id, answer)
             .map_err(|e| e.to_string())?;
@@ -2588,6 +2781,13 @@ impl PiAppState {
     }
 }
 
+fn activation_cancelled(response: &PiRpcResponse) -> bool {
+    parse_data_json(response)
+        .as_ref()
+        .and_then(|data| opt_bool(data, &["cancelled"]))
+        .unwrap_or(false)
+}
+
 fn is_synthetic_local_entry_id(id: &str) -> bool {
     let trimmed = id.trim();
     trimmed.starts_with("local-") || trimmed.starts_with("stream-") || trimmed.starts_with("msg-")
@@ -2611,21 +2811,25 @@ pub async fn pi_bootstrap(
 ) -> Result<PiBootstrapData, String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
-    tauri::async_runtime::spawn_blocking(move || Ok(app_state.bootstrap_with_sink(sink)))
-        .await
-        .map_err(|e| format!("blocking task failed: {}", e))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _workspace = app_state.lock_workspace();
+        Ok(app_state.bootstrap_with_sink(sink))
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
 pub async fn pi_switch_session(
     app: AppHandle,
     state: State<'_, PiAppState>,
-    session_path: String,
-) -> Result<Vec<PiChatMessage>, String> {
+    project_id: String,
+    session_id: String,
+) -> Result<Option<SessionWithMessages>, String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        app_state.switch_session_with_sink(sink, session_path)
+        app_state.switch_session_with_sink(sink, project_id, session_id)
     })
     .await
     .map_err(|e| format!("blocking task failed: {}", e))?
@@ -2637,7 +2841,7 @@ pub async fn pi_new_session(
     state: State<'_, PiAppState>,
     project_id: Option<String>,
     parent_session: Option<String>,
-) -> Result<PiSessionSummary, String> {
+) -> Result<Option<SessionWithMessages>, String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
     tauri::async_runtime::spawn_blocking(move || {
@@ -2651,14 +2855,14 @@ pub async fn pi_new_session(
 pub async fn pi_set_session_name(
     app: AppHandle,
     state: State<'_, PiAppState>,
+    project_id: String,
     session_id: String,
     name: String,
-    session_path: Option<String>,
 ) -> Result<PiSessionSummary, String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        app_state.set_session_name_with_sink(sink, session_id, name, session_path)
+        app_state.set_session_name_with_sink(sink, project_id, session_id, name)
     })
     .await
     .map_err(|e| format!("blocking task failed: {}", e))?
@@ -2764,12 +2968,16 @@ pub async fn pi_prompt(
     state: State<'_, PiAppState>,
     message: String,
     images: Vec<PendingAttachment>,
+    project_id: String,
+    session_id: String,
 ) -> Result<(), String> {
     let app_state = state.inner().clone();
     let sink = tauri_event_sink(&app);
-    tauri::async_runtime::spawn_blocking(move || app_state.prompt_with_sink(sink, message, images))
-        .await
-        .map_err(|e| format!("blocking task failed: {}", e))?
+    tauri::async_runtime::spawn_blocking(move || {
+        app_state.prompt_with_sink(sink, message, images, project_id, session_id)
+    })
+    .await
+    .map_err(|e| format!("blocking task failed: {}", e))?
 }
 
 #[tauri::command]
@@ -3151,13 +3359,217 @@ mod tests {
 
     fn mock_sh_config(cwd: PathBuf, script: &str) -> PiSessionConfig {
         PiSessionConfig {
-            program: "/bin/sh".to_string(),
+            program: "sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             cwd,
             env: Vec::new(),
             command_timeout: Duration::from_secs(5),
             no_session: false,
         }
+    }
+
+    #[test]
+    fn session_wire_replies_commit_only_confirmed_workspace_and_prompt_target() {
+        let root = unique_temp_dir("session-wire");
+        let alpha = root.join("alpha");
+        let beta = root.join("beta");
+        fs::create_dir(&alpha).unwrap();
+        fs::create_dir(&beta).unwrap();
+        let histories = beta.join(".pi").join("sessions");
+        fs::create_dir_all(&histories).unwrap();
+        for id in ["saved", "cancel"] {
+            fs::write(
+                histories.join(format!("{id}.jsonl")),
+                serde_json::json!({
+                    "type": "session", "id": id, "cwd": &beta
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let script = r#"
+const { basename } = require("node:path");
+const fs = require("node:fs");
+const lines = require("node:readline").createInterface({ input: process.stdin });
+const project = basename(process.cwd());
+let session = "initial-" + project;
+let serial = 0;
+let name = session;
+let file;
+lines.on("line", (line) => {
+  const input = JSON.parse(line);
+  let data;
+  switch (input.type) {
+    case "get_state":
+      data = { sessionId: session, sessionName: name, sessionFile: file ?? project + "/" + session + ".jsonl" };
+      break;
+    case "get_messages":
+      data = { messages: [{ role: "user", content: project + ":" + session }] };
+      break;
+    case "switch_session":
+      const selected = basename(input.sessionPath, ".jsonl");
+      data = { cancelled: selected === "cancel" };
+      if (!data.cancelled) {
+        session = selected;
+        file = input.sessionPath;
+        name = fs.readFileSync(file, "utf8").trim().split("\n")
+          .map((line) => JSON.parse(line)).at(-1).name ?? session;
+      }
+      break;
+    case "new_session":
+      data = { cancelled: input.parentSession === "cancel" };
+      if (!data.cancelled) {
+        session = "new-" + project + "-" + (++serial);
+        name = session;
+        file = undefined;
+      }
+      break;
+    case "set_session_name":
+      name = input.name;
+      if (file) fs.appendFileSync(file, "\n" + JSON.stringify({ type: "session_info", name }) + "\n");
+      break;
+    case "prompt":
+      if (input.message !== project + ":" + session) {
+        console.log(JSON.stringify({ type: "response", id: input.id, command: input.type,
+          success: false, error: "misrouted prompt" }));
+        return;
+      }
+  }
+  console.log(JSON.stringify({ type: "response", id: input.id, command: input.type,
+    success: true, data }));
+});
+"#;
+        let mut config = PiSessionConfig::default_pi(alpha.clone());
+        config.program = "node".to_string();
+        config.args = vec!["-e".to_string(), script.to_string()];
+        let state = PiAppState::with_config(alpha.clone(), root.join("providers.json"), config);
+        let sink: EventSink = Arc::new(|_| {});
+        let added = state
+            .add_project_with_sink(Arc::clone(&sink), beta.to_string_lossy().into_owned())
+            .unwrap();
+        let beta_id = added.active_project_id;
+        let initial = state
+            .switch_project_with_sink(Arc::clone(&sink), alpha.to_string_lossy().into_owned())
+            .unwrap();
+        let alpha_id = initial.active_project_id;
+        let initial_id = initial.active_session_id;
+
+        let cancelled = state
+            .switch_session_with_sink(Arc::clone(&sink), beta_id.clone(), "cancel".to_string())
+            .unwrap();
+        assert!(cancelled.is_none());
+        assert_eq!(
+            state.project_path(),
+            crate::projects::normalize_project_path(&alpha)
+        );
+        assert_eq!(
+            state
+                .bootstrap_with_sink(Arc::clone(&sink))
+                .active_session_id,
+            initial_id
+        );
+
+        let renamed = state
+            .set_session_name_with_sink(
+                Arc::clone(&sink),
+                beta_id.clone(),
+                "saved".to_string(),
+                "Saved title".to_string(),
+            )
+            .unwrap();
+        assert_eq!(renamed.name, "Saved title");
+        let still_active = state.bootstrap_with_sink(Arc::clone(&sink));
+        assert_eq!(still_active.active_project_id, alpha_id);
+        assert_eq!(still_active.active_session_id, initial_id);
+        assert!(state
+            .set_session_name_with_sink(
+                Arc::clone(&sink),
+                beta_id.clone(),
+                "cancel".to_string(),
+                "Wrong title".to_string(),
+            )
+            .is_err());
+
+        let selected = state
+            .switch_session_with_sink(Arc::clone(&sink), beta_id.clone(), "saved".to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.session.id, "saved");
+        assert_eq!(selected.session.name, "Saved title");
+        assert_eq!(selected.session.project_id, beta_id);
+        assert_eq!(selected.messages[0].content, "beta:saved");
+        assert_eq!(
+            state.project_path(),
+            crate::projects::normalize_project_path(&beta)
+        );
+        assert_eq!(
+            ProjectRegistry::load(&root.join("projects.json"))
+                .unwrap()
+                .active_project()
+                .unwrap()
+                .id,
+            beta_id
+        );
+        assert!(state
+            .prompt_with_sink(
+                Arc::clone(&sink),
+                "beta:saved".to_string(),
+                vec![],
+                alpha_id,
+                initial_id,
+            )
+            .is_err());
+
+        let deletion =
+            state.delete_session_with_sink(Arc::clone(&sink), selected.session.id.clone());
+        assert_eq!(
+            deletion.unwrap_err(),
+            "Pi cancelled leaving the active chat."
+        );
+        assert!(histories.join("saved.jsonl").exists());
+
+        let cancelled = state
+            .new_session_with_sink(
+                Arc::clone(&sink),
+                Some(beta_id.clone()),
+                Some("cancel".to_string()),
+            )
+            .unwrap();
+        assert!(cancelled.is_none());
+        assert_eq!(
+            state
+                .bootstrap_with_sink(Arc::clone(&sink))
+                .active_session_id,
+            selected.session.id
+        );
+        fs::remove_file(histories.join("cancel.jsonl")).unwrap();
+        let replacement = state
+            .delete_session_with_sink(Arc::clone(&sink), selected.session.id)
+            .unwrap();
+        assert_eq!(replacement.active_session_id, "new-beta-1");
+        assert!(!histories.join("saved.jsonl").exists());
+
+        let mut last = replacement.sessions[0].clone();
+        for expected in ["new-beta-2", "new-beta-3"] {
+            let result = state
+                .new_session_with_sink(Arc::clone(&sink), Some(beta_id.clone()), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.session.id, expected);
+            assert_ne!(result.session.path, last.path);
+            last = result.session;
+        }
+        state
+            .prompt_with_sink(
+                Arc::clone(&sink),
+                "beta:new-beta-3".to_string(),
+                vec![],
+                beta_id,
+                last.id,
+            )
+            .unwrap();
+        state.shutdown();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3366,7 +3778,18 @@ mod tests {
         let dir = unique_temp_dir("lifecycle");
         let store_path = dir.join("providers.json");
         let env_dump_path = dir.join("captured_env.txt");
-        let fake_verity_bin = dir.join("target").join("debug").join("verity");
+        let histories = dir.join(".pi").join("sessions");
+        fs::create_dir_all(&histories).unwrap();
+        fs::write(
+            histories.join("sess-2.jsonl"),
+            r#"{"type":"session","id":"sess-2"}"#,
+        )
+        .unwrap();
+        let fake_verity_bin = dir.join("target").join("debug").join(if cfg!(windows) {
+            "verity.exe"
+        } else {
+            "verity"
+        });
         fs::create_dir_all(fake_verity_bin.parent().unwrap()).unwrap();
         fs::write(&fake_verity_bin, "#!/bin/sh\nexit 0\n").unwrap();
 
@@ -3387,15 +3810,18 @@ mod tests {
         let script = format!(
             r#"
 printf 'KEY=%s\nMCP=%s\nARGS=%s\n' "$VERITY_DESKTOP_KEY_OPENAI_DEV" "$VERITY_MCP_BIN" "$VERITY_MCP_ARGS" > "{env_dump}"
+ACTIVE=sess-live
+TITLE="Live Session"
+CONTENT=hi
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
   case "$typ" in
     get_state)
-      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"id":"sess-live","name":"Live Session","path":"/tmp/sess-live.jsonl","thinkingLevel":"high","model":{{"provider":"openai-dev","modelId":"gpt-6.1-sol","label":"GPT-6.1 Sol"}}}}}}\n' "$id"
+      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"sessionId":"%s","sessionName":"%s","sessionFile":"/tmp/%s.jsonl","thinkingLevel":"high","model":{{"provider":"openai-dev","modelId":"gpt-6.1-sol","label":"GPT-6.1 Sol"}}}}}}\n' "$id" "$ACTIVE" "$TITLE" "$ACTIVE"
       ;;
     get_messages)
-      printf '{{"type":"response","id":"%s","command":"get_messages","success":true,"data":{{"messages":[{{"id":"m1","role":"user","content":"hi","timestamp":"10:00"}}]}}}}\n' "$id"
+      printf '{{"type":"response","id":"%s","command":"get_messages","success":true,"data":{{"messages":[{{"id":"m1","role":"user","content":"%s","timestamp":"10:00"}}]}}}}\n' "$id" "$CONTENT"
       ;;
     get_available_models)
       printf '{{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{{"models":[{{"provider":"openai-dev","modelId":"gpt-6.1-sol","label":"GPT-6.1 Sol"}}]}}}}\n' "$id"
@@ -3407,13 +3833,18 @@ while IFS= read -r line; do
       printf '{{"type":"response","id":"%s","command":"get_commands","success":true,"data":{{"commands":[{{"trigger":"/","name":"compact","description":"Compact context"}}]}}}}\n' "$id"
       ;;
     switch_session)
-      printf '{{"type":"response","id":"%s","command":"switch_session","success":true,"data":{{"messages":[{{"id":"sw1","role":"assistant","content":"switched","timestamp":"10:02"}}]}}}}\n' "$id"
+      ACTIVE=sess-2
+      CONTENT=switched
+      printf '{{"type":"response","id":"%s","command":"switch_session","success":true,"data":{{"cancelled":false}}}}\n' "$id"
       ;;
     new_session)
-      printf '{{"type":"response","id":"%s","command":"new_session","success":true,"data":{{"id":"sess-2","name":"Fresh Session","path":"/tmp/sess-2.jsonl"}}}}\n' "$id"
+      ACTIVE=sess-new
+      CONTENT=fresh
+      printf '{{"type":"response","id":"%s","command":"new_session","success":true,"data":{{"cancelled":false}}}}\n' "$id"
       ;;
     set_session_name)
-      printf '{{"type":"response","id":"%s","command":"set_session_name","success":true,"data":{{"id":"sess-2","name":"Renamed Session","path":"/tmp/sess-2.jsonl"}}}}\n' "$id"
+      TITLE="Renamed Session"
+      printf '{{"type":"response","id":"%s","command":"set_session_name","success":true}}\n' "$id"
       ;;
     get_tree)
       printf '{{"type":"response","id":"%s","command":"get_tree","success":true,"data":{{"nodes":[{{"id":"n1","parentId":null,"role":"user","preview":"root","timestamp":"10:00","depth":0,"isActiveBranch":true}}]}}}}\n' "$id"
@@ -3493,32 +3924,46 @@ done
         assert_eq!(boot.messages.len(), 1);
         assert_eq!(boot.commands.len(), 1);
 
-        // Verify 0o600 provider secret + VERITY_MCP_BIN were injected into child process.
         let dumped_env = fs::read_to_string(&env_dump_path).expect("env dump written");
         assert!(dumped_env.contains("KEY=sk-test-env-injection-42"));
-        assert!(dumped_env.contains(&format!("MCP={}", fake_verity_bin.display())));
-        assert!(dumped_env.contains("ARGS=mcp"));
+        let launched_mcp = dumped_env
+            .lines()
+            .find_map(|line| line.strip_prefix("MCP="));
+        assert_ne!(
+            launched_mcp.and_then(|path| fs::canonicalize(path).ok()),
+            Some(fs::canonicalize(fake_verity_bin).unwrap()),
+        );
 
         // 2. pi_switch_session
         let switched = state
-            .switch_session_with_sink(Arc::clone(&sink), "/tmp/sess-2.jsonl".to_string())
+            .switch_session_with_sink(
+                Arc::clone(&sink),
+                boot.active_project_id.clone(),
+                "sess-2".to_string(),
+            )
             .unwrap();
-        assert_eq!(switched[0].content, "switched");
+        let switched = switched.unwrap();
+        assert_eq!(switched.session.id, "sess-2");
+        assert_eq!(switched.messages[0].content, "switched");
 
         // 3. pi_new_session
         let created = state
             .new_session_with_sink(Arc::clone(&sink), None, Some("sess-live".to_string()))
             .unwrap();
-        assert_eq!(created.id, "sess-2");
-        assert_eq!(created.parent_session_id.as_deref(), Some("sess-live"));
+        let created = created.unwrap();
+        assert_eq!(created.session.id, "sess-new");
+        assert_eq!(
+            created.session.parent_session_id.as_deref(),
+            Some("sess-live")
+        );
 
         // 4. pi_set_session_name
         let renamed = state
             .set_session_name_with_sink(
                 Arc::clone(&sink),
-                "sess-2".to_string(),
+                boot.active_project_id.clone(),
+                created.session.id.clone(),
                 "Renamed Session".to_string(),
-                None,
             )
             .unwrap();
         assert_eq!(renamed.name, "Renamed Session");
@@ -3579,7 +4024,13 @@ done
         // 12. pi_prompt (triggers live message_start + extension_ui_request)
         let img = validate_image_bytes("shot.png", ImageMimeType::Png, b"pngdata").unwrap();
         state
-            .prompt_with_sink(Arc::clone(&sink), "run check".to_string(), vec![img])
+            .prompt_with_sink(
+                Arc::clone(&sink),
+                "run check".to_string(),
+                vec![img],
+                boot.active_project_id,
+                created.session.id,
+            )
             .unwrap();
         dlg_rx
             .recv_timeout(Duration::from_secs(3))
@@ -3662,13 +4113,23 @@ done
 
         // Boundary validation rejects empty inputs without spawning the child process.
         assert!(state
-            .switch_session_with_sink(Arc::clone(&sink), "   ".to_string())
+            .switch_session_with_sink(Arc::clone(&sink), "p1".to_string(), "   ".to_string())
             .is_err());
         assert!(state
-            .set_session_name_with_sink(Arc::clone(&sink), "".to_string(), "ok".to_string(), None)
+            .set_session_name_with_sink(
+                Arc::clone(&sink),
+                "".to_string(),
+                "".to_string(),
+                "ok".to_string()
+            )
             .is_err());
         assert!(state
-            .set_session_name_with_sink(Arc::clone(&sink), "s1".to_string(), "  ".to_string(), None)
+            .set_session_name_with_sink(
+                Arc::clone(&sink),
+                "p1".to_string(),
+                "s1".to_string(),
+                "  ".to_string()
+            )
             .is_err());
         assert!(state
             .fork_with_sink(Arc::clone(&sink), "".to_string())
@@ -4047,7 +4508,7 @@ done
 
         let script = format!(
             r#"
-pwd >> "{cwd_log}"
+(pwd -W 2>/dev/null || pwd) >> "{cwd_log}"
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
@@ -4110,7 +4571,7 @@ done
         let logged_cwds: Vec<PathBuf> = fs::read_to_string(&cwd_log)
             .unwrap()
             .lines()
-            .map(PathBuf::from)
+            .map(|path| fs::canonicalize(path).unwrap())
             .collect();
         let canon_a = fs::canonicalize(&proj_a).unwrap();
         let canon_b = fs::canonicalize(&proj_b).unwrap();
@@ -4124,64 +4585,46 @@ done
     }
 
     #[test]
-    fn set_session_name_switches_session_when_path_differs_and_new_rpc_commands_work() {
+    fn additional_rpc_commands_use_the_live_supervisor() {
         let dir = unique_temp_dir("new-rpcs");
         let store_path = dir.join("providers.json");
-        let cmd_log = dir.join("cmds.log");
 
-        let script = format!(
-            r#"
+        let script = r#"
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
-  printf '%s\n' "$typ" >> "{cmd_log}"
   case "$typ" in
     get_state)
-      printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"id":"s-cur","path":"/tmp/current.jsonl"}}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"id":"s-cur","path":"/tmp/current.jsonl"}}\n' "$id"
       ;;
     bash)
-      printf '{{"type":"response","id":"%s","command":"bash","success":true,"data":{{"output":"hello","exitCode":0}}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"bash","success":true,"data":{"output":"hello","exitCode":0}}\n' "$id"
       ;;
     get_session_stats)
-      printf '{{"type":"response","id":"%s","command":"get_session_stats","success":true,"data":{{"totalTokens":1234,"cost":0.02}}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"get_session_stats","success":true,"data":{"totalTokens":1234,"cost":0.02}}\n' "$id"
       ;;
     get_last_assistant_text)
-      printf '{{"type":"response","id":"%s","command":"get_last_assistant_text","success":true,"data":{{"text":"Last reply"}}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"get_last_assistant_text","success":true,"data":{"text":"Last reply"}}\n' "$id"
       ;;
     cycle_model)
-      printf '{{"type":"response","id":"%s","command":"cycle_model","success":true,"data":{{"model":{{"provider":"anthropic","modelId":"claude-opus-5","label":"Claude Opus 5"}}}}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"cycle_model","success":true,"data":{"model":{"provider":"anthropic","modelId":"claude-opus-5","label":"Claude Opus 5"}}}\n' "$id"
       ;;
     cycle_thinking_level)
-      printf '{{"type":"response","id":"%s","command":"cycle_thinking_level","success":true,"data":{{"level":"high"}}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"cycle_thinking_level","success":true,"data":{"level":"high"}}\n' "$id"
       ;;
     get_commands)
-      printf '{{"type":"response","id":"%s","command":"get_commands","success":true,"data":{{"commands":[{{"name":"review","description":"Review code","source":"skill","location":"/skills/review.md"}}]}}}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"get_commands","success":true,"data":{"commands":[{"name":"review","description":"Review code","source":"skill","location":"/skills/review.md"}]}}\n' "$id"
       ;;
     *)
-      printf '{{"type":"response","id":"%s","command":"%s","success":true}}\n' "$id" "$typ"
+      printf '{"type":"response","id":"%s","command":"%s","success":true}\n' "$id" "$typ"
       ;;
   esac
 done
-"#,
-            cmd_log = cmd_log.display()
-        );
+"#;
 
-        let state = PiAppState::with_config(
-            dir.clone(),
-            store_path,
-            mock_sh_config(dir.clone(), &script),
-        );
+        let state =
+            PiAppState::with_config(dir.clone(), store_path, mock_sh_config(dir.clone(), script));
         let sink: EventSink = Arc::new(|_| {});
-
-        // Renaming a different session_path must issue switch_session before set_session_name.
-        state
-            .set_session_name_with_sink(
-                Arc::clone(&sink),
-                "s-other".to_string(),
-                "Renamed Other".to_string(),
-                Some("/tmp/other.jsonl".to_string()),
-            )
-            .unwrap();
 
         let bash_res = state
             .bash_with_sink(Arc::clone(&sink), "echo hello".to_string())
@@ -4229,24 +4672,6 @@ done
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].source.as_deref(), Some("skill"));
         assert_eq!(cmds[0].location.as_deref(), Some("/skills/review.md"));
-
-        let log_lines: Vec<String> = fs::read_to_string(&cmd_log)
-            .unwrap()
-            .lines()
-            .map(ToString::to_string)
-            .collect();
-        let sw_idx = log_lines
-            .iter()
-            .position(|c| c == "switch_session")
-            .unwrap();
-        let rn_idx = log_lines
-            .iter()
-            .position(|c| c == "set_session_name")
-            .unwrap();
-        assert!(
-            sw_idx < rn_idx,
-            "switch_session must happen before set_session_name"
-        );
 
         state.shutdown();
         let _ = fs::remove_dir_all(&dir);
@@ -4405,8 +4830,15 @@ done
             }
         });
 
+        let initial = state.bootstrap_with_sink(Arc::clone(&sink));
         state
-            .prompt_with_sink(Arc::clone(&sink), "Refactor main".to_string(), vec![])
+            .prompt_with_sink(
+                Arc::clone(&sink),
+                "Refactor main".to_string(),
+                vec![],
+                initial.active_project_id,
+                initial.active_session_id,
+            )
             .unwrap();
         settled_rx
             .recv_timeout(Duration::from_secs(3))
@@ -4426,20 +4858,6 @@ done
 
         fs::write(&code_file, "fn main() { /* v2 */ }\n").unwrap();
 
-        let missing = state
-            .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true, None, None)
-            .unwrap();
-        assert!(!missing.code_reverted);
-        assert!(!missing.can_redo);
-        assert_eq!(
-            missing.code_revert_note.as_deref(),
-            Some("No code snapshot was recorded for this turn.")
-        );
-        assert_eq!(
-            fs::read_to_string(&code_file).unwrap(),
-            "fn main() { /* v2 */ }\n"
-        );
-
         let reverted = state
             .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true, None, None)
             .unwrap();
@@ -4457,6 +4875,20 @@ done
 
         let redone = state.redo_revert_with_sink().unwrap();
         assert_eq!(redone.restored_files, vec!["main.rs".to_string()]);
+        assert_eq!(
+            fs::read_to_string(&code_file).unwrap(),
+            "fn main() { /* v2 */ }\n"
+        );
+
+        let missing = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true, None, None)
+            .unwrap();
+        assert!(!missing.code_reverted);
+        assert!(!missing.can_redo);
+        assert_eq!(
+            missing.code_revert_note.as_deref(),
+            Some("No code snapshot was recorded for this turn.")
+        );
         assert_eq!(
             fs::read_to_string(&code_file).unwrap(),
             "fn main() { /* v2 */ }\n"
@@ -4490,24 +4922,24 @@ done
         fs::write(
             &a1_path,
             format!(
-                r#"{{"type":"session","id":"sess-a1","name":"Alpha One","timestamp":"2026-11-22T10:00:00Z","cwd":"{}"}}"#,
-                canon_a.display()
+                r#"{{"type":"session","id":"sess-a1","name":"Alpha One","timestamp":"2026-11-22T10:00:00Z","cwd":{}}}"#,
+                verity_core::json::escape_json_string(&canon_a.to_string_lossy())
             ),
         )
         .unwrap();
         fs::write(
             &a2_path,
             format!(
-                r#"{{"type":"session","id":"sess-a2","name":"Alpha Two","timestamp":"2026-11-21T10:00:00Z","cwd":"{}"}}"#,
-                canon_a.display()
+                r#"{{"type":"session","id":"sess-a2","name":"Alpha Two","timestamp":"2026-11-21T10:00:00Z","cwd":{}}}"#,
+                verity_core::json::escape_json_string(&canon_a.to_string_lossy())
             ),
         )
         .unwrap();
         fs::write(
             &b1_path,
             format!(
-                r#"{{"type":"session","id":"sess-b1","name":"Beta One","timestamp":"2026-11-23T10:00:00Z","cwd":"{}"}}"#,
-                canon_b.display()
+                r#"{{"type":"session","id":"sess-b1","name":"Beta One","timestamp":"2026-11-23T10:00:00Z","cwd":{}}}"#,
+                verity_core::json::escape_json_string(&canon_b.to_string_lossy())
             ),
         )
         .unwrap();
@@ -4556,7 +4988,7 @@ while IFS= read -r line; do
   esac
 done
 "#,
-            a1 = a1_path.display()
+            a1 = a1_path.to_string_lossy().replace('\\', "/")
         );
 
         let store_path = dir.join("providers.json");

@@ -20,6 +20,7 @@ import {
   type PiUiEvent,
   type ProviderProfileInput,
   type PublicProviderProfile,
+  type SessionWithMessages,
   type SlashOrSkillCommand,
   type ThinkingLevel,
 } from "../api/tauri";
@@ -511,13 +512,7 @@ export type PiAction =
   | { readonly type: "toggle_theme" }
   | { readonly type: "select_project"; readonly projectId: string }
   | {
-      readonly type: "session_switched";
-      readonly sessionId: string;
-      readonly projectId: string;
-      readonly messages: readonly PiChatMessage[];
-    }
-  | {
-      readonly type: "session_created";
+      readonly type: "session_switched" | "session_created";
       readonly session: PiSessionSummary;
       readonly messages: readonly PiChatMessage[];
     }
@@ -1625,34 +1620,25 @@ export function piReducer(state: PiWorkspaceState, action: PiAction): PiWorkspac
     }
 
     case "session_switched":
-      return {
-        ...state,
-        activeProjectId: action.projectId,
-        activeSessionId: action.sessionId,
-        messages: action.messages,
-        isStreaming: false,
-        ignoreStaleTurnEvents: true,
-        liveTools: [],
-        retryBanner: null,
-        pendingQueueCount: 0,
-        canRedoRevert: false,
-        lastRevertedFiles: [],
-      };
-
     case "session_created": {
-      const filtered = state.sessions.filter((s) => s.id !== action.session.id);
+      const session = action.session;
+      const updateExisting = action.type === "session_switched"
+        && state.sessions.some((s) => s.id === session.id);
+      const sessions = updateExisting
+        ? state.sessions.map((s) => s.id === session.id ? session : s)
+        : [session, ...state.sessions.filter((s) => s.id !== session.id)];
       return {
         ...state,
-        sessions: [action.session, ...filtered],
-        activeProjectId: action.session.projectId,
-        activeSessionId: action.session.id,
+        sessions,
+        activeProjectId: session.projectId,
+        activeSessionId: session.id,
         messages: action.messages,
         isStreaming: false,
         ignoreStaleTurnEvents: true,
         liveTools: [],
         retryBanner: null,
         pendingQueueCount: 0,
-        modal: { kind: "none" },
+        modal: action.type === "session_created" ? { kind: "none" } : state.modal,
         canRedoRevert: false,
         lastRevertedFiles: [],
       };
@@ -1962,9 +1948,9 @@ export function usePiWorkspace() {
 
   const modelRequestIdRef = useRef(0);
   const thinkingRequestIdRef = useRef(0);
-  const sessionRequestIdRef = useRef(0);
   const providerRequestIdRef = useRef(0);
   const submittingRef = useRef(false);
+  const changingWorkspaceRef = useRef(false);
 
   const lastConfirmedModelRef = useRef<ModelOption>(state.selectedModel);
   const lastConfirmedThinkingRef = useRef<ThinkingLevel>(state.thinkingLevel);
@@ -2040,45 +2026,48 @@ export function usePiWorkspace() {
     dispatch({ type: "bootstrap_loaded", data });
   }, []);
 
+  const changeWorkspace = useCallback(async (operation: () => Promise<void>) => {
+    if (changingWorkspaceRef.current || submittingRef.current || stateRef.current.isStreaming) {
+      notify("Wait for the current chat operation to finish.", "error");
+      return;
+    }
+    changingWorkspaceRef.current = true;
+    try {
+      await operation();
+    } finally {
+      changingWorkspaceRef.current = false;
+    }
+  }, [notify]);
+
   const selectProject = useCallback(
-    async (pathOrId: string) => {
-      const reqId = ++sessionRequestIdRef.current;
+    async (pathOrId: string) => changeWorkspace(async () => {
       const matched = stateRef.current.projects.find(
         (p) => p.path === pathOrId || p.id === pathOrId
       );
       const targetPath = matched?.path ?? pathOrId;
       try {
         const data = await tauriApi.piSwitchProject(targetPath);
-        if (reqId === sessionRequestIdRef.current) {
-          hydrateBootstrap(data);
-        }
+        hydrateBootstrap(data);
       } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to switch project: ${formatErrorMessage(err)}`, "error");
-        }
+        notify(`Failed to switch project: ${formatErrorMessage(err)}`, "error");
       }
-    },
-    [hydrateBootstrap, notify]
+    }),
+    [changeWorkspace, hydrateBootstrap, notify]
   );
 
   const addProject = useCallback(
-    async (path: string) => {
+    async (path: string) => changeWorkspace(async () => {
       const trimmed = path.trim();
       if (!trimmed) return;
-      const reqId = ++sessionRequestIdRef.current;
       try {
         const data = await tauriApi.piAddProject(trimmed);
-        if (reqId === sessionRequestIdRef.current) {
-          hydrateBootstrap(data);
-          notify(`Added project "${trimmed}"`);
-        }
+        hydrateBootstrap(data);
+        notify(`Added project "${trimmed}"`);
       } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to add project: ${formatErrorMessage(err)}`, "error");
-        }
+        notify(`Failed to add project: ${formatErrorMessage(err)}`, "error");
       }
-    },
-    [hydrateBootstrap, notify]
+    }),
+    [changeWorkspace, hydrateBootstrap, notify]
   );
 
   const pickAndAddProject = useCallback(async () => {
@@ -2093,45 +2082,46 @@ export function usePiWorkspace() {
   }, [addProject, notify]);
 
   const removeProject = useCallback(
-    async (path: string) => {
+    async (path: string) => changeWorkspace(async () => {
       const trimmed = path.trim();
       if (!trimmed) return;
-      const reqId = ++sessionRequestIdRef.current;
       try {
         const data = await tauriApi.piRemoveProject(trimmed);
-        if (reqId === sessionRequestIdRef.current) {
-          hydrateBootstrap(data);
-          notify(`Removed project "${trimmed}"`);
-        }
+        hydrateBootstrap(data);
+        notify(`Removed project "${trimmed}"`);
       } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to remove project: ${formatErrorMessage(err)}`, "error");
-        }
+        notify(`Failed to remove project: ${formatErrorMessage(err)}`, "error");
       }
-    },
-    [hydrateBootstrap, notify]
+    }),
+    [changeWorkspace, hydrateBootstrap, notify]
   );
 
-  const switchSession = useCallback(
-    async (session: PiSessionSummary) => {
-      const reqId = ++sessionRequestIdRef.current;
-      try {
-        const messages = await tauriApi.switchSession(session.path, session.id);
-        if (reqId === sessionRequestIdRef.current) {
-          dispatch({
-            type: "session_switched",
-            sessionId: session.id,
-            projectId: session.projectId,
-            messages,
-          });
-        }
-      } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to switch session: ${formatErrorMessage(err)}`, "error");
-        }
+  const activateSession = useCallback(async (
+    type: "session_switched" | "session_created",
+    result: SessionWithMessages
+  ) => {
+    if (result.session.projectId !== stateRef.current.activeProjectId) {
+      const data = await tauriApi.bootstrapPiWorkspace().catch(() => null);
+      if (
+        data?.activeProjectId === result.session.projectId &&
+        data.activeSessionId === result.session.id
+      ) {
+        hydrateBootstrap(data);
       }
-    },
-    [notify]
+    }
+    dispatch({ type, ...result });
+  }, [hydrateBootstrap]);
+
+  const switchSession = useCallback(
+    async (session: PiSessionSummary) => changeWorkspace(async () => {
+      try {
+        const result = await tauriApi.switchSession(session);
+        if (result) await activateSession("session_switched", result);
+      } catch (err: unknown) {
+        notify(`Failed to switch session: ${formatErrorMessage(err)}`, "error");
+      }
+    }),
+    [activateSession, changeWorkspace, notify]
   );
 
   const pushToast = useCallback(
@@ -2150,88 +2140,65 @@ export function usePiWorkspace() {
   );
 
   const createSession = useCallback(
-    async (projectPathOrId?: string) => {
-      const reqId = ++sessionRequestIdRef.current;
+    async (projectPathOrId?: string) => changeWorkspace(async () => {
       const current = stateRef.current;
-      let projectId = current.activeProjectId || current.projects[0]?.id || "proj-verity";
       try {
-        if (projectPathOrId) {
-          const matched = current.projects.find(
-            (p) => p.path === projectPathOrId || p.id === projectPathOrId
-          );
-          if (matched && matched.id !== current.activeProjectId) {
-            const switched = await tauriApi.piSwitchProject(matched.path);
-            if (reqId !== sessionRequestIdRef.current) return;
-            hydrateBootstrap(switched);
-            projectId = switched.activeProjectId || matched.id;
-          } else if (matched) {
-            projectId = matched.id;
-          }
-        }
-        const session = await tauriApi.newSession(projectId);
-        if (reqId === sessionRequestIdRef.current) {
-          dispatch({ type: "session_created", session, messages: [] });
-        }
+        const project = current.projects.find(
+          (p) => p.path === projectPathOrId || p.id === (projectPathOrId ?? current.activeProjectId)
+        );
+        if (!project) throw new Error("Select a project first.");
+        const result = await tauriApi.newSession(project.id);
+        if (result) await activateSession("session_created", result);
       } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to create session: ${formatErrorMessage(err)}`, "error");
-        }
+        notify(`Failed to create session: ${formatErrorMessage(err)}`, "error");
       }
-    },
-    [hydrateBootstrap, notify]
+    }),
+    [activateSession, changeWorkspace, notify]
   );
 
   const renameSession = useCallback(
-    async (sessionId: string, name: string) => {
+    async (sessionId: string, name: string) => changeWorkspace(async () => {
       try {
-        const updated = await tauriApi.renameSession(sessionId, name);
+        const session = stateRef.current.sessions.find((entry) => entry.id === sessionId);
+        if (!session) throw new Error("The selected chat is unavailable.");
+        const updated = await tauriApi.renameSession(session, name);
         if (updated) {
           dispatch({ type: "session_renamed", session: updated });
         }
       } catch (err: unknown) {
         notify(`Failed to rename session: ${formatErrorMessage(err)}`, "error");
       }
-    },
-    [notify]
+    }),
+    [changeWorkspace, notify]
   );
 
   const archiveSession = useCallback(
-    async (sessionId: string, archived: boolean) => {
-      const reqId = ++sessionRequestIdRef.current;
+    async (sessionId: string, archived: boolean) => changeWorkspace(async () => {
       try {
         const data = await tauriApi.piArchiveSession(sessionId, archived);
-        if (reqId === sessionRequestIdRef.current) {
-          hydrateBootstrap(data);
-          pushToast(archived ? "Chat archived." : "Chat restored.");
-        }
+        hydrateBootstrap(data);
+        pushToast(archived ? "Chat archived." : "Chat restored.");
       } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(
-            `Failed to ${archived ? "archive" : "restore"} chat: ${formatErrorMessage(err)}`,
-            "error"
-          );
-        }
+        notify(
+          `Failed to ${archived ? "archive" : "restore"} chat: ${formatErrorMessage(err)}`,
+          "error"
+        );
       }
-    },
-    [hydrateBootstrap, notify, pushToast]
+    }),
+    [changeWorkspace, hydrateBootstrap, notify, pushToast]
   );
 
   const deleteSession = useCallback(
-    async (sessionId: string) => {
-      const reqId = ++sessionRequestIdRef.current;
+    async (sessionId: string) => changeWorkspace(async () => {
       try {
         const data = await tauriApi.piDeleteSession(sessionId);
-        if (reqId === sessionRequestIdRef.current) {
-          hydrateBootstrap(data);
-          pushToast("Chat deleted.");
-        }
+        hydrateBootstrap(data);
+        pushToast("Chat deleted.");
       } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to delete chat: ${formatErrorMessage(err)}`, "error");
-        }
+        notify(`Failed to delete chat: ${formatErrorMessage(err)}`, "error");
       }
-    },
-    [hydrateBootstrap, notify, pushToast]
+    }),
+    [changeWorkspace, hydrateBootstrap, notify, pushToast]
   );
 
   const openHistoryTree = useCallback(async () => {
@@ -2261,45 +2228,35 @@ export function usePiWorkspace() {
   }, []);
 
   const forkAtEntry = useCallback(
-    async (entryId: string) => {
-      const reqId = ++sessionRequestIdRef.current;
+    async (entryId: string) => changeWorkspace(async () => {
       try {
         const result = await tauriApi.forkSession(entryId);
-        if (reqId === sessionRequestIdRef.current) {
-          dispatch({
-            type: "session_created",
-            session: result.session,
-            messages: result.messages,
-          });
-          notify(`Forked session "${result.session.name}"`);
-        }
-      } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to fork session: ${formatErrorMessage(err)}`, "error");
-        }
-      }
-    },
-    [notify]
-  );
-
-  const cloneCurrentSession = useCallback(async () => {
-    const reqId = ++sessionRequestIdRef.current;
-    try {
-      const result = await tauriApi.cloneSession();
-      if (reqId === sessionRequestIdRef.current) {
         dispatch({
           type: "session_created",
           session: result.session,
           messages: result.messages,
         });
-        notify(`Cloned session "${result.session.name}"`);
+        notify(`Forked session "${result.session.name}"`);
+      } catch (err: unknown) {
+        notify(`Failed to fork session: ${formatErrorMessage(err)}`, "error");
       }
+    }),
+    [changeWorkspace, notify]
+  );
+
+  const cloneCurrentSession = useCallback(async () => changeWorkspace(async () => {
+    try {
+      const result = await tauriApi.cloneSession();
+      dispatch({
+        type: "session_created",
+        session: result.session,
+        messages: result.messages,
+      });
+      notify(`Cloned session "${result.session.name}"`);
     } catch (err: unknown) {
-      if (reqId === sessionRequestIdRef.current) {
-        notify(`Failed to clone session: ${formatErrorMessage(err)}`, "error");
-      }
+      notify(`Failed to clone session: ${formatErrorMessage(err)}`, "error");
     }
-  }, [notify]);
+  }), [changeWorkspace, notify]);
 
   const exportSessionHtml = useCallback(async () => {
     try {
@@ -2547,8 +2504,7 @@ export function usePiWorkspace() {
       revertCode: boolean,
       fallbackPromptText?: string,
       userTurnIndex?: number
-    ) => {
-      const reqId = ++sessionRequestIdRef.current;
+    ) => changeWorkspace(async () => {
       const resolvedUserTurnIndex =
         userTurnIndex !== undefined
           ? userTurnIndex
@@ -2564,7 +2520,6 @@ export function usePiWorkspace() {
           resolvedUserTurnIndex,
           fallbackPromptText
         );
-        if (reqId !== sessionRequestIdRef.current) return;
         const restoredPrompt = result.restoredPrompt ?? fallbackPromptText ?? null;
         dispatch({
           type: "turn_reverted",
@@ -2574,11 +2529,8 @@ export function usePiWorkspace() {
           canRedo: result.canRedo,
           revertedFiles: result.revertedFiles,
         });
-        if (revertCode && !result.codeReverted) {
-          pushToast(
-            result.codeRevertNote?.trim() || "Reverted chat only (no code snapshot available).",
-            "warning"
-          );
+        if (result.codeRevertNote) {
+          pushToast(result.codeRevertNote, "warning");
         } else if (result.codeReverted) {
           const count = result.revertedFiles.length;
           pushToast(
@@ -2588,15 +2540,13 @@ export function usePiWorkspace() {
           pushToast("Reverted chat only.");
         }
       } catch (err: unknown) {
-        if (reqId === sessionRequestIdRef.current) {
-          notify(`Failed to revert turn: ${formatErrorMessage(err)}`, "error");
-        }
+        notify(`Failed to revert turn: ${formatErrorMessage(err)}`, "error");
       }
-    },
-    [notify, pushToast]
+    }),
+    [changeWorkspace, notify, pushToast]
   );
 
-  const redoRevert = useCallback(async () => {
+  const redoRevert = useCallback(async () => changeWorkspace(async () => {
     try {
       const result = await tauriApi.piRedoRevert();
       dispatch({ type: "revert_redone" });
@@ -2607,7 +2557,7 @@ export function usePiWorkspace() {
     } catch (err: unknown) {
       notify(`Failed to restore reverted files: ${formatErrorMessage(err)}`, "error");
     }
-  }, [notify, pushToast]);
+  }), [changeWorkspace, notify, pushToast]);
 
   const copyFullChat = useCallback(async () => {
     try {
@@ -2672,7 +2622,7 @@ export function usePiWorkspace() {
   }, []);
 
   const steerPrompt = useCallback(async () => {
-    if (submittingRef.current) return;
+    if (submittingRef.current || changingWorkspaceRef.current) return;
     const prevDraft = stateRef.current.draft;
     const prevAttachments = stateRef.current.attachments;
     const text = prevDraft.trim();
@@ -2691,7 +2641,7 @@ export function usePiWorkspace() {
   }, [notify]);
 
   const followUpPrompt = useCallback(async () => {
-    if (submittingRef.current) return;
+    if (submittingRef.current || changingWorkspaceRef.current) return;
     const prevDraft = stateRef.current.draft;
     const prevAttachments = stateRef.current.attachments;
     const text = prevDraft.trim();
@@ -2749,6 +2699,10 @@ export function usePiWorkspace() {
 
   const sendPrompt = useCallback(async () => {
     if (submittingRef.current || stateRef.current.isStreaming) return;
+    if (changingWorkspaceRef.current) {
+      notify("Wait for the current chat operation to finish.", "error");
+      return;
+    }
     const text = stateRef.current.draft.trim();
     const attachments = stateRef.current.attachments;
     if (!text && attachments.length === 0) return;
@@ -2853,7 +2807,6 @@ export function usePiWorkspace() {
     }
 
     submittingRef.current = true;
-    sessionRequestIdRef.current += 1;
     const optimisticMsg: PiChatMessage = {
       id: nextClientId("local"),
       role: "user",
@@ -2863,7 +2816,10 @@ export function usePiWorkspace() {
     };
     dispatch({ type: "prompt_submitted", message: optimisticMsg });
     try {
-      await tauriApi.sendPrompt(text, attachments);
+      await tauriApi.sendPrompt(text, attachments, {
+        projectId: stateRef.current.activeProjectId,
+        sessionId: stateRef.current.activeSessionId,
+      });
     } catch (err: unknown) {
       dispatch({ type: "prompt_failed" });
       notify(`Failed to send prompt: ${formatErrorMessage(err)}`, "error");
