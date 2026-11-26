@@ -7,6 +7,46 @@ use verity_core::types::{
 };
 
 #[cfg(kani)]
+fn spec_eq_ascii_ci(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !a[i].eq_ignore_ascii_case(&b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(kani)]
+fn spec_is_windows_reserved(seg: &[u8]) -> bool {
+    let mut stem_len = 0;
+    while stem_len < seg.len() && seg[stem_len] != b'.' {
+        stem_len += 1;
+    }
+    while stem_len > 0 && seg[stem_len - 1] == b' ' {
+        stem_len -= 1;
+    }
+    let stem = &seg[..stem_len];
+    if stem.len() == 3 {
+        spec_eq_ascii_ci(stem, b"CON")
+            || spec_eq_ascii_ci(stem, b"PRN")
+            || spec_eq_ascii_ci(stem, b"AUX")
+            || spec_eq_ascii_ci(stem, b"NUL")
+    } else if stem.len() == 4 || stem.len() == 5 {
+        matches!(&stem[3..], [b'1'..=b'9'] | [0xc2, 0xb2 | 0xb3 | 0xb9])
+            && (spec_eq_ascii_ci(&stem[..3], b"COM") || spec_eq_ascii_ci(&stem[..3], b"LPT"))
+    } else if matches!(stem.len(), 6 | 7) {
+        spec_eq_ascii_ci(stem, b"CONIN$") || spec_eq_ascii_ci(stem, b"CONOUT$")
+    } else {
+        false
+    }
+}
+
+#[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(66)]
 pub fn prove_task_id_and_hex_digest_laws() {
@@ -19,6 +59,9 @@ pub fn prove_task_id_and_hex_digest_laws() {
     if res.is_ok() {
         assert!(!slice.is_empty());
         assert!(slice != b"." && slice != b"..");
+        assert!(slice[slice.len() - 1] != b'.');
+        assert!(!spec_eq_ascii_ci(slice, b".git"));
+        assert!(!spec_is_windows_reserved(slice));
         let mut i = 0;
         while i < slice.len() {
             let b = slice[i];
@@ -29,6 +72,10 @@ pub fn prove_task_id_and_hex_digest_laws() {
             }
             i += 1;
         }
+    }
+
+    if spec_is_windows_reserved(slice) {
+        assert!(res.is_err());
     }
 
     // Oversized TaskId (> 128 bytes) must always be rejected without panic.
@@ -50,6 +97,14 @@ pub fn prove_task_id_and_hex_digest_laws() {
     kani::cover!(
         res == Err(TypeError::InvalidTaskIdChar),
         "task_id_invalid_char_reject_reachable"
+    );
+    kani::cover!(
+        res == Err(TypeError::ReservedDeviceName),
+        "task_id_reserved_device_reject_reachable"
+    );
+    kani::cover!(
+        res == Err(TypeError::DotGitSegment),
+        "task_id_dotgit_reject_reachable"
     );
 
     // CommitOid & SpecDigest length laws: any short slice (<= 8 bytes) must fail.
@@ -124,7 +179,7 @@ pub fn prove_task_id_and_hex_digest_laws() {
 
 #[cfg(kani)]
 #[kani::proof]
-#[kani::unwind(10)]
+#[kani::unwind(11)]
 pub fn prove_rel_path_traversal_and_windows_laws() {
     let len: usize = kani::any();
     kani::assume(len <= 8);
@@ -132,6 +187,10 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
     let slice = &buf[..len];
 
     let res = validate_rel_path_bytes(slice);
+    if !slice.is_empty() && slice[0] == b'/' {
+        assert_eq!(res, Err(TypeError::AbsolutePath));
+    }
+
     if let Ok(end) = res {
         assert!(end > 0 && end <= slice.len());
         let trimmed = &slice[..end];
@@ -141,33 +200,33 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
         if trimmed.len() >= 2 {
             assert!(!(trimmed[0].is_ascii_alphabetic() && trimmed[1] == b':'));
         }
-        // Never contains backslash, NUL, or control chars
+        // Never contains backslash, NUL, colon, or control chars
         let mut i = 0;
         while i < trimmed.len() {
             assert!(trimmed[i] != b'\\');
+            assert!(trimmed[i] != b':');
             assert!(trimmed[i] != 0);
             assert!(trimmed[i] >= 0x20 && trimmed[i] != 0x7f);
             i += 1;
         }
-        // Never contains empty (`//`), `.`, `..`, or `.git` segments
-        let mut seg_start = 0;
-        let mut idx = 0;
-        while idx <= trimmed.len() {
-            if idx == trimmed.len() || trimmed[idx] == b'/' {
-                let seg = &trimmed[seg_start..idx];
+        // One arbitrary segment represents all segments without unrolling a validator per segment.
+        let start: usize = kani::any();
+        let stop: usize = kani::any();
+        if start <= stop
+            && stop <= end
+            && (start == 0 || trimmed[start - 1] == b'/')
+            && (stop == end || trimmed[stop] == b'/')
+        {
+            let seg = &trimmed[start..stop];
+            if seg.iter().all(|&byte| byte != b'/') {
                 assert!(!seg.is_empty());
                 assert!(seg != b".");
                 assert!(seg != b"..");
-                if seg.len() == 4 {
-                    let is_dotgit = seg[0] == b'.'
-                        && seg[1].to_ascii_lowercase() == b'g'
-                        && seg[2].to_ascii_lowercase() == b'i'
-                        && seg[3].to_ascii_lowercase() == b't';
-                    assert!(!is_dotgit);
-                }
-                seg_start = idx + 1;
+                assert!(seg[seg.len() - 1] != b'.' && seg[seg.len() - 1] != b' ');
+                assert!(!spec_eq_ascii_ci(seg, b".git"));
+                assert!(!spec_is_windows_reserved(seg));
+                kani::cover!(seg == b"src", "rel_path_arbitrary_segment_reachable");
             }
-            idx += 1;
         }
     }
 
@@ -188,6 +247,10 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
         "rel_path_unix_abs_reject_reachable"
     );
     kani::cover!(
+        res == Err(TypeError::AbsolutePath) && slice == b"/",
+        "rel_path_root_slash_reject_reachable"
+    );
+    kani::cover!(
         res == Err(TypeError::BackslashPath),
         "rel_path_backslash_reject_reachable"
     );
@@ -198,5 +261,9 @@ pub fn prove_rel_path_traversal_and_windows_laws() {
     kani::cover!(
         res == Err(TypeError::DotGitSegment),
         "rel_path_dotgit_reject_reachable"
+    );
+    kani::cover!(
+        res == Err(TypeError::ReservedDeviceName),
+        "rel_path_reserved_device_reject_reachable"
     );
 }
