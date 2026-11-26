@@ -4,8 +4,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process;
 use verity_core::json::escape_json_string;
-use verity_core::{CommitOid, RelPath, TaskId};
-use verity_runtime::git::{commit_tree, merge_tree, update_ref_cas, MergeOutcome};
+use verity_core::{RelPath, TaskId};
 use verity_runtime::handoff::RunLog;
 use verity_runtime::orchestrator::{
     approve_and_merge, handoff_to_json, load_handoff, parse_verifier_kind, spawn_write_task,
@@ -15,15 +14,15 @@ use verity_runtime::pi_rpc::{run_pi_prompt, PiRpcConfig};
 
 fn usage() {
     eprintln!(
-        "Verity v0.2.0\n\
+        "Verity v{}\n\
          Commands:\n\
          \tverity run-readonly <repo> <goal> [pi-bin]\n\
          \tverity spawn <repo> <task-id> <base-ref> <kani|lean> <write-scope-csv> <goal> [pi-bin]\n\
          \tverity review <repo> <task-id>\n\
          \tverity merge <repo> <task-id> <target-ref> <approved-digest>\n\
-         \tverity merge <repo> <ref> <base-oid> <candidate-oid> <approved-digest> <verified-digest>\n\
          \tverity log <repo>\n\
-         \tverity mcp"
+         \tverity mcp",
+        env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -56,7 +55,7 @@ fn main() {
             }
         }
         "run-readonly" => {
-            if args.len() < 3 {
+            if !(3..=4).contains(&args.len()) {
                 usage();
                 process::exit(2);
             }
@@ -65,7 +64,6 @@ fn main() {
             let mut cfg = PiRpcConfig::default_pi(repo.clone(), true);
             if let Some(bin) = args.get(3) {
                 cfg.program = bin.clone();
-                cfg.args.clear();
             }
             match run_pi_prompt(&cfg, "readonly-1", goal) {
                 Ok(res) => {
@@ -87,7 +85,7 @@ fn main() {
             }
         }
         "spawn" => {
-            if args.len() < 7 {
+            if !(7..=8).contains(&args.len()) {
                 usage();
                 process::exit(2);
             }
@@ -109,7 +107,6 @@ fn main() {
             let pi_config = args.get(7).map(|bin| {
                 let mut cfg = PiRpcConfig::default_pi(repo_dir.clone(), false);
                 cfg.program = bin.clone();
-                cfg.args.clear();
                 cfg
             });
 
@@ -190,64 +187,13 @@ fn main() {
                         process::exit(1);
                     }
                 }
-            } else if args.len() == 7 {
-                let repo = PathBuf::from(&args[1]);
-                let ref_name = &args[2];
-                let base = CommitOid::parse(&args[3]).unwrap_or_else(|e| {
-                    eprintln!("invalid base oid: {}", e);
-                    process::exit(2);
-                });
-                let candidate = CommitOid::parse(&args[4]).unwrap_or_else(|e| {
-                    eprintln!("invalid candidate oid: {}", e);
-                    process::exit(2);
-                });
-                if args[5] != args[6] {
-                    eprintln!("refusing merge: approved digest does not match verified digest");
-                    process::exit(1);
-                }
-                match merge_tree(&repo, &base, &candidate) {
-                    Ok(MergeOutcome::Clean { tree_oid }) => {
-                        let merged =
-                            commit_tree(&repo, &tree_oid, &[&base, &candidate], "verity merge")
-                                .unwrap_or_else(|e| {
-                                    eprintln!("commit-tree failed: {}", e);
-                                    process::exit(1);
-                                });
-                        update_ref_cas(&repo, ref_name, &merged, Some(&base)).unwrap_or_else(|e| {
-                            eprintln!("cas update-ref failed: {}", e);
-                            process::exit(1);
-                        });
-                        if let Ok(log) = RunLog::open(&repo) {
-                            let _ = log.append_event("merge", "merged", merged.as_str());
-                        }
-                        println!(
-                            "{{\"status\":\"merged\",\"commit\":{}}}",
-                            escape_json_string(merged.as_str())
-                        );
-                    }
-                    Ok(MergeOutcome::Conflict { conflicted_paths }) => {
-                        let paths: Vec<String> = conflicted_paths
-                            .iter()
-                            .map(|p| escape_json_string(p.as_str()))
-                            .collect();
-                        println!(
-                            "{{\"status\":\"conflict\",\"paths\":[{}]}}",
-                            paths.join(",")
-                        );
-                        process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("merge-tree failed: {}", e);
-                        process::exit(1);
-                    }
-                }
             } else {
                 usage();
                 process::exit(2);
             }
         }
         "log" => {
-            if args.len() < 2 {
+            if args.len() != 2 {
                 usage();
                 process::exit(2);
             }

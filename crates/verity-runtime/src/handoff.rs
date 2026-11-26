@@ -79,7 +79,7 @@ pub fn build_spec_handoff(
     }
 
     let extracted_spec = extract_spec_only(verifier, files);
-    let spec_digest = SpecDigest::of_spec(&extracted_spec);
+    let spec_digest = candidate_spec_digest(&candidate_commit, &extracted_spec);
 
     SpecHandoff {
         candidate_commit,
@@ -90,6 +90,13 @@ pub fn build_spec_handoff(
         verdict,
         spec_digest,
     }
+}
+
+pub(crate) fn candidate_spec_digest(candidate: &CommitOid, spec: &str) -> SpecDigest {
+    SpecDigest::of_spec(&format!(
+        "verity-handoff-v2\n{}\n{spec}",
+        candidate.as_str()
+    ))
 }
 
 /// Thin append-only JSONL run log replacing the 11-table SQLite journal.

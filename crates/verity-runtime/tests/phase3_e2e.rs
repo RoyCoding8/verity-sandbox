@@ -6,14 +6,18 @@ use verity_core::{
     transition, CheckerVerdict, CommitOid, GateError, RelPath, ScopeError, TaskEvent, TaskId,
     TaskMode, TaskState, VerdictStatus, VerifierKind,
 };
-use verity_runtime::git::{read_ref, run_git};
+use verity_runtime::git::{
+    commit_tree, commit_worktree_changes, create_worktree, read_ref, remove_worktree, run_git,
+    update_ref_cas,
+};
 use verity_runtime::handoff::{build_spec_handoff, extract_spec_only, RunLog};
 use verity_runtime::orchestrator::{
-    approve_and_merge, handoff_path_for, load_handoff, spawn_write_task,
+    approve_and_merge, handoff_path_for, handoff_to_json, load_handoff, spawn_write_task,
     spawn_write_task_with_options, worktree_path_for, MergeResult, OrchestratorError,
-    WriteTaskOptions, WriteTaskRequest,
+    PersistedHandoff, WriteTaskOptions, WriteTaskRequest,
 };
 use verity_runtime::pi_rpc::{run_pi_prompt, PiRpcConfig, PiRpcError};
+use verity_runtime::sandbox::pi_sandbox_available;
 use verity_runtime::verifiers::discover_kani_targets;
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -61,7 +65,7 @@ fn init_git_repo(dir: &Path) {
 
 fn mock_pi_config(script: &str) -> PiRpcConfig {
     PiRpcConfig {
-        program: "/bin/sh".to_string(),
+        program: "sh".to_string(),
         args: vec!["-c".to_string(), script.to_string()],
         cwd: PathBuf::new(),
         timeout: Duration::from_secs(10),
@@ -75,7 +79,7 @@ fn pi_rpc_handles_jsonl_stream_and_enforces_tool_budget_and_timeout() {
 
     // 1. Happy path mock Pi RPC responder.
     let ok_cfg = PiRpcConfig {
-        program: "/bin/sh".to_string(),
+        program: "sh".to_string(),
         args: vec![
             "-c".to_string(),
             r#"read line
@@ -95,7 +99,7 @@ printf '{"type":"agent_settled"}\n'"#
 
     // 2. Tool call cap enforcement kills runaway worker.
     let cap_cfg = PiRpcConfig {
-        program: "/bin/sh".to_string(),
+        program: "sh".to_string(),
         args: vec![
             "-c".to_string(),
             r#"read line
@@ -116,7 +120,7 @@ printf '{"type":"tool_call","name":"read"}\n'"#
 
     // 3. Hard wall-clock timeout kills hung worker.
     let timeout_cfg = PiRpcConfig {
-        program: "/bin/sh".to_string(),
+        program: "sh".to_string(),
         args: vec!["-c".to_string(), "read line; sleep 10".to_string()],
         cwd: dir.clone(),
         timeout: Duration::from_millis(120),
@@ -212,7 +216,10 @@ fn verify_safe_sub() {
 }
 
 #[test]
-fn write_subagent_pipeline_spawn_review_and_cas_merge() {
+fn write_subagent_pipeline_blocks_merge_without_checker_evidence() {
+    if !pi_sandbox_available() {
+        return;
+    }
     let repo = temp_dir("write_pipeline");
     init_git_repo(&repo);
     let base_oid = read_ref(&repo, "refs/heads/main").unwrap().unwrap();
@@ -224,8 +231,9 @@ fn write_subagent_pipeline_spawn_review_and_cas_merge() {
 mkdir -p src
 cat <<'EOF' > src/math.rs
 /* nested /* kani::assume(false) */ comment must not trigger lint */
+use crate::base;
 pub fn safe_add(a: u32, b: u32) -> u32 {
-    let internal_secret_impl = a.saturating_add(b);
+    let internal_secret_impl = a.saturating_add(b).saturating_add(base());
     internal_secret_impl
 }
 
@@ -263,7 +271,6 @@ printf '{"type":"agent_settled"}\n'"#;
 
     // Spec-only extraction includes public signature + Kani proof checks, never impl body.
     assert!(loaded.handoff.hygiene.is_clean());
-    assert_eq!(loaded.handoff.verdict.status, VerdictStatus::Pass);
     assert!(loaded.handoff.extracted_spec.contains("pub fn safe_add"));
     assert!(loaded.handoff.extracted_spec.contains("#[kani::proof]"));
     assert!(loaded
@@ -290,50 +297,116 @@ printf '{"type":"agent_settled"}\n'"#;
         base_oid
     );
 
-    // Correct digest performs lock-free merge-tree + CAS ref update.
     let digest_hex = loaded.handoff.spec_digest.to_hex();
-    let merged_commit =
-        match approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap() {
-            MergeResult::Merged {
-                commit,
-                already_merged,
-            } => {
-                assert!(!already_merged);
-                commit
-            }
-            MergeResult::Conflict { .. } => panic!("expected clean CAS merge"),
-        };
-    assert_ne!(merged_commit, base_oid);
+    assert!(matches!(
+        approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex),
+        Err(OrchestratorError::GateFailed(GateError::VerdictNotPass(_)))
+    ));
     assert_eq!(
-        read_ref(&repo, "refs/heads/main").unwrap().unwrap(),
-        merged_commit
+        read_ref(&repo, "refs/heads/main").unwrap().as_ref(),
+        Some(&base_oid)
     );
 
-    // Verify merged tree actually contains src/math.rs on refs/heads/main.
+    // RunLog recorded the handoff but no merge.
+    let log_lines = RunLog::open(&repo).unwrap().read_lines().unwrap();
+    assert!(log_lines.iter().any(|l| l.contains("\"handoff_ready\"")));
+    assert!(!log_lines.iter().any(|l| l.contains("\"merged\"")));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn approval_rejects_changed_candidate_and_advances_clean_checkout_once() {
+    let repo = temp_dir("approve");
+    init_git_repo(&repo);
+    let task_id = TaskId::parse("approve").unwrap();
+    let base_oid = read_ref(&repo, "HEAD").unwrap().unwrap();
+    let worktree = worktree_path_for(&repo, &task_id);
+    create_worktree(&repo, &worktree, &task_id, &base_oid).unwrap();
+    let source = "pub fn safe_add(a: u32, b: u32) -> u32 { a.saturating_add(b) }\n";
+    fs::write(worktree.join("src/math.rs"), source).unwrap();
+    let candidate = commit_worktree_changes(&worktree, "verified candidate").unwrap();
+    remove_worktree(&repo, &worktree).unwrap();
+    let verifier = VerifierKind::RustKani;
+    let handoff = build_spec_handoff(
+        candidate,
+        &[(RelPath::parse("src/math.rs").unwrap(), source.to_string())],
+        verifier,
+        CheckerVerdict {
+            status: VerdictStatus::Pass,
+            reason: "simulated controller verdict".to_string(),
+            checks_passed: 1,
+            probes_satisfied: 0,
+        },
+        None,
+    );
+    let digest_hex = handoff.spec_digest.to_hex();
+    let mut verified = PersistedHandoff {
+        task_id: task_id.clone(),
+        base_commit: base_oid.clone(),
+        verifier,
+        handoff,
+    };
+    let handoff_path = handoff_path_for(&repo, &task_id);
+    fs::create_dir_all(handoff_path.parent().unwrap()).unwrap();
+    let verified_json = handoff_to_json(&verified);
+    verified.handoff.candidate_commit = base_oid.clone();
+    fs::write(&handoff_path, handoff_to_json(&verified)).unwrap();
+    assert!(matches!(
+        approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex),
+        Err(OrchestratorError::GateFailed(GateError::VerdictNotPass(_)))
+    ));
+    assert_eq!(
+        read_ref(&repo, "refs/heads/main").unwrap().as_ref(),
+        Some(&base_oid)
+    );
+
+    fs::write(&handoff_path, verified_json).unwrap();
+    let base_tree = read_ref(&repo, "HEAD^{tree}").unwrap().unwrap();
+    let advanced = commit_tree(&repo, &base_tree, &[&base_oid], "advanced target").unwrap();
+    update_ref_cas(&repo, "refs/heads/advanced", &advanced, None).unwrap();
+    assert!(matches!(
+        approve_and_merge(&repo, &task_id, "advanced", &digest_hex),
+        Err(OrchestratorError::TargetMoved)
+    ));
+    assert_eq!(
+        read_ref(&repo, "refs/heads/advanced").unwrap(),
+        Some(advanced)
+    );
+    let MergeResult::Merged {
+        commit,
+        already_merged: false,
+    } = approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap()
+    else {
+        panic!("expected clean merge");
+    };
     let show = run_git(&repo, &["show", "refs/heads/main:src/math.rs"]).unwrap();
     assert!(show.status.success());
     assert!(String::from_utf8_lossy(&show.stdout).contains("pub fn safe_add"));
-
-    // Re-running approve_and_merge is idempotent and does not create a duplicate commit.
-    let second = approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap();
     assert_eq!(
-        second,
+        fs::read_to_string(repo.join("src/math.rs"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+        source.trim_end()
+    );
+    assert_eq!(
+        approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap(),
         MergeResult::Merged {
-            commit: merged_commit,
-            already_merged: true,
+            commit,
+            already_merged: true
         }
     );
-
-    // RunLog recorded handoff_ready and merged events.
-    let log_lines = RunLog::open(&repo).unwrap().read_lines().unwrap();
-    assert!(log_lines.iter().any(|l| l.contains("\"handoff_ready\"")));
-    assert!(log_lines.iter().any(|l| l.contains("\"merged\"")));
 
     let _ = fs::remove_dir_all(&repo);
 }
 
 #[test]
 fn write_subagent_enforces_scope_hygiene_and_cleans_up_worktree_on_failure() {
+    if !pi_sandbox_available() {
+        return;
+    }
     let repo = temp_dir("write_guards");
     init_git_repo(&repo);
 
@@ -421,6 +494,10 @@ fn verify_clamped() {
     assert_eq!(harness.as_deref(), Some("verify_clamped"));
     assert_eq!(probes, vec!["nonzero_branch".to_string()]);
 
+    if !pi_sandbox_available() {
+        return;
+    }
+
     let repo = temp_dir("live_verifier");
     init_git_repo(&repo);
 
@@ -486,6 +563,28 @@ fn verify_safe_add() {
     assert!(safe_add(a, b) >= a);
     kani::cover!(a > 0 && b > 0, "both_positive");
 }
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn write_task_requires_a_supported_worker_sandbox() {
+    let repo = temp_dir("unsupported_worker_sandbox");
+    init_git_repo(&repo);
+    let task_id = TaskId::parse("sandbox-required").unwrap();
+    let result = spawn_write_task(WriteTaskRequest {
+        repo_dir: repo.clone(),
+        task_id: task_id.clone(),
+        base_ref: "HEAD".to_string(),
+        write_scope: vec![RelPath::parse("src").unwrap()],
+        forbidden: vec![],
+        verifier: VerifierKind::RustKani,
+        goal: "inspect src".to_string(),
+        pi_config: Some(mock_pi_config("exit 1")),
+    });
+    assert!(matches!(result, Err(OrchestratorError::PiRpc(PiRpcError::Sandbox(_)))));
+    assert!(!worktree_path_for(&repo, &task_id).exists());
+    assert!(!handoff_path_for(&repo, &task_id).exists());
+    let _ = fs::remove_dir_all(&repo);
+}
 EOF
 printf '{"type":"agent_settled"}\n'"#;
     let live_handoff = spawn_write_task_with_options(
@@ -507,10 +606,16 @@ printf '{"type":"agent_settled"}\n'"#;
     .unwrap();
     assert!(!worktree_path_for(&repo, &live_kani_task).exists());
     assert!(handoff_path_for(&repo, &live_kani_task).exists());
-    assert!(matches!(
-        live_handoff.handoff.verdict.status,
-        VerdictStatus::Pass | VerdictStatus::Inconclusive
-    ));
+    let verdict = &live_handoff.handoff.verdict;
+    if verdict.status == VerdictStatus::Pass {
+        assert!(std::env::var_os("VERITY_KANI").is_some());
+        assert_eq!((verdict.checks_passed, verdict.probes_satisfied), (1, 1));
+    } else {
+        assert!(matches!(
+            verdict.status,
+            VerdictStatus::InvalidReport | VerdictStatus::Inconclusive
+        ));
+    }
     assert!(!live_handoff.handoff.verdict.reason.is_empty());
 
     // 4. Live Lean 4 verifier returns Inconclusive with actionable reason when export/lake is missing.
@@ -548,7 +653,7 @@ printf '{"type":"agent_settled"}\n'"#;
         .reason
         .contains("challenge.export"));
 
-    // 5. Pre-emitted .verity-kani-report.json is validated against discovered kani::cover! probes.
+    // 5. A worker report cannot grant approval when the controller checker is disabled.
     let report_task = TaskId::parse("report-with-probes").unwrap();
     let report_script = r#"read line
 cat <<'EOF' > src/checked.rs
@@ -566,20 +671,34 @@ printf '{"type":"agent_settled"}\n'"#;
             repo_dir: repo.clone(),
             task_id: report_task.clone(),
             base_ref: "refs/heads/main".to_string(),
-            write_scope: vec![RelPath::parse("src").unwrap()],
+            write_scope: vec![
+                RelPath::parse("src").unwrap(),
+                RelPath::parse(".verity-kani-report.json").unwrap(),
+            ],
             forbidden: vec![],
             verifier: VerifierKind::RustKani,
             goal: "verify nonzero".to_string(),
             pi_config: Some(mock_pi_config(report_script)),
         },
         WriteTaskOptions {
-            run_live_verifier: true,
+            run_live_verifier: false,
             lean_challenge_export: None,
         },
     )
     .unwrap();
-    assert_eq!(report_handoff.handoff.verdict.status, VerdictStatus::Pass);
-    assert_eq!(report_handoff.handoff.verdict.probes_satisfied, 1);
+    assert_eq!(
+        report_handoff.handoff.verdict.status,
+        VerdictStatus::Inconclusive
+    );
+    assert!(matches!(
+        approve_and_merge(
+            &repo,
+            &report_task,
+            "refs/heads/main",
+            &report_handoff.handoff.spec_digest.to_hex(),
+        ),
+        Err(OrchestratorError::GateFailed(GateError::VerdictNotPass(_)))
+    ));
 
     let _ = fs::remove_dir_all(&repo);
 }

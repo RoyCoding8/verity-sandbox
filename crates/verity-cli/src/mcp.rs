@@ -1,8 +1,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use verity_core::json::{escape_json_string, parse_json, JsonValue};
-use verity_core::{CommitOid, RelPath, TaskId};
-use verity_runtime::git::{commit_tree, merge_tree, update_ref_cas, MergeOutcome};
+use verity_core::{RelPath, TaskId};
 use verity_runtime::handoff::RunLog;
 use verity_runtime::orchestrator::{
     approve_and_merge, handoff_to_json, parse_verifier_kind, spawn_write_task, MergeResult,
@@ -65,7 +64,7 @@ fn parse_rel_paths_array(
     key: &str,
     required: bool,
 ) -> Result<Vec<RelPath>, String> {
-    if required && args.get(key).is_none() {
+    if required && args.get(key).and_then(JsonValue::as_array).is_none() {
         return Err(format!("missing required array argument '{}'", key));
     }
     let raw = parse_optional_string_array(args, key)?;
@@ -77,27 +76,18 @@ fn parse_rel_paths_array(
     Ok(out)
 }
 
-fn build_pi_config(
-    args: &JsonValue,
-    cwd: PathBuf,
-    read_only: bool,
-) -> Result<Option<PiRpcConfig>, String> {
-    let Some(pi_bin) = args.get("pi_bin").and_then(|v| v.as_str()) else {
-        return Ok(None);
-    };
-    let mut cfg = PiRpcConfig::default_pi(cwd, read_only);
-    cfg.program = pi_bin.to_string();
-    cfg.args = parse_optional_string_array(args, "pi_args")?;
-    Ok(Some(cfg))
+fn require_controller_pi(args: &JsonValue) -> Result<(), String> {
+    if args.get("pi_bin").is_some() || args.get("pi_args").is_some() {
+        return Err("MCP requests use the controller's Pi command".to_string());
+    }
+    Ok(())
 }
 
 fn exec_run_readonly(args: &JsonValue) -> Result<String, String> {
+    require_controller_pi(args)?;
     let repo = PathBuf::from(arg_str(args, "repo")?);
     let goal = arg_str(args, "goal")?;
-    let cfg = match build_pi_config(args, repo.clone(), true)? {
-        Some(c) => c,
-        None => PiRpcConfig::default_pi(repo.clone(), true),
-    };
+    let cfg = PiRpcConfig::default_pi(repo.clone(), true);
     let res = run_pi_prompt(&cfg, "readonly-mcp", goal).map_err(|e| e.to_string())?;
     if let Ok(log) = RunLog::open(&repo) {
         let _ = log.append_event("readonly-mcp", "completed_readonly", &res.final_text);
@@ -111,19 +101,18 @@ fn exec_run_readonly(args: &JsonValue) -> Result<String, String> {
 }
 
 fn exec_spawn_write(args: &JsonValue) -> Result<String, String> {
+    require_controller_pi(args)?;
     let repo_dir = PathBuf::from(arg_str(args, "repo")?);
     let task_id = TaskId::parse(arg_str(args, "task_id")?).map_err(|e| e.to_string())?;
     let write_scope = parse_rel_paths_array(args, "write_scope", true)?;
     let forbidden = parse_rel_paths_array(args, "forbidden", false)?;
     let verifier = parse_verifier_kind(arg_str(args, "verifier")?)?;
     let goal = arg_str(args, "goal")?.to_string();
-    let base_ref = args
-        .get("base_ref")
-        .and_then(|v| v.as_str())
-        .unwrap_or("HEAD")
-        .to_string();
-    let pi_config = build_pi_config(args, repo_dir.clone(), false)?;
-
+    let base_ref = match args.get("base_ref") {
+        None => "HEAD".to_string(),
+        Some(JsonValue::String(value)) => value.clone(),
+        _ => return Err("base_ref must be a string".to_string()),
+    };
     let req = WriteTaskRequest {
         repo_dir,
         task_id,
@@ -132,7 +121,7 @@ fn exec_spawn_write(args: &JsonValue) -> Result<String, String> {
         forbidden,
         verifier,
         goal,
-        pi_config,
+        pi_config: None,
     };
 
     let record = spawn_write_task(req).map_err(|e| e.to_string())?;
@@ -143,70 +132,24 @@ fn exec_merge_approved(args: &JsonValue) -> Result<(String, bool), String> {
     let repo = PathBuf::from(arg_str(args, "repo")?);
     let approved_digest = arg_str(args, "approved_digest")?;
 
-    // Persisted-handoff path: repo + task_id + (target_ref | ref_name) + approved_digest.
-    if let Some(task_id_raw) = args.get("task_id").and_then(|v| v.as_str()) {
-        let task_id = TaskId::parse(task_id_raw).map_err(|e| e.to_string())?;
-        let target_ref = args
-            .get("target_ref")
-            .or_else(|| args.get("ref_name"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                "missing required string argument 'target_ref' or 'ref_name'".to_string()
-            })?;
-        return match approve_and_merge(&repo, &task_id, target_ref, approved_digest) {
-            Ok(MergeResult::Merged {
-                commit,
-                already_merged,
-            }) => Ok((
-                format!(
-                    "{{\"status\":\"merged\",\"commit\":{},\"already_merged\":{}}}",
-                    escape_json_string(commit.as_str()),
-                    already_merged
-                ),
-                false,
-            )),
-            Ok(MergeResult::Conflict { conflicted_paths }) => {
-                let paths: Vec<String> = conflicted_paths
-                    .iter()
-                    .map(|p| escape_json_string(p.as_str()))
-                    .collect();
-                Ok((
-                    format!(
-                        "{{\"status\":\"conflict\",\"paths\":[{}]}}",
-                        paths.join(",")
-                    ),
-                    true,
-                ))
-            }
-            Err(e) => Err(e.to_string()),
-        };
-    }
-
-    // Direct OID fallback path: repo + ref_name + base + candidate + approved_digest + verified_digest.
-    let ref_name = arg_str(args, "ref_name")?;
-    let base = CommitOid::parse(arg_str(args, "base")?).map_err(|e| e.to_string())?;
-    let candidate = CommitOid::parse(arg_str(args, "candidate")?).map_err(|e| e.to_string())?;
-    let verified_digest = arg_str(args, "verified_digest")?;
-    if approved_digest != verified_digest {
-        return Err("refusing merge: approved_digest does not match verified_digest".to_string());
-    }
-    match merge_tree(&repo, &base, &candidate).map_err(|e| e.to_string())? {
-        MergeOutcome::Clean { tree_oid } => {
-            let merged = commit_tree(&repo, &tree_oid, &[&base, &candidate], "verity merge")
-                .map_err(|e| e.to_string())?;
-            update_ref_cas(&repo, ref_name, &merged, Some(&base)).map_err(|e| e.to_string())?;
-            if let Ok(log) = RunLog::open(&repo) {
-                let _ = log.append_event("merge-mcp", "merged", merged.as_str());
-            }
-            Ok((
-                format!(
-                    "{{\"status\":\"merged\",\"commit\":{},\"already_merged\":false}}",
-                    escape_json_string(merged.as_str())
-                ),
-                false,
-            ))
-        }
-        MergeOutcome::Conflict { conflicted_paths } => {
+    let task_id = TaskId::parse(arg_str(args, "task_id")?).map_err(|e| e.to_string())?;
+    let target_ref = args
+        .get("target_ref")
+        .or_else(|| args.get("ref_name"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "missing required string argument 'target_ref'".to_string())?;
+    match approve_and_merge(&repo, &task_id, target_ref, approved_digest) {
+        Ok(MergeResult::Merged {
+            commit,
+            already_merged,
+        }) => Ok((
+            format!(
+                "{{\"status\":\"merged\",\"commit\":{},\"already_merged\":{already_merged}}}",
+                escape_json_string(commit.as_str()),
+            ),
+            false,
+        )),
+        Ok(MergeResult::Conflict { conflicted_paths }) => {
             let paths: Vec<String> = conflicted_paths
                 .iter()
                 .map(|p| escape_json_string(p.as_str()))
@@ -219,30 +162,40 @@ fn exec_merge_approved(args: &JsonValue) -> Result<(String, bool), String> {
                 true,
             ))
         }
+        Err(e) => Err(e.to_string()),
     }
 }
 
 /// Handles a single parsed MCP JSON-RPC 2.0 request. Returns `None` for
 /// notifications that require no response.
 pub fn handle_mcp_request(req: &JsonValue) -> Option<String> {
-    let id_str = match req.get("id") {
-        Some(JsonValue::Number(n)) => format!("{}", *n as i64),
-        Some(JsonValue::String(s)) => escape_json_string(s),
-        _ => "null".to_string(),
+    let Some(method) = req.get("method").and_then(JsonValue::as_str) else {
+        return Some(jsonrpc_error("null", -32600, "invalid request"));
     };
-    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if req.get("jsonrpc").and_then(JsonValue::as_str) != Some("2.0") {
+        return Some(jsonrpc_error("null", -32600, "invalid JSON-RPC version"));
+    }
+    let id_str = match req.get("id") {
+        Some(JsonValue::Number(n)) if n.fract() == 0.0 && n.abs() < (1_u64 << 53) as f64 => {
+            (*n as i64).to_string()
+        }
+        Some(JsonValue::String(s)) => escape_json_string(s),
+        None => return None,
+        _ => return Some(jsonrpc_error("null", -32600, "invalid request id")),
+    };
 
     match method {
         "initialize" => Some(jsonrpc_result(
             &id_str,
             "{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"verity-mcp\",\"version\":\"0.2.0\"}}",
         )),
+        "ping" => Some(jsonrpc_result(&id_str, "{}")),
         "tools/list" => Some(jsonrpc_result(
             &id_str,
             "{\"tools\":[\
-            {\"name\":\"verity_run_readonly\",\"description\":\"Run a read-only subagent without a worktree and return its summary.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"repo\":{\"type\":\"string\"},\"goal\":{\"type\":\"string\"},\"pi_bin\":{\"type\":\"string\"},\"pi_args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"repo\",\"goal\"]}},\
-            {\"name\":\"verity_spawn_write\",\"description\":\"Spawn a write subagent in an isolated git worktree to formalize, implement, and prove a contract.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"repo\":{\"type\":\"string\"},\"task_id\":{\"type\":\"string\"},\"base_ref\":{\"type\":\"string\"},\"write_scope\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"forbidden\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"verifier\":{\"type\":\"string\",\"enum\":[\"kani\",\"lean\"]},\"goal\":{\"type\":\"string\"},\"pi_bin\":{\"type\":\"string\"},\"pi_args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"repo\",\"task_id\",\"write_scope\",\"verifier\",\"goal\"]}},\
-            {\"name\":\"verity_merge_approved\",\"description\":\"Verify approved spec digest, run lock-free git merge-tree, and compare-and-swap update the target ref.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"repo\":{\"type\":\"string\"},\"task_id\":{\"type\":\"string\"},\"target_ref\":{\"type\":\"string\"},\"ref_name\":{\"type\":\"string\"},\"base\":{\"type\":\"string\"},\"candidate\":{\"type\":\"string\"},\"approved_digest\":{\"type\":\"string\"},\"verified_digest\":{\"type\":\"string\"}},\"required\":[\"repo\",\"approved_digest\"]}}\
+            {\"name\":\"verity_run_readonly\",\"description\":\"Run a read-only subagent without a worktree and return its summary.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"repo\":{\"type\":\"string\"},\"goal\":{\"type\":\"string\"}},\"required\":[\"repo\",\"goal\"]}},\
+            {\"name\":\"verity_spawn_write\",\"description\":\"Spawn a write subagent in an isolated git worktree to formalize, implement, and prove a contract.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"repo\":{\"type\":\"string\"},\"task_id\":{\"type\":\"string\"},\"base_ref\":{\"type\":\"string\"},\"write_scope\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"forbidden\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"verifier\":{\"type\":\"string\",\"enum\":[\"kani\",\"lean\"]},\"goal\":{\"type\":\"string\"}},\"required\":[\"repo\",\"task_id\",\"write_scope\",\"verifier\",\"goal\"]}},\
+            {\"name\":\"verity_merge_approved\",\"description\":\"Verify approved spec digest, run lock-free git merge-tree, and compare-and-swap update the target ref.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"repo\":{\"type\":\"string\"},\"task_id\":{\"type\":\"string\"},\"target_ref\":{\"type\":\"string\"},\"approved_digest\":{\"type\":\"string\"}},\"required\":[\"repo\",\"task_id\",\"target_ref\",\"approved_digest\"]}}\
             ]}",
         )),
         "tools/call" => {
@@ -254,6 +207,9 @@ pub fn handle_mcp_request(req: &JsonValue) -> Option<String> {
             };
             let empty_args = JsonValue::Object(Default::default());
             let tool_args = params.get("arguments").unwrap_or(&empty_args);
+            if !matches!(tool_args, JsonValue::Object(_)) {
+                return Some(jsonrpc_error(&id_str, -32602, "arguments must be an object"));
+            }
 
             match tool_name {
                 "verity_run_readonly" => match exec_run_readonly(tool_args) {
@@ -356,79 +312,62 @@ mod tests {
     }
 
     #[test]
-    fn mcp_tools_call_executes_readonly_spawn_and_merge() {
+    fn mcp_distinguishes_notifications_from_invalid_requests() {
+        let request = |raw| handle_mcp_request(&parse_json(raw).unwrap());
+        assert!(request(r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#).is_none());
+        for raw in [
+            r#"{"jsonrpc":"1.0","method":"ping","id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"ping","id":null}"#,
+            r#"{"jsonrpc":"2.0","method":"ping","id":9007199254740993}"#,
+        ] {
+            assert!(request(raw).unwrap().contains("-32600"));
+        }
+        let reply = request(r#"{"jsonrpc":"2.0","method":"ping","id":"check"}"#).unwrap();
+        assert_eq!(
+            parse_json(&reply)
+                .unwrap()
+                .get("id")
+                .and_then(JsonValue::as_str),
+            Some("check")
+        );
+    }
+
+    #[test]
+    fn mcp_rejects_caller_selected_programs_and_missing_handoff() {
         let repo = init_repo("full_flow");
         let repo_json = escape_json_string(repo.to_str().unwrap());
-
-        // 1. verity_run_readonly
-        let ro_req = parse_json(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"verity_run_readonly\",\"arguments\":{{\"repo\":{},\"goal\":\"summarize\",\"pi_bin\":\"/bin/sh\",\"pi_args\":[\"-c\",\"read line; printf '{{\\\"type\\\":\\\"message_update\\\",\\\"delta\\\":\\\"clean repo\\\"}}\\n'; printf '{{\\\"type\\\":\\\"agent_settled\\\"}}\\n'\"]}}}}}}",
-            repo_json
-        ))
-        .unwrap();
-        let ro_resp = parse_json(&handle_mcp_request(&ro_req).unwrap()).unwrap();
-        let ro_res = ro_resp.get("result").unwrap();
-        assert_eq!(ro_res.get("isError").and_then(|v| v.as_bool()), Some(false));
-        let ro_text = ro_res.get("content").unwrap().as_array().unwrap()[0]
-            .get("text")
-            .unwrap()
-            .as_str()
+        let expect_error = |name, arguments, message| {
+            let request = parse_json(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{arguments}}}}}"#
+            ))
             .unwrap();
-        assert!(ro_text.contains("clean repo"));
-
-        // 2. verity_spawn_write
-        let worker_script = "read line; mkdir -p src; cat <<'EOF' > src/calc.rs\n\
-pub fn safe_inc(x: u32) -> u32 {\n\
-    x.saturating_add(1)\n\
-}\n\
-#[kani::proof]\n\
-fn verify_inc() {\n\
-    let x: u32 = kani::any();\n\
-    assert!(safe_inc(x) >= x);\n\
-}\n\
-EOF\n\
-printf '{\"type\":\"message_update\",\"delta\":\"safe_inc never decreases x\"}\\n'\n\
-printf '{\"type\":\"agent_settled\"}\\n'";
-        let spawn_req = parse_json(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"verity_spawn_write\",\"arguments\":{{\"repo\":{},\"task_id\":\"mcp-t1\",\"base_ref\":\"refs/heads/main\",\"write_scope\":[\"src\"],\"verifier\":\"kani\",\"goal\":\"add safe_inc\",\"pi_bin\":\"/bin/sh\",\"pi_args\":[\"-c\",{}]}}}}}}",
-            repo_json,
-            escape_json_string(worker_script)
-        ))
-        .unwrap();
-        let spawn_resp = parse_json(&handle_mcp_request(&spawn_req).unwrap()).unwrap();
-        let spawn_res = spawn_resp.get("result").unwrap();
-        assert_eq!(
-            spawn_res.get("isError").and_then(|v| v.as_bool()),
-            Some(false)
+            let reply = parse_json(&handle_mcp_request(&request).unwrap()).unwrap();
+            let result = reply.get("result").unwrap();
+            assert_eq!(
+                result.get("isError").and_then(JsonValue::as_bool),
+                Some(true)
+            );
+            let text = result.get("content").unwrap().as_array().unwrap()[0]
+                .get("text")
+                .and_then(JsonValue::as_str)
+                .unwrap();
+            assert!(text.contains(message), "{text}");
+        };
+        for name in ["verity_run_readonly", "verity_spawn_write"] {
+            expect_error(
+                name,
+                format!(r#"{{"repo":{repo_json},"goal":"summarize","pi_bin":"other-pi"}}"#),
+                "controller's Pi command",
+            );
+        }
+        let digest = "0".repeat(64);
+        expect_error(
+            "verity_merge_approved",
+            format!(
+                r#"{{"repo":{repo_json},"task_id":"mcp-t1","target_ref":"refs/heads/main","approved_digest":"{digest}"}}"#
+            ),
+            "handoff not found",
         );
-        let handoff_text = spawn_res.get("content").unwrap().as_array().unwrap()[0]
-            .get("text")
-            .unwrap()
-            .as_str()
-            .unwrap();
-        let handoff_val = parse_json(handoff_text).unwrap();
-        let digest = handoff_val.get("spec_digest").unwrap().as_str().unwrap();
-
-        // 3. verity_merge_approved
-        let merge_req = parse_json(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"verity_merge_approved\",\"arguments\":{{\"repo\":{},\"task_id\":\"mcp-t1\",\"target_ref\":\"refs/heads/main\",\"approved_digest\":{}}}}}}}",
-            repo_json,
-            escape_json_string(digest)
-        ))
-        .unwrap();
-        let merge_resp = parse_json(&handle_mcp_request(&merge_req).unwrap()).unwrap();
-        let merge_res = merge_resp.get("result").unwrap();
-        assert_eq!(
-            merge_res.get("isError").and_then(|v| v.as_bool()),
-            Some(false)
-        );
-        let merge_text = merge_res.get("content").unwrap().as_array().unwrap()[0]
-            .get("text")
-            .unwrap()
-            .as_str()
-            .unwrap();
-        assert!(merge_text.contains("\"status\":\"merged\""));
-
         let _ = fs::remove_dir_all(&repo);
     }
 }

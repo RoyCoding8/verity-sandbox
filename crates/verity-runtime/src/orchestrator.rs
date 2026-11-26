@@ -1,20 +1,22 @@
 use crate::git::{
-    changed_paths, commit_tree, commit_worktree_changes, create_worktree, merge_tree, read_ref,
-    remove_worktree, run_git, update_ref_cas, GitError, MergeOutcome,
+    changed_paths, commit_tree, commit_worktree_changes, committed_text, create_worktree,
+    git_common_dir, integrate_branch, merge_tree, read_ref, remove_worktree, run_git, GitError,
+    MergeOutcome,
 };
-use crate::handoff::{build_spec_handoff, RunLog};
-use crate::pi_rpc::{run_pi_prompt, PiRpcConfig, PiRpcError};
+use crate::handoff::{build_spec_handoff, candidate_spec_digest, RunLog};
+use crate::pi_rpc::{run_sandboxed_pi_prompt, PiRpcConfig, PiRpcError};
+use crate::sandbox::default_offline_config;
 use crate::verifiers::{
-    discover_kani_targets, parse_kani_json, run_kani_sandboxed, run_lean_comparator_sandboxed,
+    discover_kani_proofs, run_kani_proof_sandboxed, run_lean_comparator_sandboxed,
 };
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use verity_core::json::{escape_json_string, parse_json, JsonValue};
 use verity_core::{
-    can_approve, check_scope, classify_kani_report, CheckerVerdict, CommitOid, GateError,
-    HygieneReport, HygieneViolation, RelPath, ScopeError, SpecDigest, SpecHandoff, TaskId,
-    VerdictStatus, VerifierKind,
+    can_approve, check_scope, CheckerVerdict, CommitOid, GateError, HygieneReport,
+    HygieneViolation, RelPath, ScopeError, SpecDigest, SpecHandoff, TaskId, VerdictStatus,
+    VerifierKind,
 };
 
 #[derive(Debug, Clone)]
@@ -31,15 +33,22 @@ pub struct WriteTaskRequest {
 
 /// Optional execution controls for `spawn_write_task_with_options`, keeping
 /// `WriteTaskRequest` backwards-compatible for existing CLI and desktop callers.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WriteTaskOptions {
-    /// When true (and the worker did not pre-emit `.verity-kani-report.json`),
-    /// runs the sandboxed Kani or Lean 4 verifier inside the isolated worktree
-    /// before tearing it down.
+    /// Runs the controller's checker. Disabling it produces a review-only handoff.
     pub run_live_verifier: bool,
     /// Optional path to a Lean 4 challenge export file for
-    /// `VerifierKind::Lean4Comparator`. Falls back to `<worktree>/challenge.export`.
+    /// `VerifierKind::Lean4Comparator`. Falls back to the source checkout's challenge.export.
     pub lean_challenge_export: Option<PathBuf>,
+}
+
+impl Default for WriteTaskOptions {
+    fn default() -> Self {
+        Self {
+            run_live_verifier: true,
+            lean_challenge_export: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +74,7 @@ pub enum MergeResult {
 pub enum OrchestratorError {
     EmptyWriteScope,
     RefNotFound(String),
+    TargetMoved,
     Git(GitError),
     PiRpc(PiRpcError),
     ScopeViolation(ScopeError),
@@ -83,6 +93,7 @@ impl fmt::Display for OrchestratorError {
                 write!(f, "write task requires at least one write_scope path")
             }
             OrchestratorError::RefNotFound(r) => write!(f, "git ref not found: {}", r),
+            OrchestratorError::TargetMoved => write!(f, "target branch differs from the verified base; rerun verification on the current target"),
             OrchestratorError::Git(e) => write!(f, "git error: {}", e),
             OrchestratorError::PiRpc(e) => write!(f, "pi rpc error: {}", e),
             OrchestratorError::ScopeViolation(e) => write!(f, "scope violation: {}", e),
@@ -125,6 +136,21 @@ struct WorktreeGuard<'a> {
 impl Drop for WorktreeGuard<'_> {
     fn drop(&mut self) {
         let _ = remove_worktree(self.repo_dir, &self.worktree_path);
+    }
+}
+
+impl<'a> WorktreeGuard<'a> {
+    fn create(
+        repo_dir: &'a Path,
+        worktree_path: PathBuf,
+        task_id: &TaskId,
+        commit: &CommitOid,
+    ) -> Result<Self, GitError> {
+        create_worktree(repo_dir, &worktree_path, task_id, commit)?;
+        Ok(Self {
+            repo_dir,
+            worktree_path,
+        })
     }
 }
 
@@ -334,7 +360,7 @@ pub fn parse_handoff_json(raw: &str) -> Result<PersistedHandoff, OrchestratorErr
     let verdict_obj = root
         .get("verdict")
         .ok_or_else(|| OrchestratorError::CorruptHandoff("missing verdict object".into()))?;
-    let verdict = CheckerVerdict {
+    let mut verdict = CheckerVerdict {
         status: parse_verdict_status(require_str(verdict_obj, "status")?)?,
         reason: require_str(verdict_obj, "reason")?.to_string(),
         checks_passed: require_usize(verdict_obj, "checks_passed")?,
@@ -343,6 +369,10 @@ pub fn parse_handoff_json(raw: &str) -> Result<PersistedHandoff, OrchestratorErr
 
     let spec_digest = parse_spec_digest_hex(require_str(&root, "spec_digest")?)
         .map_err(|e| OrchestratorError::CorruptHandoff(e.to_string()))?;
+
+    if candidate_spec_digest(&candidate_commit, &extracted_spec) != spec_digest {
+        verdict = inconclusive("handoff is missing a current candidate-bound approval digest");
+    }
 
     Ok(PersistedHandoff {
         task_id,
@@ -380,39 +410,12 @@ fn write_handoff_atomic(
     Ok(target)
 }
 
-/// Reads an optional `.verity-kani-report.json` emitted inside the worktree
-/// and removes it before staging so it never pollutes the candidate diff.
-fn take_optional_kani_report(worktree_dir: &Path) -> Option<Result<String, String>> {
-    let report_path = worktree_dir.join(".verity-kani-report.json");
-    if !report_path.exists() {
-        return None;
-    }
-    let raw = fs::read_to_string(&report_path)
-        .map_err(|_| "failed to read .verity-kani-report.json".to_string());
-    let _ = fs::remove_file(&report_path);
-    Some(raw)
-}
-
-fn classify_raw_kani_report(
-    raw: Result<String, String>,
-    expected_probes: &[&str],
-) -> CheckerVerdict {
-    match raw {
-        Ok(text) => match parse_kani_json(&text) {
-            Ok(report) => classify_kani_report(&report, expected_probes),
-            Err(msg) => CheckerVerdict {
-                status: VerdictStatus::InvalidReport,
-                reason: msg,
-                checks_passed: 0,
-                probes_satisfied: 0,
-            },
-        },
-        Err(reason) => CheckerVerdict {
-            status: VerdictStatus::InvalidReport,
-            reason,
-            checks_passed: 0,
-            probes_satisfied: 0,
-        },
+fn inconclusive(reason: impl Into<String>) -> CheckerVerdict {
+    CheckerVerdict {
+        status: VerdictStatus::Inconclusive,
+        reason: reason.into(),
+        checks_passed: 0,
+        probes_satisfied: 0,
     }
 }
 
@@ -422,12 +425,12 @@ fn execute_live_verifier(
     worktree_dir: &Path,
     verifier: VerifierKind,
     changed_files: &[(RelPath, String)],
-    lean_challenge_export: Option<&Path>,
+    lean_challenge_export: &Path,
 ) -> CheckerVerdict {
     match verifier {
         VerifierKind::RustKani => {
-            let (harness, probes) = discover_kani_targets(changed_files);
-            let Some(harness_name) = harness else {
+            let targets = discover_kani_proofs(changed_files);
+            if targets.is_empty() {
                 return CheckerVerdict {
                     status: VerdictStatus::InvalidReport,
                     reason: "no #[kani::proof] harness discovered in changed Rust files"
@@ -435,95 +438,99 @@ fn execute_live_verifier(
                     checks_passed: 0,
                     probes_satisfied: 0,
                 };
-            };
-            let probe_refs: Vec<&str> = probes.iter().map(String::as_str).collect();
-            match run_kani_sandboxed(worktree_dir, &harness_name, &probe_refs) {
-                Ok(verdict) => verdict,
-                Err(err) => CheckerVerdict {
-                    status: VerdictStatus::Inconclusive,
-                    reason: format!(
-                        "unable to run sandboxed cargo kani for harness '{}': {} — ensure bubblewrap/sandbox and cargo-kani are available",
-                        harness_name, err
-                    ),
-                    checks_passed: 0,
-                    probes_satisfied: 0,
-                },
             }
+            let mut result = CheckerVerdict {
+                status: VerdictStatus::Pass,
+                reason: format!("Kani passed all {} discovered harnesses", targets.len()),
+                checks_passed: 0,
+                probes_satisfied: 0,
+            };
+            for target in &targets {
+                match run_kani_proof_sandboxed(worktree_dir, target) {
+                    Ok(verdict) if verdict.status == VerdictStatus::Pass => {
+                        result.checks_passed += verdict.checks_passed;
+                        result.probes_satisfied += verdict.probes_satisfied;
+                    }
+                    Ok(verdict) => return verdict,
+                    Err(err) => {
+                        return inconclusive(format!("Kani check for '{}': {err}", target.name))
+                    }
+                }
+            }
+            result
         }
         VerifierKind::Lean4Comparator => {
-            let default_export = worktree_dir.join("challenge.export");
-            let export_path = match lean_challenge_export {
-                Some(p) => p,
-                None if default_export.exists() => default_export.as_path(),
-                None => {
-                    return CheckerVerdict {
-                        status: VerdictStatus::Inconclusive,
-                        reason:
-                            "no Lean 4 challenge export configured or found at challenge.export"
-                                .to_string(),
-                        checks_passed: 0,
-                        probes_satisfied: 0,
-                    };
-                }
-            };
-            match run_lean_comparator_sandboxed(worktree_dir, export_path) {
+            if !lean_challenge_export.is_file() {
+                return inconclusive("no controller challenge.export configured for Lean 4");
+            }
+            match run_lean_comparator_sandboxed(worktree_dir, lean_challenge_export) {
                 Ok(verdict) => verdict,
-                Err(err) => CheckerVerdict {
-                    status: VerdictStatus::Inconclusive,
-                    reason: format!(
-                        "unable to run sandboxed lake comparator: {} — ensure bubblewrap/sandbox and lake are available",
-                        err
-                    ),
-                    checks_passed: 0,
-                    probes_satisfied: 0,
-                },
+                Err(err) => inconclusive(format!("Lean comparator: {err}")),
             }
         }
     }
 }
 
-/// Runs the full write-subagent pipeline with default options (`run_live_verifier: false`).
+/// Runs the full write-subagent pipeline with controller verification enabled.
 pub fn spawn_write_task(req: WriteTaskRequest) -> Result<PersistedHandoff, OrchestratorError> {
     spawn_write_task_with_options(req, WriteTaskOptions::default())
 }
 
 /// Runs the full write-subagent pipeline:
-/// 1. Idempotently creates a locked detached git worktree at `<repo>/.verity/worktrees/<task_id>`.
+/// 1. Creates a locked detached git worktree at `<repo>/.verity/worktrees/<task_id>`.
 /// 2. Runs the Pi RPC worker inside that worktree.
 /// 3. Commits candidate changes and verifies the diff against `verity_core::check_scope`.
-/// 4. Reads changed files, optionally runs the live sandboxed Kani / Lean 4 verifier inside
-///    the isolated worktree before teardown, builds the spec-only `SpecHandoff` (running
+/// 4. Reads committed files, optionally runs the live Kani or Lean 4 verifier in a fresh
+///    checkout of the candidate, builds the spec-only `SpecHandoff` (running
 ///    hygiene lints), atomically persists `<repo>/.verity/handoffs/<task_id>.json`, and logs
 ///    to `RunLog`.
 /// 5. Cleans up the worktree on every exit path.
 pub fn spawn_write_task_with_options(
-    req: WriteTaskRequest,
+    mut req: WriteTaskRequest,
     options: WriteTaskOptions,
 ) -> Result<PersistedHandoff, OrchestratorError> {
     if req.write_scope.is_empty() {
         return Err(OrchestratorError::EmptyWriteScope);
     }
+    req.repo_dir =
+        std::path::absolute(&req.repo_dir).map_err(|err| OrchestratorError::Io(err.to_string()))?;
 
-    let base_commit = read_ref(&req.repo_dir, &req.base_ref)?
+    let base_commit = read_ref(&req.repo_dir, &format!("{}^{{commit}}", req.base_ref))?
         .ok_or_else(|| OrchestratorError::RefNotFound(req.base_ref.clone()))?;
 
-    let wt_path = worktree_path_for(&req.repo_dir, &req.task_id);
-    create_worktree(&req.repo_dir, &wt_path, &req.task_id, &base_commit)?;
-    let _guard = WorktreeGuard {
-        repo_dir: &req.repo_dir,
-        worktree_path: wt_path.clone(),
-    };
+    let worker = WorktreeGuard::create(
+        &req.repo_dir,
+        worktree_path_for(&req.repo_dir, &req.task_id),
+        &req.task_id,
+        &base_commit,
+    )?;
+    let wt_path = &worker.worktree_path;
 
     let mut pi_cfg = req
         .pi_config
         .unwrap_or_else(|| PiRpcConfig::default_pi(wt_path.clone(), false));
     pi_cfg.cwd = wt_path.clone();
 
-    let pi_res = run_pi_prompt(&pi_cfg, req.task_id.as_str(), &req.goal)?;
+    let mut sandbox = default_offline_config(wt_path, Some(git_common_dir(&req.repo_dir)?));
+    sandbox.allow_network = true;
+    sandbox.env_passthrough = [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| (name.to_string(), value))
+    })
+    .collect();
+    let pi_res = run_sandboxed_pi_prompt(&pi_cfg, &sandbox, req.task_id.as_str(), &req.goal)?;
 
-    let raw_kani_report = take_optional_kani_report(&wt_path);
     let commit_msg = format!("verity candidate {}", req.task_id.as_str());
-    let candidate_commit = commit_worktree_changes(&wt_path, &commit_msg)?;
+    let candidate_commit = commit_worktree_changes(wt_path, &commit_msg)?;
 
     let diff_paths = changed_paths(&req.repo_dir, &base_commit, &candidate_commit)?;
     if let Err(scope_err) = check_scope(&diff_paths, &req.write_scope, &req.forbidden) {
@@ -539,42 +546,33 @@ pub fn spawn_write_task_with_options(
 
     let mut changed_files = Vec::with_capacity(diff_paths.len());
     for rel in &diff_paths {
-        let full = wt_path.join(rel.as_str());
-        let content = if full.exists() {
-            fs::read_to_string(&full).map_err(|e| OrchestratorError::Io(e.to_string()))?
-        } else {
-            String::new()
-        };
+        let content = committed_text(&req.repo_dir, &candidate_commit, rel)?;
         changed_files.push((rel.clone(), content));
     }
 
-    let verdict = match raw_kani_report {
-        Some(raw) => {
-            let (_, probes) = discover_kani_targets(&changed_files);
-            let probe_refs: Vec<&str> = probes.iter().map(String::as_str).collect();
-            classify_raw_kani_report(raw, &probe_refs)
-        }
-        None if !pi_res.settled => CheckerVerdict {
-            status: VerdictStatus::Inconclusive,
-            reason: "worker exited before emitting agent_settled".to_string(),
-            checks_passed: 0,
-            probes_satisfied: 0,
-        },
-        None if options.run_live_verifier => execute_live_verifier(
-            &wt_path,
+    let verdict = if !pi_res.settled {
+        inconclusive("worker exited before emitting agent_settled")
+    } else if options.run_live_verifier {
+        let verifier = WorktreeGuard::create(
+            &req.repo_dir,
+            req.repo_dir
+                .join(".verity/checker-worktrees")
+                .join(req.task_id.as_str()),
+            &req.task_id,
+            &candidate_commit,
+        )?;
+        let default_export = req.repo_dir.join("challenge.export");
+        execute_live_verifier(
+            &verifier.worktree_path,
             req.verifier,
             &changed_files,
-            options.lean_challenge_export.as_deref(),
-        ),
-        None => CheckerVerdict {
-            status: VerdictStatus::Pass,
-            reason: format!(
-                "worker settled ({} tool call(s)); hygiene lints evaluated",
-                pi_res.tool_calls
-            ),
-            checks_passed: changed_files.len(),
-            probes_satisfied: 0,
-        },
+            options
+                .lean_challenge_export
+                .as_deref()
+                .unwrap_or(&default_export),
+        )
+    } else {
+        inconclusive("controller verification was disabled")
     };
 
     let back_translation = if pi_res.final_text.trim().is_empty() {
@@ -621,7 +619,13 @@ pub fn load_handoff(
         return Err(OrchestratorError::HandoffNotFound(path));
     }
     let raw = fs::read_to_string(&path).map_err(|e| OrchestratorError::Io(e.to_string()))?;
-    parse_handoff_json(&raw)
+    let record = parse_handoff_json(&raw)?;
+    if record.task_id != *task_id {
+        return Err(OrchestratorError::CorruptHandoff(
+            "task ID does not match the handoff filename".into(),
+        ));
+    }
+    Ok(record)
 }
 
 fn is_ancestor(
@@ -649,9 +653,8 @@ fn is_ancestor(
     }
 }
 
-/// Verifies the approved spec digest and gate status, then idempotently merges
-/// the persisted candidate commit into `target_ref` using lock-free
-/// `git merge-tree --write-tree`, `commit-tree`, and CAS `update-ref`.
+/// Merges the approved candidate if the target still points to the verified base.
+/// A repeat approval succeeds when the target already includes the candidate.
 pub fn approve_and_merge(
     repo_dir: &Path,
     task_id: &TaskId,
@@ -670,14 +673,29 @@ pub fn approve_and_merge(
 
     can_approve(&record.handoff).map_err(OrchestratorError::GateFailed)?;
 
-    let target_oid = read_ref(repo_dir, target_ref)?
-        .ok_or_else(|| OrchestratorError::RefNotFound(target_ref.to_string()))?;
+    let target_ref = if target_ref.starts_with("refs/heads/") {
+        target_ref.to_string()
+    } else {
+        format!("refs/heads/{target_ref}")
+    };
+    if !run_git(repo_dir, &["check-ref-format", &target_ref])?
+        .status
+        .success()
+    {
+        return Err(OrchestratorError::RefNotFound(target_ref));
+    }
+    let target_oid = read_ref(repo_dir, &target_ref)?
+        .ok_or_else(|| OrchestratorError::RefNotFound(target_ref.clone()))?;
 
     if is_ancestor(repo_dir, &record.handoff.candidate_commit, &target_oid)? {
         return Ok(MergeResult::Merged {
             commit: target_oid,
             already_merged: true,
         });
+    }
+
+    if target_oid != record.base_commit {
+        return Err(OrchestratorError::TargetMoved);
     }
 
     match merge_tree(repo_dir, &target_oid, &record.handoff.candidate_commit)? {
@@ -689,7 +707,7 @@ pub fn approve_and_merge(
                 &[&target_oid, &record.handoff.candidate_commit],
                 &msg,
             )?;
-            update_ref_cas(repo_dir, target_ref, &merged, Some(&target_oid))?;
+            integrate_branch(repo_dir, &target_ref, &merged, &target_oid)?;
             if let Ok(log) = RunLog::open(repo_dir) {
                 let _ = log.append_event(task_id.as_str(), "merged", merged.as_str());
             }

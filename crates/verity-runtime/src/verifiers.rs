@@ -1,6 +1,9 @@
-use crate::sandbox::{default_offline_config, run_sandboxed, SandboxError};
-use std::path::Path;
-use verity_core::json::parse_json;
+use crate::sandbox::{default_offline_config, run_sandboxed, SandboxConfig, SandboxError};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{env, fs};
+use verity_core::json::{parse_json, JsonValue};
 use verity_core::{
     classify_kani_report, CheckKind, CheckStatus, CheckerVerdict, HygieneReport, HygieneViolation,
     KaniCheck, KaniReport, RelPath, VerdictStatus,
@@ -301,11 +304,24 @@ fn extract_cover_label(source: &str, open_pos: usize) -> (Option<String>, usize)
     (label, i)
 }
 
-/// Scans comment-stripped Rust files for the first `#[kani::proof]` function
-/// name and all `kani::cover!(..., "label")` reachability probe descriptions.
+#[derive(Debug)]
+pub(crate) struct KaniTarget {
+    pub(crate) name: String,
+    source: RelPath,
+    line: usize,
+    probes: Vec<String>,
+}
+
+/// Finds the first proof and its labeled reachability probes.
 pub fn discover_kani_targets(files: &[(RelPath, String)]) -> (Option<String>, Vec<String>) {
-    let mut first_harness: Option<String> = None;
-    let mut probes: Vec<String> = Vec::new();
+    discover_kani_proofs(files).into_iter().next().map_or_else(
+        || (None, Vec::new()),
+        |target| (Some(target.name), target.probes),
+    )
+}
+
+pub(crate) fn discover_kani_proofs(files: &[(RelPath, String)]) -> Vec<KaniTarget> {
+    let mut targets: Vec<KaniTarget> = Vec::new();
 
     for (rel, source) in files {
         if !rel.as_str().ends_with(".rs") {
@@ -316,6 +332,8 @@ pub fn discover_kani_targets(files: &[(RelPath, String)]) -> (Option<String>, Ve
         let len = bytes.len();
         let mut i = 0usize;
         let mut pending_proof = false;
+        let mut active_proof = None;
+        let mut body_depth = 0usize;
 
         while i < len {
             // Skip literals so strings containing `#[kani::proof]` or `kani::cover!` never match.
@@ -362,7 +380,7 @@ pub fn discover_kani_targets(files: &[(RelPath, String)]) -> (Option<String>, Ve
                     .chars()
                     .filter(|c| !c.is_whitespace())
                     .collect();
-                if compact == "kani::proof" && first_harness.is_none() {
+                if compact == "kani::proof" && active_proof.is_none() {
                     pending_proof = true;
                 }
                 i = j;
@@ -382,7 +400,13 @@ pub fn discover_kani_targets(files: &[(RelPath, String)]) -> (Option<String>, Ve
                         name_end += 1;
                     }
                     if name_end > name_start {
-                        first_harness = Some(stripped[name_start..name_end].to_string());
+                        active_proof = Some(targets.len());
+                        targets.push(KaniTarget {
+                            name: stripped[name_start..name_end].to_string(),
+                            source: rel.clone(),
+                            line: 1 + bytes[..i].iter().filter(|&&b| b == b'\n').count(),
+                            probes: Vec::new(),
+                        });
                         pending_proof = false;
                         i = name_end;
                         continue;
@@ -390,24 +414,35 @@ pub fn discover_kani_targets(files: &[(RelPath, String)]) -> (Option<String>, Ve
                 }
             }
 
-            // Detect `kani::cover!(..., "label")`.
-            if starts_with_ident(bytes, i, b"kani") {
-                let mut j = skip_ws(bytes, i + 4);
-                if bytes.get(j..j + 2) == Some(b"::") {
-                    j = skip_ws(bytes, j + 2);
-                    if starts_with_ident(bytes, j, b"cover") {
-                        j = skip_ws(bytes, j + 5);
-                        if bytes.get(j) == Some(&b'!') {
-                            j = skip_ws(bytes, j + 1);
-                            if matches!(bytes.get(j), Some(b'(' | b'[' | b'{')) {
-                                let (label, next_i) = extract_cover_label(&stripped, j);
-                                if let Some(desc) = label {
-                                    if !desc.is_empty() {
-                                        probes.push(desc);
+            if let Some(target) = active_proof {
+                match bytes[i] {
+                    b'{' => body_depth += 1,
+                    b'}' if body_depth > 0 => {
+                        body_depth -= 1;
+                        if body_depth == 0 {
+                            active_proof = None;
+                        }
+                    }
+                    b';' if body_depth == 0 => active_proof = None,
+                    _ => {}
+                }
+
+                if body_depth > 0 && starts_with_ident(bytes, i, b"kani") {
+                    let mut j = skip_ws(bytes, i + 4);
+                    if bytes.get(j..j + 2) == Some(b"::") {
+                        j = skip_ws(bytes, j + 2);
+                        if starts_with_ident(bytes, j, b"cover") {
+                            j = skip_ws(bytes, j + 5);
+                            if bytes.get(j) == Some(&b'!') {
+                                j = skip_ws(bytes, j + 1);
+                                if matches!(bytes.get(j), Some(b'(' | b'[' | b'{')) {
+                                    let (label, next_i) = extract_cover_label(&stripped, j);
+                                    if let Some(desc) = label.filter(|label| !label.is_empty()) {
+                                        targets[target].probes.push(desc);
                                     }
+                                    i = next_i;
+                                    continue;
                                 }
-                                i = next_i;
-                                continue;
                             }
                         }
                     }
@@ -419,7 +454,7 @@ pub fn discover_kani_targets(files: &[(RelPath, String)]) -> (Option<String>, Ve
         }
     }
 
-    (first_harness, probes)
+    targets
 }
 
 /// Strips Rust line comments (`//`), nested block comments (`/* ... */`),
@@ -764,192 +799,557 @@ pub fn hygiene_lint_lean(rel_path: &str, source: &str) -> HygieneReport {
     HygieneReport { violations }
 }
 
-/// Parses Kani JSON report output (`kani --export-json`) into `KaniReport`.
+struct KaniExport {
+    report: KaniReport,
+    crate_name: String,
+    source: String,
+    start_line: usize,
+    end_line: usize,
+    succeeded: bool,
+}
+
+fn kani_text<'a>(object: &'a JsonValue, field: &str) -> Result<&'a str, String> {
+    object
+        .get(field)
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("missing or invalid Kani field '{field}'"))
+}
+
+fn kani_bool(object: &JsonValue, field: &str) -> Result<bool, String> {
+    object
+        .get(field)
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| format!("missing or invalid Kani field '{field}'"))
+}
+
+fn kani_array<'a>(object: &'a JsonValue, field: &str) -> Result<&'a [JsonValue], String> {
+    object
+        .get(field)
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("missing or invalid Kani array '{field}'"))
+}
+
+fn kani_one<'a>(object: &'a JsonValue, field: &str) -> Result<&'a JsonValue, String> {
+    match kani_array(object, field)? {
+        [item] => Ok(item),
+        _ => Err(format!("expected one item in Kani array '{field}'")),
+    }
+}
+
+fn kani_line(source: &JsonValue, field: &str) -> Result<usize, String> {
+    match source.get(field) {
+        Some(JsonValue::Number(line))
+            if *line >= 1.0 && *line < usize::MAX as f64 && line.fract() == 0.0 =>
+        {
+            Ok(*line as usize)
+        }
+        _ => Err(format!("missing or invalid Kani source line '{field}'")),
+    }
+}
+
+/// Parses the single-harness export produced by Kani 0.68.0.
 pub fn parse_kani_json(raw: &str) -> Result<KaniReport, String> {
+    Ok(parse_kani_export(raw)?.report)
+}
+
+fn parse_kani_export(raw: &str) -> Result<KaniExport, String> {
     let root = parse_json(raw).map_err(|e| e.to_string())?;
-    let harness_name = root
-        .get("harness")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let should_panic = root
-        .get("should_panic")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let solver_error = root
-        .get("solver_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let metadata = root.get("metadata").ok_or("missing Kani export metadata")?;
+    if kani_text(metadata, "version")? != "1.0" || kani_text(metadata, "kani_version")? != "0.68.0"
+    {
+        return Err("unsupported Kani export schema or version (expected Kani 0.68.0)".to_string());
+    }
 
-    let checks_arr = root
-        .get("checks")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "missing checks array in Kani JSON".to_string())?;
+    let harness = kani_one(&root, "harness_metadata")?;
+    let harness_name = kani_text(harness, "pretty_name")?;
+    let crate_name = kani_text(harness, "crate_name")?;
+    let attributes = harness
+        .get("attributes")
+        .ok_or("missing Kani harness attributes")?;
+    if harness_name.is_empty()
+        || crate_name.is_empty()
+        || kani_text(attributes, "kind")? != "Proof"
+        || kani_bool(harness, "is_automatically_generated")?
+    {
+        return Err("invalid Kani proof harness metadata".to_string());
+    }
+    let should_panic = kani_bool(attributes, "should_panic")?;
+    let source = harness.get("source").ok_or("missing Kani harness source")?;
+    let source_file = kani_text(source, "file")?;
+    let start_line = kani_line(source, "start_line")?;
+    let end_line = kani_line(source, "end_line")?;
+    if source_file.is_empty() || start_line > end_line {
+        return Err("invalid Kani harness source span".to_string());
+    }
 
-    let mut checks = Vec::with_capacity(checks_arr.len());
-    for item in checks_arr {
-        let class_str = item
-            .get("property_class")
-            .and_then(|v| v.as_str())
-            .unwrap_or("safety");
-        let kind = match class_str {
+    let verification = root
+        .get("verification_results")
+        .ok_or("missing Kani verification results")?;
+    let result = kani_one(verification, "results")?;
+    let errors = kani_one(&root, "error_details")?;
+    let properties = kani_one(&root, "property_details")?;
+    if kani_text(result, "harness_id")? != harness_name
+        || kani_text(errors, "harness_id")? != harness_name
+        || kani_text(properties, "harness_id")? != harness_name
+    {
+        return Err("Kani export records disagree on harness identity".to_string());
+    }
+    let succeeded = match kani_text(result, "status")? {
+        "Success" => true,
+        "Failure" => false,
+        other => return Err(format!("invalid Kani harness status '{other}'")),
+    };
+    let summary = verification
+        .get("summary")
+        .ok_or("missing Kani verification summary")?;
+    for (field, count) in [
+        ("total_harnesses", 1.0),
+        ("executed", 1.0),
+        ("successful", f64::from(succeeded)),
+        ("failed", f64::from(!succeeded)),
+    ] {
+        if summary.get(field) != Some(&JsonValue::Number(count)) {
+            return Err(format!("inconsistent Kani verification count '{field}'"));
+        }
+    }
+    if kani_text(summary, "status")? != "completed" || kani_bool(errors, "has_errors")? == succeeded
+    {
+        return Err("incomplete or inconsistent Kani verification outcome".to_string());
+    }
+
+    let checks_array = kani_array(result, "checks")?;
+    let property_count = properties
+        .get("property_details")
+        .and_then(|counts| counts.get("total_properties"));
+    if property_count != Some(&JsonValue::Number(checks_array.len() as f64)) {
+        return Err("Kani verification checks disagree with the property count".to_string());
+    }
+    let mut checks = Vec::with_capacity(checks_array.len());
+    let mut solver_error = !succeeded
+        && (kani_text(errors, "exit_status")? != "properties_failed"
+            || !matches!(
+                kani_text(errors, "error_type")?,
+                "assertion_failure" | "verification_failure"
+            ));
+    for item in checks_array {
+        let category = kani_text(item, "category")?;
+        let kind = match category {
             "assertion" => CheckKind::Assertion,
             "cover" => CheckKind::Cover,
             _ => CheckKind::Safety,
         };
-        let description = item
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let status_str = item
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("UNDETERMINED");
-        let status = match status_str {
-            "SUCCESS" => CheckStatus::Success,
-            "FAILURE" => CheckStatus::Failure,
-            "UNREACHABLE" => CheckStatus::Unreachable,
-            "SATISFIED" => CheckStatus::Satisfied,
-            "UNSATISFIABLE" => CheckStatus::Unsatisfiable,
-            _ => CheckStatus::Undetermined,
+        let status = match kani_text(item, "status")? {
+            "Success" => CheckStatus::Success,
+            "Failure" if matches!(category, "unwind" | "recursion") => CheckStatus::Undetermined,
+            "Failure" => CheckStatus::Failure,
+            "Unreachable" => CheckStatus::Unreachable,
+            "Satisfied" => CheckStatus::Satisfied,
+            "Unsatisfiable" => CheckStatus::Unsatisfiable,
+            "Undetermined" | "Unknown" | "Covered" | "Uncovered" => CheckStatus::Undetermined,
+            "Error" => {
+                solver_error = true;
+                CheckStatus::Undetermined
+            }
+            other => return Err(format!("invalid Kani check status '{other}'")),
         };
         checks.push(KaniCheck {
             kind,
-            description,
+            description: kani_text(item, "description")?.to_string(),
             status,
         });
     }
 
-    Ok(KaniReport {
-        harness_name,
-        should_panic,
-        solver_error,
-        checks,
+    let has_failed_check = checks
+        .iter()
+        .any(|check| check.kind != CheckKind::Cover && check.status == CheckStatus::Failure);
+    if succeeded && has_failed_check {
+        return Err("Kani reported a successful harness with failed checks".to_string());
+    }
+    if !succeeded
+        && !has_failed_check
+        && !checks
+            .iter()
+            .any(|check| check.status == CheckStatus::Undetermined)
+    {
+        solver_error = true;
+    }
+
+    Ok(KaniExport {
+        report: KaniReport {
+            harness_name: harness_name.to_string(),
+            should_panic,
+            solver_error,
+            checks,
+        },
+        crate_name: crate_name.to_string(),
+        source: source_file.to_string(),
+        start_line,
+        end_line,
+        succeeded,
     })
 }
 
-/// Runs `cargo kani` inside an offline OS sandbox and classifies its JSON report.
-pub fn run_kani_sandboxed(
-    worktree_dir: &Path,
-    harness_name: &str,
-    expected_probes: &[&str],
-) -> Result<CheckerVerdict, SandboxError> {
-    let cfg = default_offline_config(worktree_dir, None);
-    let report_path = worktree_dir.join(".verity-kani-report.json");
-    // Remove any stale report from an interrupted prior run before executing.
-    let _ = std::fs::remove_file(&report_path);
-    let report_str = report_path
-        .to_str()
-        .ok_or_else(|| SandboxError::Io("non-utf8 report path".to_string()))?;
-
-    let out = run_sandboxed(
-        &cfg,
-        "cargo",
-        &[
-            "kani",
-            "-Z",
-            "unstable-options",
-            "--harness",
-            harness_name,
-            "--export-json",
-            report_str,
-        ],
-    )?;
-
-    if !report_path.exists() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let missing_bin = stderr.contains("No such file or directory")
-            || stderr.contains("no such command: `kani`")
-            || stderr.contains("no such subcommand: `kani`")
-            || stderr.contains("not found");
-        let reason = if missing_bin {
-            format!(
-                "cargo kani binary unavailable in sandbox (exit {:?}): {} — install cargo-kani or ensure it is on PATH",
-                out.status.code(),
-                stderr
-            )
-        } else {
-            format!(
-                "kani produced no report (exit {:?}): {}",
-                out.status.code(),
-                stderr
-            )
-        };
-        return Ok(CheckerVerdict {
-            status: VerdictStatus::Inconclusive,
-            reason,
-            checks_passed: 0,
-            probes_satisfied: 0,
-        });
-    }
-
-    let raw = std::fs::read_to_string(&report_path).map_err(|e| SandboxError::Io(e.to_string()))?;
-    let _ = std::fs::remove_file(&report_path);
-
-    match parse_kani_json(&raw) {
-        Ok(report) => Ok(classify_kani_report(&report, expected_probes)),
-        Err(msg) => Ok(CheckerVerdict {
-            status: VerdictStatus::InvalidReport,
-            reason: msg,
-            checks_passed: 0,
-            probes_satisfied: 0,
-        }),
+fn no_checker_evidence(status: VerdictStatus, reason: impl Into<String>) -> CheckerVerdict {
+    CheckerVerdict {
+        status,
+        reason: reason.into(),
+        checks_passed: 0,
+        probes_satisfied: 0,
     }
 }
 
-/// Runs Lean 4 `lake comparator --paranoid` inside an offline OS sandbox.
+fn classify_kani_export(
+    raw: &str,
+    exit_code: Option<i32>,
+    worktree_dir: &Path,
+    target: &KaniTarget,
+) -> CheckerVerdict {
+    let export = match parse_kani_export(raw) {
+        Ok(export) => export,
+        Err(reason) => return no_checker_evidence(VerdictStatus::InvalidReport, reason),
+    };
+    if export.crate_name != KANI_CRATE
+        || export.report.harness_name.rsplit("::").next() != Some(target.name.as_str())
+        || worktree_dir.join(&export.source) != worktree_dir.join(target.source.as_str())
+        || !(export.start_line..=export.end_line).contains(&target.line)
+    {
+        return no_checker_evidence(
+            VerdictStatus::InvalidReport,
+            format!(
+                "Kani report does not identify requested harness '{}' in {}",
+                target.name,
+                target.source.as_str()
+            ),
+        );
+    }
+    if exit_code != Some(i32::from(!export.succeeded)) {
+        return no_checker_evidence(
+            VerdictStatus::Inconclusive,
+            format!("Kani exit {exit_code:?} disagrees with the verification report"),
+        );
+    }
+    let expected_probes: Vec<&str> = target.probes.iter().map(String::as_str).collect();
+    classify_kani_report(&export.report, &expected_probes)
+}
+
+const KANI_CRATE: &str = "verity_candidate";
+static NEXT_KANI_RUN: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn run_kani_proof_sandboxed(
+    worktree_dir: &Path,
+    target: &KaniTarget,
+) -> Result<CheckerVerdict, SandboxError> {
+    let worktree_dir = canonical_path(worktree_dir)?;
+    let program = configured_checker_path("VERITY_KANI", &worktree_dir)?;
+    let source_path = worktree_dir.join(target.source.as_str());
+    if canonical_path(&source_path)? != source_path || !source_path.is_file() {
+        return Ok(no_checker_evidence(
+            VerdictStatus::InvalidReport,
+            "Kani proof source must be a regular file in the worktree",
+        ));
+    }
+
+    let run_dir = worktree_dir.join(format!(
+        ".verity-kani-{}-{}",
+        std::process::id(),
+        NEXT_KANI_RUN.fetch_add(1, Ordering::Relaxed),
+    ));
+    fs::create_dir(&run_dir).map_err(sandbox_io)?;
+    let verdict = capture_kani_verdict(&program, &worktree_dir, &source_path, &run_dir, target);
+    fs::remove_dir_all(&run_dir).map_err(sandbox_io)?;
+    verdict
+}
+
+fn capture_kani_verdict(
+    program: &Path,
+    worktree_dir: &Path,
+    source_path: &Path,
+    run_dir: &Path,
+    target: &KaniTarget,
+) -> Result<CheckerVerdict, SandboxError> {
+    let cfg = checker_sandbox(worktree_dir, program)?;
+    let report_path = run_dir.join("report.json");
+    // Standalone Kani invokes its compiler directly without Cargo configuration,
+    // build scripts, dependency search paths, or a candidate-selected linker.
+    let out = run_sandboxed(
+        &cfg,
+        path_arg(program)?,
+        &[
+            "-Z",
+            "unstable-options",
+            "--harness",
+            &target.name,
+            "--crate-name",
+            KANI_CRATE,
+            "--target-dir",
+            path_arg(run_dir)?,
+            "--export-json",
+            path_arg(&report_path)?,
+            path_arg(source_path)?,
+        ],
+    )?;
+    match fs::symlink_metadata(&report_path) {
+        Ok(metadata) if metadata.is_file() => {
+            let raw = fs::read_to_string(&report_path).map_err(sandbox_io)?;
+            Ok(classify_kani_export(
+                &raw,
+                out.status.code(),
+                worktree_dir,
+                target,
+            ))
+        }
+        Ok(_) => Ok(no_checker_evidence(
+            VerdictStatus::InvalidReport,
+            "Kani report is not a regular file",
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(no_checker_evidence(
+            VerdictStatus::Inconclusive,
+            format!(
+                "Kani produced no report (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
+        )),
+        Err(error) => Err(sandbox_io(error)),
+    }
+}
+
+fn sandbox_io(error: std::io::Error) -> SandboxError {
+    SandboxError::Io(error.to_string())
+}
+
+fn canonical_path(path: &Path) -> Result<PathBuf, SandboxError> {
+    path.canonicalize()
+        .map_err(|error| SandboxError::Io(format!("{}: {error}", path.display())))
+}
+
+fn path_arg(path: &Path) -> Result<&str, SandboxError> {
+    path.to_str()
+        .ok_or_else(|| SandboxError::Io("checker path is not UTF-8".to_string()))
+}
+
+fn independent_checker_file(
+    path: &Path,
+    worktree_dir: &Path,
+    role: &str,
+) -> Result<PathBuf, SandboxError> {
+    if path.is_absolute() {
+        let canonical = canonical_path(path)?;
+        if canonical.is_file() && !canonical.starts_with(worktree_dir) {
+            return Ok(canonical);
+        }
+    }
+    Err(SandboxError::NotAvailable(format!(
+        "{role} must be an absolute path to a regular file outside the candidate worktree"
+    )))
+}
+
+fn configured_checker_path(variable: &str, worktree_dir: &Path) -> Result<PathBuf, SandboxError> {
+    let path = env::var_os(variable)
+        .ok_or_else(|| SandboxError::NotAvailable(format!("{variable} is unset")))?;
+    independent_checker_file(Path::new(&path), worktree_dir, variable)
+}
+
+fn checker_sandbox(worktree_dir: &Path, program: &Path) -> Result<SandboxConfig, SandboxError> {
+    let bin_dir = program
+        .parent()
+        .ok_or_else(|| SandboxError::Io("checker has no tool directory".to_string()))?;
+    let tool_path = env::join_paths([
+        bin_dir,
+        Path::new("/usr/local/bin"),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+    ])
+    .map_err(|error| SandboxError::Io(error.to_string()))?;
+    let mut cfg = default_offline_config(worktree_dir, None);
+    cfg.env_passthrough.push((
+        "PATH".to_string(),
+        path_arg(Path::new(&tool_path))?.to_string(),
+    ));
+    Ok(cfg)
+}
+
+/// Runs a trusted Lake comparator against an independently maintained configuration and export.
 pub fn run_lean_comparator_sandboxed(
     worktree_dir: &Path,
     challenge_export: &Path,
 ) -> Result<CheckerVerdict, SandboxError> {
-    let cfg = default_offline_config(worktree_dir, None);
-    let flag = format!("--challenge-from-export={}", challenge_export.display());
+    let worktree_dir = canonical_path(worktree_dir)?;
+    let program = configured_checker_path("VERITY_LEAN_COMPARATOR", &worktree_dir)?;
+    let config = configured_checker_path("VERITY_LEAN_COMPARATOR_CONFIG", &worktree_dir)?;
+    let challenge_export =
+        independent_checker_file(challenge_export, &worktree_dir, "Lean challenge export")?;
+    let config_flag = format!("--config={}", path_arg(&config)?);
+    let challenge_flag = format!("--challenge-from-export={}", path_arg(&challenge_export)?);
     let out = run_sandboxed(
-        &cfg,
-        "lake",
-        &[
-            "comparator",
-            &flag,
-            "--paranoid",
-            "--permitted-axioms=propext,Quot.sound,Classical.choice",
-        ],
+        &checker_sandbox(&worktree_dir, &program)?,
+        path_arg(&program)?,
+        &["comparator", &config_flag, &challenge_flag, "--paranoid"],
     )?;
-
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if out.status.success() {
         return Ok(CheckerVerdict {
             status: VerdictStatus::Pass,
-            reason: "lean comparator --paranoid accepted proof".to_string(),
+            reason: "Lean comparator --paranoid accepted the proof".to_string(),
             checks_passed: 1,
-            probes_satisfied: 1,
-        });
-    }
-    if stderr.contains("bwrap:")
-        || stderr.contains("No such file or directory")
-        || stderr.contains("not found")
-    {
-        return Ok(CheckerVerdict {
-            status: VerdictStatus::Inconclusive,
-            reason: format!(
-                "lake binary unavailable in sandbox: {} — install Lean 4 / lake and ensure it is on PATH",
-                stderr
-            ),
-            checks_passed: 0,
             probes_satisfied: 0,
         });
     }
-    Ok(CheckerVerdict {
-        status: VerdictStatus::Counterexample,
-        reason: format!("lean comparator rejected proof: {}", stderr),
-        checks_passed: 0,
-        probes_satisfied: 0,
-    })
+    Ok(no_checker_evidence(
+        VerdictStatus::Inconclusive,
+        format!(
+            "Lean comparator did not accept the proof (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KANI_PASS: &str = include_str!("../tests/fixtures/kani-0.68.0-pass.json");
+
+    #[test]
+    fn pinned_kani_exports_distinguish_assertion_failure_from_insufficient_unwind() {
+        let cases = [
+            (
+                include_str!("../tests/fixtures/kani-0.68.0-failure.json"),
+                "verify_failure",
+                10,
+                VerdictStatus::Counterexample,
+            ),
+            (
+                include_str!("../tests/fixtures/kani-0.68.0-bound.json"),
+                "verify_bound",
+                18,
+                VerdictStatus::Inconclusive,
+            ),
+        ];
+        for (raw, name, line, expected) in cases {
+            let target = KaniTarget {
+                name: name.to_string(),
+                source: RelPath::parse("proof.rs").unwrap(),
+                line,
+                probes: Vec::new(),
+            };
+            let verdict = classify_kani_export(raw, Some(1), Path::new("/worktree"), &target);
+            assert_eq!(verdict.status, expected, "{}", verdict.reason);
+        }
+    }
+
+    #[test]
+    fn pinned_kani_export_requires_requested_source_and_successful_process() {
+        let mut target = KaniTarget {
+            name: "verify_pass".to_string(),
+            source: RelPath::parse("proof.rs").unwrap(),
+            line: 3,
+            probes: vec!["forty_two".to_string()],
+        };
+        let classify = |raw, exit_code, target: &KaniTarget| {
+            classify_kani_export(raw, exit_code, Path::new("/worktree"), target).status
+        };
+        assert_eq!(classify(KANI_PASS, Some(0), &target), VerdictStatus::Pass);
+        assert_eq!(
+            classify(KANI_PASS, Some(1), &target),
+            VerdictStatus::Inconclusive
+        );
+        let other_crate = KANI_PASS.replace(
+            r#""crate_name": "verity_candidate""#,
+            r#""crate_name": "other_crate""#,
+        );
+        assert_eq!(
+            classify(&other_crate, Some(0), &target),
+            VerdictStatus::InvalidReport
+        );
+        target.name = "pass".to_string();
+        assert_eq!(
+            classify(KANI_PASS, Some(0), &target),
+            VerdictStatus::InvalidReport
+        );
+        target.name = "verify_pass".to_string();
+        target.line = 8;
+        assert_eq!(
+            classify(KANI_PASS, Some(0), &target),
+            VerdictStatus::InvalidReport
+        );
+        target.line = 3;
+        target.source = RelPath::parse("src/other.rs").unwrap();
+        assert_eq!(
+            classify(KANI_PASS, Some(0), &target),
+            VerdictStatus::InvalidReport
+        );
+        target.source = RelPath::parse("proof.rs").unwrap();
+        target.probes.push("missing_probe".to_string());
+        assert_eq!(
+            classify(KANI_PASS, Some(0), &target),
+            VerdictStatus::InvalidReport
+        );
+    }
+
+    #[test]
+    fn pinned_kani_export_requires_consistent_completed_harness_evidence() {
+        assert!(parse_kani_json(r#"{"harness":"verify_pass","checks":[]}"#).is_err());
+        for (from, to) in [
+            (r#""executed": 1"#, r#""executed": 0"#),
+            (r#""total_properties": 2"#, r#""total_properties": 3"#),
+            (r#""status": "completed""#, r#""status": "incomplete""#),
+            (
+                r#""harness_id": "proofs::verify_pass""#,
+                r#""harness_id": "proofs::other""#,
+            ),
+            (r#""kani_version": "0.68.0""#, r#""kani_version": "0.67.0""#),
+        ] {
+            let raw = KANI_PASS.replacen(from, to, 1);
+            assert_ne!(raw, KANI_PASS, "fixture field {from} is missing");
+            assert!(parse_kani_json(&raw).is_err(), "accepted {to}");
+        }
+    }
+
+    #[test]
+    fn checker_files_require_independent_absolute_paths() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let worktree = canonical_path(&manifest_dir.join("src")).unwrap();
+        assert!(independent_checker_file(Path::new("Cargo.toml"), &worktree, "checker").is_err());
+        assert!(
+            independent_checker_file(&worktree.join("verifiers.rs"), &worktree, "checker").is_err()
+        );
+        let independent = manifest_dir.join("Cargo.toml");
+        assert_eq!(
+            independent_checker_file(&independent, &worktree, "checker").unwrap(),
+            canonical_path(&independent).unwrap(),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires VERITY_KANI and a working native sandbox"]
+    fn standalone_kani_checks_the_discovered_proof() {
+        let worktree = env::temp_dir().join(format!("verity-kani-smoke-{}", std::process::id()));
+        fs::create_dir(&worktree).unwrap();
+        let source = r#"
+mod proofs {
+    #[kani::proof]
+    fn verify_pass() {
+        let n: u8 = kani::any();
+        assert!(n.saturating_add(0) == n);
+        kani::cover!(n == 42, "forty_two");
+    }
+}
+"#;
+        let path = RelPath::parse("proof.rs").unwrap();
+        fs::write(worktree.join(path.as_str()), source).unwrap();
+        let targets = discover_kani_proofs(&[(path, source.to_string())]);
+        let verdict = run_kani_proof_sandboxed(&worktree, &targets[0]);
+        let files = fs::read_dir(&worktree).unwrap().count();
+        fs::remove_dir_all(&worktree).unwrap();
+
+        let verdict = verdict.unwrap();
+        assert_eq!(verdict.status, VerdictStatus::Pass, "{}", verdict.reason);
+        assert_eq!(verdict.checks_passed, 1);
+        assert_eq!(verdict.probes_satisfied, 1);
+        assert_eq!(files, 1);
+    }
 
     #[test]
     fn rust_scanner_ignores_comments_and_strings_but_catches_smuggled_code() {
@@ -1033,6 +1433,10 @@ pub(crate) fn verify_safe_sub() {
 fn second_harness() {
     kani::cover!(true, r#"raw_label_probe"#);
 }
+
+fn helper() {
+    kani::cover!(true, "outside_probe");
+}
 "##;
         let files = vec![
             (
@@ -1042,16 +1446,15 @@ fn second_harness() {
             (RelPath::parse("src/math.rs").unwrap(), src.to_string()),
         ];
 
-        let (harness, probes) = discover_kani_targets(&files);
-        assert_eq!(harness.as_deref(), Some("verify_safe_sub"));
-        assert_eq!(
-            probes,
-            vec![
-                "positive_diff".to_string(),
-                "underflow_saturates".to_string(),
-                "raw_label_probe".to_string(),
-            ]
-        );
+        let targets = discover_kani_proofs(&files);
+        let [first, second] = targets.as_slice() else {
+            panic!("expected two proof harnesses, got {targets:?}");
+        };
+        assert_eq!(first.name, "verify_safe_sub");
+        assert_eq!(first.source.as_str(), "src/math.rs");
+        assert_eq!(first.probes, ["positive_diff", "underflow_saturates"]);
+        assert_eq!(second.name, "second_harness");
+        assert_eq!(second.probes, ["raw_label_probe"]);
     }
 
     #[test]

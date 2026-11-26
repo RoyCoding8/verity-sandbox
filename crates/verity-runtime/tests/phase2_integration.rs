@@ -63,15 +63,12 @@ fn git_worktree_merge_tree_and_cas_ref_lifecycle() {
     let wt_path = root.join("worktrees/task-1");
     let task_id = TaskId::parse("task-1").unwrap();
 
-    // Idempotent creation (calling twice converges cleanly).
-    create_worktree(&repo, &wt_path, &task_id, &base).unwrap();
     create_worktree(&repo, &wt_path, &task_id, &base).unwrap();
 
-    fs::write(
-        wt_path.join("lib.rs"),
-        "pub fn add(a: u32, b: u32) -> u32 { a.saturating_add(b) }\n",
-    )
-    .unwrap();
+    let change = "pub fn add(a: u32, b: u32) -> u32 { a.saturating_add(b) }\n";
+    fs::write(wt_path.join("lib.rs"), change).unwrap();
+    assert!(create_worktree(&repo, &wt_path, &task_id, &base).is_err());
+    assert_eq!(fs::read_to_string(wt_path.join("lib.rs")).unwrap(), change);
     let cand = commit_worktree_changes(&wt_path, "task-1 candidate").unwrap();
     let diffs = changed_paths(&repo, &base, &cand).unwrap();
     assert_eq!(diffs, vec![RelPath::parse("lib.rs").unwrap()]);
@@ -189,16 +186,10 @@ fn hygiene_lints_and_kani_json_parser_catch_cheats() {
     let bad_lean = "partial def loop (n : Nat) : Nat := loop n\ntheorem t : True := by sorry\n";
     assert_eq!(hygiene_lint_lean("Spec.lean", bad_lean).violations.len(), 2);
 
-    let json = r#"{
-        "harness": "verify_add",
-        "should_panic": false,
-        "solver_error": false,
-        "checks": [
-            {"property_class": "safety", "description": "overflow", "status": "SUCCESS"},
-            {"property_class": "cover", "description": "happy_path", "status": "SATISFIED"}
-        ]
-    }"#;
+    let json = include_str!("fixtures/kani-0.68.0-pass.json");
     let parsed = parse_kani_json(json).unwrap();
-    let verdict = classify_kani_report(&parsed, &["happy_path"]);
+    let verdict = classify_kani_report(&parsed, &["forty_two"]);
     assert_eq!(verdict.status, VerdictStatus::Pass);
+    assert_eq!(verdict.checks_passed, 1);
+    assert_eq!(verdict.probes_satisfied, 1);
 }

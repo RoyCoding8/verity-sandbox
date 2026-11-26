@@ -95,7 +95,16 @@ pub fn git_common_dir(repo_dir: &Path) -> Result<PathBuf, GitError> {
 }
 
 pub fn read_ref(repo_dir: &Path, ref_name: &str) -> Result<Option<CommitOid>, GitError> {
-    let out = run_git(repo_dir, &["rev-parse", "--verify", "--quiet", ref_name])?;
+    let out = run_git(
+        repo_dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            ref_name,
+        ],
+    )?;
     if !out.status.success() {
         return Ok(None);
     }
@@ -105,18 +114,13 @@ pub fn read_ref(repo_dir: &Path, ref_name: &str) -> Result<Option<CommitOid>, Gi
         .map_err(|e| GitError::InvalidOutput(e.to_string()))
 }
 
-/// Idempotently creates a locked detached git worktree for a write subagent.
-/// Reconciles stale worktree metadata first so crashes never wedge retries.
+/// Creates a locked detached worktree. Git rejects a path already in use.
 pub fn create_worktree(
     repo_dir: &Path,
     worktree_path: &Path,
     task_id: &TaskId,
     base: &CommitOid,
 ) -> Result<PathBuf, GitError> {
-    let _ = run_git(repo_dir, &["worktree", "prune"]);
-    if worktree_path.exists() {
-        let _ = remove_worktree(repo_dir, worktree_path);
-    }
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| GitError::Io(e.to_string()))?;
     }
@@ -132,6 +136,7 @@ pub fn create_worktree(
             "--lock",
             "--reason",
             task_id.as_str(),
+            "--",
             wt_str,
             base.as_str(),
         ],
@@ -139,19 +144,15 @@ pub fn create_worktree(
     Ok(worktree_path.to_path_buf())
 }
 
-/// Idempotently removes a locked or unlocked worktree and prunes metadata.
+/// Removes a registered worktree, including its lock and worktree metadata.
 pub fn remove_worktree(repo_dir: &Path, worktree_path: &Path) -> Result<(), GitError> {
     let wt_str = worktree_path
         .to_str()
         .ok_or_else(|| GitError::InvalidOutput("non-utf8 worktree path".to_string()))?;
-    let _ = run_git(
+    require_git_ok(
         repo_dir,
-        &["worktree", "remove", "--force", "--force", wt_str],
-    );
-    if worktree_path.exists() {
-        std::fs::remove_dir_all(worktree_path).map_err(|e| GitError::Io(e.to_string()))?;
-    }
-    let _ = run_git(repo_dir, &["worktree", "prune"]);
+        &["worktree", "remove", "--force", "--force", "--", wt_str],
+    )?;
     Ok(())
 }
 
@@ -204,6 +205,35 @@ pub fn changed_paths(
         out.push(rel);
     }
     Ok(out)
+}
+
+pub(crate) fn committed_text(
+    repo_dir: &Path,
+    commit: &CommitOid,
+    path: &RelPath,
+) -> Result<String, GitError> {
+    let literal = format!(":(literal){}", path.as_str());
+    let entry = require_git_ok(
+        repo_dir,
+        &["ls-tree", "-z", commit.as_str(), "--", &literal],
+    )?;
+    let metadata = entry
+        .split(|&byte| byte == b'\t')
+        .next()
+        .unwrap_or_default();
+    if metadata.is_empty() || metadata.starts_with(b"040000 tree ") {
+        return Ok(String::new());
+    }
+    let oid = metadata
+        .strip_prefix(b"100644 blob ")
+        .or_else(|| metadata.strip_prefix(b"100755 blob "))
+        .and_then(|oid| std::str::from_utf8(oid).ok())
+        .ok_or_else(|| {
+            GitError::InvalidOutput(format!("non-regular file in candidate: {}", path.as_str()))
+        })?;
+    String::from_utf8(require_git_ok(repo_dir, &["cat-file", "blob", oid])?).map_err(|_| {
+        GitError::InvalidOutput(format!("non-UTF-8 file in candidate: {}", path.as_str()))
+    })
 }
 
 /// Lock-free 3-way merge via `git merge-tree --write-tree` (Git 2.38+).
@@ -288,9 +318,54 @@ pub fn update_ref_cas(
         &[
             "update-ref",
             "--no-deref",
+            "--",
             ref_name,
             new_oid.as_str(),
             expected,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn integrate_branch(
+    repo_dir: &Path,
+    branch: &str,
+    merged: &CommitOid,
+    expected: &CommitOid,
+) -> Result<(), GitError> {
+    let path = require_git_ok(
+        repo_dir,
+        &["for-each-ref", "--format=%(worktreepath)", branch],
+    )?;
+    let path = std::str::from_utf8(&path)
+        .map_err(|_| GitError::InvalidOutput("non-UTF-8 worktree path".to_string()))?
+        .trim_end_matches(['\r', '\n']);
+    if path.is_empty() {
+        return update_ref_cas(repo_dir, branch, merged, Some(expected));
+    }
+
+    let local_branch = require_git_ok(repo_dir, &["symbolic-ref", "HEAD"])?;
+    if local_branch.trim_ascii_end() != branch.as_bytes()
+        || read_ref(repo_dir, "HEAD")?.as_ref() != Some(expected)
+    {
+        return Err(GitError::InvalidOutput(
+            "target is checked out elsewhere or moved; retry from the target checkout".into(),
+        ));
+    }
+    let status = require_git_ok(repo_dir, &["status", "--porcelain", "--untracked-files=no"])?;
+    if !status.is_empty() {
+        return Err(GitError::InvalidOutput(
+            "target checkout contains tracked changes; commit or stash before merging".into(),
+        ));
+    }
+    require_git_ok(
+        repo_dir,
+        &[
+            "merge",
+            "--ff-only",
+            "--no-autostash",
+            "--no-overwrite-ignore",
+            merged.as_str(),
         ],
     )?;
     Ok(())
