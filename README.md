@@ -5,17 +5,17 @@ A Rust controller and Tauri v2 Material Design 3 desktop app for running coding 
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://v2.tauri.app/)
 [![Material Design 3](https://img.shields.io/badge/UI-Material%20Design%203-6750A4)](https://m3.material.io/)
-[![Kani Verified](https://img.shields.io/badge/Kani-20%20proofs-2E7D32)](https://model-checking.github.io/kani/)
+[![Kani](https://img.shields.io/badge/Kani-formal%20checks-2E7D32)](https://model-checking.github.io/kani/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue)](https://www.apache.org/licenses/LICENSE-2.0)
 
 ## Why Verity?
 
 Coding agents break repositories when they edit the main checkout directly or skip verification. Verity separates read work from write work and enforces formal checks before any change reaches your branch.
 
-- Read-only subagents run without worktrees and return text summaries.
-- Write subagents run inside locked `git worktree` checkouts with OS sandboxing and an `O_NOFOLLOW` path jail.
-- Every write task produces a stripped spec-only review bundle and passes Kani or Lean 4 verification before lock-free `git merge-tree` integration.
-- The desktop app persists workspaces per project, speaks full Pi JSONL RPC, and snapshots repository state on every turn so you can revert chat and code together without losing redo history.
+- Read-only subagents use Pi's read tools and return text summaries.
+- Write subagents run in locked Git worktrees under bubblewrap on Linux. Other platforms reject write tasks before starting Pi.
+- The controller verifies a fresh checkout of the candidate commit. Approval requires a passing Kani or Lean verdict and the digest shown in its review bundle.
+- The desktop app keeps Pi sessions per project and captures code checkpoints for chat turns. Code restore requires a matching checkpoint. Redo requires the same session and rejects later edits to affected paths.
 
 ## Architecture
 
@@ -23,11 +23,11 @@ Coding agents break repositories when they edit the main checkout directly or sk
 flowchart LR
     UI["Desktop UI<br/>React 19 + Material Design 3"] -->|Tauri v2 IPC| Shell["Tauri v2 Shell<br/>desktop/src-tauri"]
     Shell -->|JSONL over stdio| Pi["Pi Agent RPC<br/>Sessions, skills, bash, UI extensions"]
-    Shell -->|Per-turn checkpoints| Shadow["Shadow-Git Snapshots<br/>Targeted revert and lossless redo"]
+    Shell -->|Per-turn checkpoints| Shadow["Shadow-Git Snapshots<br/>Targeted revert and redo"]
     Shell -->|Subagent lifecycle| Runtime["Verity Runtime<br/>crates/verity-runtime"]
-    Runtime --> Worktree["Isolated git worktree<br/>bubblewrap / sandbox-exec"]
-    Runtime --> Gate["Verification Gate<br/>20 Kani proofs + hygiene lints"]
-    Gate --> Merge["Spec-only handoff<br/>Lock-free git merge-tree"]
+    Runtime --> Worktree["Isolated Git worktree<br/>Linux bubblewrap"]
+    Runtime --> Gate["Verification gate<br/>Kani or Lean and hygiene lints"]
+    Gate --> Merge["Spec-only handoff<br/>Verified-base merge"]
     Core["Pure Domain Core<br/>crates/verity-core"] -.-> Runtime
     Core -.-> Shell
 ```
@@ -37,9 +37,9 @@ flowchart LR
 | Area | Capabilities |
 | :--- | :--- |
 | Multi-project desktop | Stores workspaces in `~/.verity/projects.json`, opens repositories through the native folder picker (`tauri-plugin-dialog`), and isolates Pi sessions per project. |
-| Full Pi RPC parity | Supports slash commands, skills, prompt templates, `!` and `!!` bash execution, a session settings and stats modal, and extension UI dialogs, toasts, and widgets. |
-| Turn revert and checkpoints | Captures shadow-git snapshots on each turn for targeted chat and code revert with lossless redo, plus one-click copy for individual messages or full chats. |
-| Formal verification and handoffs | Runs 20 Kani `#[kani::proof]` drivers in `formal/` against `verity-core` and protocol contracts, enforces OS sandboxing (`bubblewrap` on Linux, `sandbox-exec` on macOS), and merges approved changes with `git merge-tree`. |
+| Pi RPC | Supports slash commands, skills, prompt templates, `!` and `!!` bash execution, a session settings and stats modal, and extension UI dialogs, toasts, and widgets. |
+| Turn revert and checkpoints | Captures shadow Git snapshots for targeted chat and code revert and redo. |
+| Formal verification and handoffs | Uses Kani or Lean to check write tasks and `git merge-tree` to integrate approved candidates. The project's own proof suite lives in `formal/`. |
 
 ## Quick start
 
@@ -79,6 +79,19 @@ npm run dev
 npm run tauri:build
 ```
 
+### Write task requirements
+
+Write tasks require Linux with bubblewrap and user namespaces enabled. Use a system-installed Pi and Node.js. Supply the model provider's API key in the controller environment. The worker uses a private home and can reach the network to call the provider.
+
+The controller forwards API keys from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, and `OPENROUTER_API_KEY` when those variables are set.
+
+The desktop app locates the `verity` CLI beside its executable or on `PATH`. Set `VERITY_MCP_BIN` to an absolute executable path to override discovery.
+
+- For Kani, set `VERITY_KANI` to the absolute path of a trusted standalone Kani 0.68.0 launcher with a prepared toolchain. The controller verifies Rust source files as standalone crates. Cargo packages that require dependencies, features, or build scripts need separate verification.
+- For Lean, set `VERITY_LEAN_COMPARATOR` to the absolute path of a trusted `lake` launcher and `VERITY_LEAN_COMPARATOR_CONFIG` to its trusted comparator configuration. Keep these files and `challenge.export` outside the candidate checkout.
+
+Review the proof statements and scope in the handoff before approving. The checker result applies to the candidate commit and the obligations it ran. If the target branch moves, rerun the task against the new base.
+
 ## Workspace layout
 
 | Path | Contents |
@@ -86,7 +99,7 @@ npm run tauri:build
 | `crates/verity-core` | Zero-IO pure Rust domain types, task state machine, Pi session exclusivity laws, Pi wire types, provider URL validation, write-scope rules, Kani verdict classifier, and JSON parser. |
 | `crates/verity-runtime` | Native `git worktree` and `git merge-tree` operations, rootless Linux `bubblewrap` and macOS `sandbox-exec` sandboxing, `O_NOFOLLOW` workspace path jail, comment-aware Kani and Lean 4 hygiene lints, Pi JSONL RPC client, write-subagent orchestrator, and spec-only handoff extractor. |
 | `crates/verity-cli` | Headless `verity` CLI (`run-readonly`, `spawn`, `review`, `merge`, `log`) and local STDIO MCP server (`verity mcp`). |
-| `formal/` | 20 Kani 0.68.0 `#[kani::proof]` proof drivers with `kani::cover!` reachability probes verifying `verity-core` and protocol contracts directly. |
+| `formal/` | Kani 0.68.0 harnesses and reachability probes for `verity-core` and bounded protocol models. |
 | `desktop/` | Tauri v2 Rust shell (`desktop/src-tauri/`) and Material Design 3 React 19 frontend (`desktop/ui/`). |
 
 ## Verification
@@ -103,7 +116,7 @@ Run the Tauri backend test suite by itself:
 cargo test --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
-Run all 20 Kani formal proofs in `formal/` (requires Kani 0.68.0):
+Run the proof suite in `formal/` with Kani 0.68.0:
 
 ```sh
 npm run formal
@@ -114,6 +127,10 @@ Run the frontend state law checks (requires `npm run setup` first):
 ```sh
 node desktop/ui/src/verify/piStore.laws.mjs
 ```
+
+### Validate a local branch on GitHub
+
+The repository workflows run on pushes to `main` and `ci/verify/**` branches, and on pull requests. To validate a local commit without opening a pull request, push it to a temporary branch under `ci/verify/`. Check the workflow results for that commit, then delete the temporary branch after they pass.
 
 ## License
 

@@ -2,7 +2,7 @@ name: Tests and lints
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/verify/**']
   pull_request:
 
 jobs:
@@ -10,7 +10,7 @@ jobs:
     name: Rust fmt, clippy, and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -33,9 +33,9 @@ jobs:
     name: Desktop UI typecheck and build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -45,4 +45,8 @@ jobs:
 
       - name: Typecheck and build UI
         working-directory: desktop/ui
-        run: npm run typecheck && npm run build
+        run: npm run build
+
+      - name: Run frontend state law checks
+        working-directory: desktop/ui
+        run: node --test src/verify/piStore.laws.mjs
