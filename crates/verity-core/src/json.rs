@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub const MAX_JSON_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Null,
@@ -136,9 +138,48 @@ pub fn validate_json_number_bytes(bytes: &[u8]) -> bool {
     i == len
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JsonNumberKind {
+    NonFinite,
+    Integer(i64),
+    Float(f64),
+}
+
+/// Pure finite/integer classification used by JSON serialization and verified by Kani.
+pub fn classify_json_number(n: f64) -> JsonNumberKind {
+    if !n.is_finite() {
+        JsonNumberKind::NonFinite
+    } else if n.abs() < 1e15 && (n as i64 as f64) == n {
+        JsonNumberKind::Integer(n as i64)
+    } else {
+        JsonNumberKind::Float(n)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonEscape {
+    Static(&'static str),
+    UnicodeControl(u8),
+    Passthrough,
+}
+
+/// Pure character escape classification used by `escape_json_string` and verified by Kani.
+pub fn classify_json_escape(ch: char) -> JsonEscape {
+    match ch {
+        '"' => JsonEscape::Static("\\\""),
+        '\\' => JsonEscape::Static("\\\\"),
+        '\n' => JsonEscape::Static("\\n"),
+        '\r' => JsonEscape::Static("\\r"),
+        '\t' => JsonEscape::Static("\\t"),
+        c if (c as u32) < 0x20 => JsonEscape::UnicodeControl(c as u8),
+        _ => JsonEscape::Passthrough,
+    }
+}
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -146,6 +187,7 @@ impl<'a> Parser<'a> {
         Self {
             bytes: input.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -170,7 +212,7 @@ impl<'a> Parser<'a> {
     }
 
     fn read_hex4(&mut self) -> Result<u16, JsonError> {
-        if self.pos + 4 > self.bytes.len() {
+        if self.bytes.len() - self.pos < 4 {
             return Err(self.err("incomplete unicode escape"));
         }
         let hex4 = [
@@ -238,7 +280,7 @@ impl<'a> Parser<'a> {
                         b'u' => {
                             let unit = self.read_hex4()?;
                             if (0xD800..=0xDBFF).contains(&unit) {
-                                if self.pos + 2 > self.bytes.len()
+                                if self.bytes.len() - self.pos < 2
                                     || self.bytes[self.pos] != b'\\'
                                     || self.bytes[self.pos + 1] != b'u'
                                 {
@@ -303,55 +345,71 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_array(&mut self) -> Result<JsonValue, JsonError> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(self.err("maximum JSON nesting depth exceeded"));
+        }
+        self.depth += 1;
         self.pos += 1;
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(JsonValue::Array(items));
-        }
-        loop {
-            items.push(self.parse_value()?);
+        let res = (|| {
+            let mut items = Vec::new();
             self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(JsonValue::Array(items));
-                }
-                _ => return Err(self.err("expected ',' or ']'")),
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                return Ok(JsonValue::Array(items));
             }
-        }
+            loop {
+                items.push(self.parse_value()?);
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => self.pos += 1,
+                    Some(b']') => {
+                        self.pos += 1;
+                        return Ok(JsonValue::Array(items));
+                    }
+                    _ => return Err(self.err("expected ',' or ']'")),
+                }
+            }
+        })();
+        self.depth -= 1;
+        res
     }
 
     fn parse_object(&mut self) -> Result<JsonValue, JsonError> {
+        if self.depth >= MAX_JSON_DEPTH {
+            return Err(self.err("maximum JSON nesting depth exceeded"));
+        }
+        self.depth += 1;
         self.pos += 1;
-        let mut map = BTreeMap::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(JsonValue::Object(map));
-        }
-        loop {
+        let res = (|| {
+            let mut map = BTreeMap::new();
             self.skip_ws();
-            let key = self.parse_string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err(self.err("expected ':'"));
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                return Ok(JsonValue::Object(map));
             }
-            self.pos += 1;
-            let val = self.parse_value()?;
-            map.insert(key, val);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(JsonValue::Object(map));
+            loop {
+                self.skip_ws();
+                let key = self.parse_string()?;
+                self.skip_ws();
+                if self.peek() != Some(b':') {
+                    return Err(self.err("expected ':'"));
                 }
-                _ => return Err(self.err("expected ',' or '}'")),
+                self.pos += 1;
+                let val = self.parse_value()?;
+                map.insert(key, val);
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => self.pos += 1,
+                    Some(b'}') => {
+                        self.pos += 1;
+                        return Ok(JsonValue::Object(map));
+                    }
+                    _ => return Err(self.err("expected ',' or '}'")),
+                }
             }
-        }
+        })();
+        self.depth -= 1;
+        res
     }
 }
 
@@ -365,48 +423,90 @@ pub fn parse_json(input: &str) -> Result<JsonValue, JsonError> {
     Ok(val)
 }
 
-pub fn escape_json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+fn push_escaped_json_string(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+        match classify_json_escape(ch) {
+            JsonEscape::Static(esc) => out.push_str(esc),
+            JsonEscape::UnicodeControl(byte) => {
+                use fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", byte);
+            }
+            JsonEscape::Passthrough => out.push(ch),
         }
     }
     out.push('"');
+}
+
+pub fn escape_json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    push_escaped_json_string(&mut out, s);
     out
 }
 
+enum SerItem<'a> {
+    Value(&'a JsonValue),
+    Raw(&'static str),
+    Key(&'a str),
+}
+
 pub fn to_json_string(val: &JsonValue) -> String {
-    match val {
-        JsonValue::Null => "null".to_string(),
-        JsonValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-        JsonValue::Number(n) => {
-            if n.fract() == 0.0 && n.abs() < 1e15 {
-                format!("{}", *n as i64)
-            } else {
-                format!("{}", n)
-            }
-        }
-        JsonValue::String(s) => escape_json_string(s),
-        JsonValue::Array(items) => {
-            let parts: Vec<String> = items.iter().map(to_json_string).collect();
-            format!("[{}]", parts.join(","))
-        }
-        JsonValue::Object(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{}:{}", escape_json_string(k), to_json_string(v)))
-                .collect();
-            format!("{{{}}}", parts.join(","))
+    use fmt::Write as _;
+
+    let mut out = String::new();
+    let mut stack = vec![SerItem::Value(val)];
+    while let Some(item) = stack.pop() {
+        match item {
+            SerItem::Raw(s) => out.push_str(s),
+            SerItem::Key(k) => push_escaped_json_string(&mut out, k),
+            SerItem::Value(v) => match v {
+                JsonValue::Null => out.push_str("null"),
+                JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                JsonValue::Number(n) => match classify_json_number(*n) {
+                    JsonNumberKind::NonFinite => out.push_str("null"),
+                    JsonNumberKind::Integer(i) => {
+                        let _ = write!(out, "{}", i);
+                    }
+                    JsonNumberKind::Float(f) => {
+                        let _ = write!(out, "{}", f);
+                    }
+                },
+                JsonValue::String(s) => push_escaped_json_string(&mut out, s),
+                JsonValue::Array(items) => {
+                    out.push('[');
+                    if items.is_empty() {
+                        out.push(']');
+                    } else {
+                        stack.push(SerItem::Raw("]"));
+                        for (idx, elem) in items.iter().enumerate().rev() {
+                            stack.push(SerItem::Value(elem));
+                            if idx > 0 {
+                                stack.push(SerItem::Raw(","));
+                            }
+                        }
+                    }
+                }
+                JsonValue::Object(map) => {
+                    out.push('{');
+                    if map.is_empty() {
+                        out.push('}');
+                    } else {
+                        stack.push(SerItem::Raw("}"));
+                        let len = map.len();
+                        for (idx, (k, elem)) in map.iter().rev().enumerate() {
+                            stack.push(SerItem::Value(elem));
+                            stack.push(SerItem::Raw(":"));
+                            stack.push(SerItem::Key(k));
+                            if idx + 1 < len {
+                                stack.push(SerItem::Raw(","));
+                            }
+                        }
+                    }
+                }
+            },
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -480,6 +580,80 @@ mod tests {
                 "expected parse err: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn enforces_max_nesting_depth_without_stack_overflow() {
+        let exact_arr = format!(
+            "{}1{}",
+            "[".repeat(MAX_JSON_DEPTH),
+            "]".repeat(MAX_JSON_DEPTH)
+        );
+        assert!(parse_json(&exact_arr).is_ok());
+
+        let deep_arr = format!(
+            "{}1{}",
+            "[".repeat(MAX_JSON_DEPTH + 1),
+            "]".repeat(MAX_JSON_DEPTH + 1)
+        );
+        let err = parse_json(&deep_arr).unwrap_err();
+        assert!(err.message.contains("depth"));
+
+        let exact_obj = format!(
+            "{}1{}",
+            "{\"a\":".repeat(MAX_JSON_DEPTH),
+            "}".repeat(MAX_JSON_DEPTH)
+        );
+        assert!(parse_json(&exact_obj).is_ok());
+
+        let deep_obj = format!(
+            "{}1{}",
+            "{\"a\":".repeat(MAX_JSON_DEPTH + 1),
+            "}".repeat(MAX_JSON_DEPTH + 1)
+        );
+        assert!(parse_json(&deep_obj).is_err());
+
+        let very_deep_arr = format!("{}1{}", "[".repeat(4096), "]".repeat(4096));
+        assert!(parse_json(&very_deep_arr).is_err());
+    }
+
+    #[test]
+    fn serializes_nonfinite_numbers_as_null_and_deep_values_iteratively() {
+        assert_eq!(to_json_string(&JsonValue::Number(f64::NAN)), "null");
+        assert_eq!(to_json_string(&JsonValue::Number(f64::INFINITY)), "null");
+        assert_eq!(
+            to_json_string(&JsonValue::Number(f64::NEG_INFINITY)),
+            "null"
+        );
+        assert_eq!(to_json_string(&JsonValue::Number(-0.0)), "0");
+
+        let arr = JsonValue::Array(vec![
+            JsonValue::Number(1.0),
+            JsonValue::Number(f64::NAN),
+            JsonValue::Number(f64::INFINITY),
+            JsonValue::Number(2.5),
+        ]);
+        let serialized = to_json_string(&arr);
+        assert_eq!(serialized, "[1,null,null,2.5]");
+        assert_eq!(
+            parse_json(&serialized).unwrap(),
+            JsonValue::Array(vec![
+                JsonValue::Number(1.0),
+                JsonValue::Null,
+                JsonValue::Null,
+                JsonValue::Number(2.5),
+            ])
+        );
+
+        let mut nested = JsonValue::Number(42.0);
+        for _ in 0..256 {
+            let mut map = BTreeMap::new();
+            map.insert("k".to_string(), nested);
+            nested = JsonValue::Object(map);
+        }
+        let deep_out = to_json_string(&nested);
+        assert!(deep_out.starts_with("{\"k\":"));
+        assert!(deep_out.ends_with(&format!("42{}", "}".repeat(256))));
     }
 
     #[test]

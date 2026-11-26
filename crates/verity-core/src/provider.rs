@@ -166,79 +166,145 @@ fn is_valid_reg_host_bytes(host: &[u8]) -> bool {
     if first == b'.' || first == b'-' || last == b'.' || last == b'-' {
         return false;
     }
-    let mut prev_dot = false;
+    let mut prev = b'.';
     let mut i = 0usize;
     while i < host.len() {
         let b = host[i];
-        let ok = b.is_ascii_alphanumeric() || b == b'.' || b == b'-';
-        if !ok {
+        if !(b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
             return false;
         }
-        if b == b'.' {
-            if prev_dot {
-                return false;
-            }
-            prev_dot = true;
-        } else {
-            prev_dot = false;
+        if b == b'.' && (prev == b'.' || prev == b'-') {
+            return false;
         }
+        if b == b'-' && prev == b'.' {
+            return false;
+        }
+        prev = b;
         i += 1;
     }
     true
 }
 
-fn is_valid_ipv6_literal_inner(inner: &[u8]) -> bool {
-    if inner.is_empty() {
-        return false;
+fn parse_ipv4_octets(host: &[u8]) -> Option<[u8; 4]> {
+    if host.len() < 7 || host.len() > 15 {
+        return None;
     }
-    let mut has_colon = false;
-    let mut i = 0usize;
-    while i < inner.len() {
-        let b = inner[i];
-        if b == b':' {
-            has_colon = true;
-        } else if !(b.is_ascii_hexdigit() || b == b'.') {
-            return false;
-        }
-        i += 1;
-    }
-    has_colon
-}
-
-fn is_ipv4_loopback_bytes(host: &[u8]) -> bool {
-    if host.len() < 9 || host.len() > 15 || !starts_with_bytes(host, b"127.") {
-        return false;
-    }
-    let mut idx = 4usize;
-    let mut octets = 1usize;
-    while octets < 4 {
+    let mut octets = [0u8; 4];
+    let mut idx = 0usize;
+    let mut part = 0usize;
+    while part < 4 {
         let start = idx;
         let mut val = 0u32;
         let mut digits = 0usize;
         while idx < host.len() && host[idx] != b'.' {
             let b = host[idx];
             if !b.is_ascii_digit() {
-                return false;
+                return None;
             }
             digits += 1;
             if digits > 3 {
-                return false;
+                return None;
             }
             val = val * 10 + (b - b'0') as u32;
             idx += 1;
         }
         if digits == 0 || (digits > 1 && host[start] == b'0') || val > 255 {
-            return false;
+            return None;
         }
-        octets += 1;
-        if octets < 4 {
+        octets[part] = val as u8;
+        part += 1;
+        if part < 4 {
             if idx >= host.len() || host[idx] != b'.' {
-                return false;
+                return None;
             }
             idx += 1;
         }
     }
-    idx == host.len()
+    if idx == host.len() {
+        Some(octets)
+    } else {
+        None
+    }
+}
+
+fn is_valid_ipv6_literal_inner(inner: &[u8]) -> bool {
+    if inner.len() < 2 || inner.len() > 45 {
+        return false;
+    }
+    let mut has_double_colon = false;
+    let mut groups = 0usize;
+    let mut i = 0usize;
+
+    if inner[0] == b':' {
+        if inner[1] != b':' {
+            return false;
+        }
+        has_double_colon = true;
+        i = 2;
+    }
+
+    while i < inner.len() {
+        let mut j = i;
+        let mut saw_dot = false;
+        while j < inner.len() && inner[j] != b':' {
+            let b = inner[j];
+            if b == b'.' {
+                saw_dot = true;
+                break;
+            }
+            if !b.is_ascii_hexdigit() {
+                return false;
+            }
+            j += 1;
+        }
+
+        if saw_dot {
+            if groups + 2 > 8 || parse_ipv4_octets(&inner[i..]).is_none() {
+                return false;
+            }
+            groups += 2;
+            break;
+        }
+
+        let seg_len = j - i;
+        if seg_len == 0 || seg_len > 4 {
+            return false;
+        }
+        groups += 1;
+        if groups > 8 {
+            return false;
+        }
+
+        if j == inner.len() {
+            break;
+        }
+
+        if j + 1 < inner.len() && inner[j + 1] == b':' {
+            if has_double_colon {
+                return false;
+            }
+            has_double_colon = true;
+            i = j + 2;
+            if i < inner.len() && inner[i] == b':' {
+                return false;
+            }
+        } else {
+            i = j + 1;
+            if i == inner.len() {
+                return false;
+            }
+        }
+    }
+
+    if has_double_colon {
+        groups <= 7
+    } else {
+        groups == 8
+    }
+}
+
+fn is_ipv4_loopback_bytes(host: &[u8]) -> bool {
+    matches!(parse_ipv4_octets(host), Some([127, _, _, _]))
 }
 
 /// Allocation-free loopback host predicate verified directly by Kani.
@@ -386,4 +452,75 @@ pub fn validate_provider_url(url: &str) -> Result<(), ProviderError> {
 /// Validates an external sign-in URL (`https://` strictly).
 pub fn validate_external_sign_in_url(url: &str) -> Result<(), ProviderError> {
     validate_external_sign_in_url_bytes(url.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_ipv6_bracket_literals_and_ports_beyond_kani_range() {
+        for valid in [
+            "http://[::1]:8080/v1",
+            "https://[::1]:443/v1",
+            "https://[2001:db8::1]/v1",
+            "https://[2001:db8:85a3:0:0:8a2e:370:7334]:8443/v1",
+            "https://[::ffff:127.0.0.1]:8080/v1",
+            "https://[1:2:3:4:5:6:192.0.2.1]/v1",
+            "https://[1::]/v1",
+            "https://[::]/v1",
+        ] {
+            assert!(
+                validate_provider_url(valid).is_ok(),
+                "expected valid IPv6 URL: {valid}"
+            );
+        }
+
+        for invalid in [
+            "https://[:]/v1",
+            "https://[:::]/v1",
+            "https://[:1]/v1",
+            "https://[1:]/v1",
+            "https://[1::2::3]/v1",
+            "https://[12345::1]/v1",
+            "https://[1:2:3:4:5:6:7:8:9]/v1",
+            "https://[1:2:3:4:5:6:7::8]/v1",
+            "https://[1:2:3:4:5:6:7:1.2.3.4]/v1",
+            "https://[::ffff:999.0.0.1]/v1",
+            "https://[::1.2.3]/v1",
+            "https://[::1.2.3.4:5]/v1",
+            "https://[192.168.1.1::]/v1",
+            "https://[::1]:/v1",
+            "https://[::1]:0/v1",
+            "https://[::1]:65536/v1",
+            "https://[::1]:080/v1",
+            "https://[::1]extra/v1",
+            "https://[::1/v1",
+            "https://[]/v1",
+        ] {
+            assert!(
+                validate_provider_url(invalid).is_err(),
+                "expected invalid IPv6 URL: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_reg_host_label_and_documented_at_policy() {
+        assert!(validate_provider_url("https://api-1.example.com:8443/v1").is_ok());
+        assert!(validate_provider_url("https://192.168.1.10:8080/v1").is_ok());
+        assert_eq!(
+            validate_provider_url("https://a.-b.com/v1"),
+            Err(ProviderError::InvalidHost)
+        );
+        assert_eq!(
+            validate_provider_url("https://a-.b.com/v1"),
+            Err(ProviderError::InvalidHost)
+        );
+        // Preserves current documented / verdict_gate.rs invariant rejecting '@' anywhere in URL.
+        assert_eq!(
+            validate_provider_url("https://api.example.com/@org/v1"),
+            Err(ProviderError::EmbeddedCredentials)
+        );
+    }
 }

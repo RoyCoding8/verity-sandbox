@@ -2,7 +2,8 @@
 
 #[cfg(kani)]
 use verity_core::json::{
-    decode_utf16_surrogate_pair, parse_hex4_bytes, validate_json_number_bytes,
+    classify_json_escape, classify_json_number, decode_utf16_surrogate_pair, parse_hex4_bytes,
+    validate_json_number_bytes, JsonEscape, JsonNumberKind,
 };
 
 /// Law: UTF-16 surrogate pair decoding and 4-byte hex parsing are total,
@@ -100,8 +101,8 @@ pub fn prove_json_number_syntax_laws() {
         }
     }
 
-    let mut has_dot = false;
-    let mut has_exp = false;
+    let mut dot_count = 0usize;
+    let mut exp_count = 0usize;
     let mut i = 0usize;
     while i < len {
         let b = bytes[i];
@@ -109,13 +110,21 @@ pub fn prove_json_number_syntax_laws() {
             assert!(matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'));
         }
         if b == b'.' {
-            has_dot = true;
+            dot_count += 1;
         }
         if b == b'e' || b == b'E' {
-            has_exp = true;
+            exp_count += 1;
         }
         i += 1;
     }
+
+    if valid {
+        assert!(dot_count <= 1);
+        assert!(exp_count <= 1);
+    }
+
+    let has_dot = dot_count > 0;
+    let has_exp = exp_count > 0;
 
     // Valid classes
     kani::cover!(
@@ -141,5 +150,84 @@ pub fn prove_json_number_syntax_laws() {
     kani::cover!(
         !valid && bytes == b"1e-",
         "number_reject_dangling_exp_minus"
+    );
+    kani::cover!(!valid && bytes == b"1.2.3", "number_reject_double_dot");
+}
+
+/// Law: JSON number serialization classification never emits non-finite floats
+/// (all NaN/+Inf/-Inf bit patterns map to `NonFinite`), and string escape
+/// classification never passes through control chars (< 0x20), `"`, or `\`.
+#[cfg(kani)]
+#[kani::proof]
+pub fn prove_json_number_serialization_and_escape_laws() {
+    // 1. All non-finite IEEE-754 bit patterns (sign=0/1, exp=0x7ff, any mantissa) -> NonFinite.
+    let sign: u64 = kani::any();
+    let mantissa: u64 = kani::any();
+    let nonfinite_bits =
+        ((sign & 1) << 63) | (0x7ff_u64 << 52) | (mantissa & 0x000f_ffff_ffff_ffff);
+    let nonfinite = f64::from_bits(nonfinite_bits);
+    assert!(!nonfinite.is_finite());
+    assert_eq!(classify_json_number(nonfinite), JsonNumberKind::NonFinite);
+    kani::cover!(nonfinite.is_nan(), "nonfinite_nan_classified");
+    kani::cover!(
+        nonfinite.is_infinite() && nonfinite.is_sign_positive(),
+        "nonfinite_pos_inf_classified"
+    );
+    kani::cover!(
+        nonfinite.is_infinite() && nonfinite.is_sign_negative(),
+        "nonfinite_neg_inf_classified"
+    );
+
+    // 2. Bounded finite integers convert losslessly without overflow.
+    let iv: i32 = kani::any();
+    let int_f = iv as f64;
+    assert_eq!(
+        classify_json_number(int_f),
+        JsonNumberKind::Integer(iv as i64)
+    );
+    assert_eq!(classify_json_number(-0.0), JsonNumberKind::Integer(0));
+
+    // 3. Bounded non-integer finite values stay finite Float.
+    let half_base: i16 = kani::any();
+    let frac_f = (half_base as f64) + 0.5;
+    match classify_json_number(frac_f) {
+        JsonNumberKind::Float(f) => assert!(f.is_finite()),
+        _ => unreachable!("x + 0.5 for i16 must classify as finite Float"),
+    }
+
+    // Large finite integer at threshold >= 1e15 falls back to finite Float.
+    assert_eq!(classify_json_number(1e15), JsonNumberKind::Float(1e15));
+
+    // 4. Total escape classification across all Unicode scalar values `char`.
+    let ch: char = kani::any();
+    let esc = classify_json_escape(ch);
+    if (ch as u32) < 0x20 || ch == '"' || ch == '\\' {
+        assert!(!matches!(esc, JsonEscape::Passthrough));
+    }
+    match esc {
+        JsonEscape::Static(s) => {
+            assert!(s.as_bytes()[0] == b'\\');
+            assert!(matches!(ch, '"' | '\\' | '\n' | '\r' | '\t'));
+        }
+        JsonEscape::UnicodeControl(b) => {
+            assert!(b < 0x20);
+            assert_eq!(b as u32, ch as u32);
+        }
+        JsonEscape::Passthrough => {
+            assert!((ch as u32) >= 0x20 && ch != '"' && ch != '\\');
+        }
+    }
+
+    kani::cover!(
+        matches!(esc, JsonEscape::Static(_)),
+        "escape_static_reachable"
+    );
+    kani::cover!(
+        matches!(esc, JsonEscape::UnicodeControl(_)),
+        "escape_control_reachable"
+    );
+    kani::cover!(
+        matches!(esc, JsonEscape::Passthrough),
+        "escape_passthrough_reachable"
     );
 }

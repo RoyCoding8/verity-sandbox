@@ -44,7 +44,8 @@ impl fmt::Display for TypeError {
 impl std::error::Error for TypeError {}
 
 /// Pure, allocation-free byte validator for `TaskId` (used by both runtime and Kani proofs).
-/// Rejects empty/oversized IDs, `.`, `..`, any `..` traversal substring, and non-safe characters.
+/// Rejects empty/oversized IDs, `.`, `..`, any `..` traversal substring, trailing `.`,
+/// `.git`, Windows reserved device names, and non-safe characters.
 pub fn validate_task_id_bytes(bytes: &[u8]) -> Result<(), TypeError> {
     if bytes.is_empty() || bytes.len() > 128 {
         return Err(TypeError::EmptyTaskId);
@@ -64,6 +65,19 @@ pub fn validate_task_id_bytes(bytes: &[u8]) -> Result<(), TypeError> {
         }
         prev_dot = b == b'.';
         i += 1;
+    }
+    let mut dot_trim = bytes.len();
+    while dot_trim > 0 && bytes[dot_trim - 1] == b'.' {
+        dot_trim -= 1;
+    }
+    if eq_ignore_ascii_case(&bytes[..dot_trim], b".git") {
+        return Err(TypeError::DotGitSegment);
+    }
+    if is_windows_reserved_bytes(bytes) {
+        return Err(TypeError::ReservedDeviceName);
+    }
+    if dot_trim < bytes.len() {
+        return Err(TypeError::InvalidTaskIdChar);
     }
     Ok(())
 }
@@ -126,6 +140,9 @@ fn is_windows_reserved_bytes(segment: &[u8]) -> bool {
     while stem_len < segment.len() && segment[stem_len] != b'.' {
         stem_len += 1;
     }
+    while stem_len > 0 && segment[stem_len - 1] == b' ' {
+        stem_len -= 1;
+    }
     let stem = &segment[..stem_len];
     if stem.len() == 3 {
         eq_ignore_ascii_case(stem, b"CON")
@@ -138,15 +155,24 @@ fn is_windows_reserved_bytes(segment: &[u8]) -> bool {
             return false;
         }
         eq_ignore_ascii_case(&stem[..3], b"COM") || eq_ignore_ascii_case(&stem[..3], b"LPT")
+    } else if stem.len() == 6 {
+        eq_ignore_ascii_case(stem, b"CONIN$") || eq_ignore_ascii_case(stem, b"CONOUT$")
     } else {
         false
     }
 }
 
 /// Pure, allocation-free byte validator for `RelPath` (used by both runtime and Kani proofs).
-/// Rejects empty paths, leading `/`, Windows drive prefixes (`C:`), backslashes `\`,
-/// ASCII control chars (`< 0x20` or `0x7f`), empty/`.`/`..` segments, `.git`, and Windows reserved device names.
+/// Rejects empty paths, leading `/`, Windows drive prefixes (`C:`), colons `:`, backslashes `\`,
+/// ASCII control chars (`< 0x20` or `0x7f`), empty/`.`/`..`/trailing-space-or-dot segments,
+/// `.git`, and Windows reserved device names.
 pub fn validate_rel_path_bytes(raw: &[u8]) -> Result<usize, TypeError> {
+    if raw.is_empty() {
+        return Err(TypeError::EmptyPath);
+    }
+    if raw[0] == b'/' {
+        return Err(TypeError::AbsolutePath);
+    }
     let mut end = raw.len();
     while end > 0 && raw[end - 1] == b'/' {
         end -= 1;
@@ -155,9 +181,6 @@ pub fn validate_rel_path_bytes(raw: &[u8]) -> Result<usize, TypeError> {
         return Err(TypeError::EmptyPath);
     }
     let trimmed = &raw[..end];
-    if trimmed[0] == b'/' {
-        return Err(TypeError::AbsolutePath);
-    }
     if trimmed.len() >= 2 && trimmed[0].is_ascii_alphabetic() && trimmed[1] == b':' {
         return Err(TypeError::AbsolutePath);
     }
@@ -170,6 +193,9 @@ pub fn validate_rel_path_bytes(raw: &[u8]) -> Result<usize, TypeError> {
         if b < 0x20 || b == 0x7f {
             return Err(TypeError::ControlCharInPath);
         }
+        if b == b':' {
+            return Err(TypeError::AbsolutePath);
+        }
         i += 1;
     }
 
@@ -181,11 +207,22 @@ pub fn validate_rel_path_bytes(raw: &[u8]) -> Result<usize, TypeError> {
             if segment.is_empty() || segment == b"." || segment == b".." {
                 return Err(TypeError::TraversalSegment);
             }
-            if eq_ignore_ascii_case(segment, b".git") {
+            let mut norm_end = segment.len();
+            while norm_end > 0 && (segment[norm_end - 1] == b' ' || segment[norm_end - 1] == b'.') {
+                norm_end -= 1;
+            }
+            let win_norm = &segment[..norm_end];
+            if win_norm.is_empty() {
+                return Err(TypeError::TraversalSegment);
+            }
+            if eq_ignore_ascii_case(win_norm, b".git") {
                 return Err(TypeError::DotGitSegment);
             }
             if is_windows_reserved_bytes(segment) {
                 return Err(TypeError::ReservedDeviceName);
+            }
+            if norm_end < segment.len() {
+                return Err(TypeError::TraversalSegment);
             }
             seg_start = idx + 1;
         }
@@ -418,4 +455,84 @@ pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_id_rejects_windows_reserved_and_unsafe_names_beyond_kani_range() {
+        for bad in [
+            "CON",
+            "con",
+            "prn.txt",
+            "AUX.json",
+            "nul.",
+            "COM1",
+            "com9.log",
+            "LPT1",
+            "lpt9.json",
+            ".git",
+            ".GIT",
+            ".git.",
+            "task.",
+        ] {
+            assert!(
+                TaskId::parse(bad).is_err(),
+                "expected TaskId rejection for {bad}"
+            );
+        }
+        assert_eq!(TaskId::parse("CON"), Err(TypeError::ReservedDeviceName));
+        assert_eq!(
+            TaskId::parse("com1.json"),
+            Err(TypeError::ReservedDeviceName)
+        );
+        assert_eq!(TaskId::parse(".git"), Err(TypeError::DotGitSegment));
+        assert_eq!(TaskId::parse(&"a".repeat(129)), Err(TypeError::EmptyTaskId));
+
+        assert!(TaskId::parse("task-1.v2_alpha").is_ok());
+        assert!(TaskId::parse(&"a".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn rel_path_rejects_unsafe_windows_and_root_classifications_beyond_kani_range() {
+        assert_eq!(RelPath::parse("/"), Err(TypeError::AbsolutePath));
+        assert_eq!(RelPath::parse("///"), Err(TypeError::AbsolutePath));
+        assert_eq!(
+            RelPath::parse("src/CON.txt"),
+            Err(TypeError::ReservedDeviceName)
+        );
+        assert_eq!(
+            RelPath::parse("src/CON .txt"),
+            Err(TypeError::ReservedDeviceName)
+        );
+        assert_eq!(
+            RelPath::parse("src/CONIN$"),
+            Err(TypeError::ReservedDeviceName)
+        );
+        assert_eq!(
+            RelPath::parse("src/.git./config"),
+            Err(TypeError::DotGitSegment)
+        );
+        assert_eq!(
+            RelPath::parse("src/.git /config"),
+            Err(TypeError::DotGitSegment)
+        );
+        assert_eq!(
+            RelPath::parse("src/file.txt:stream"),
+            Err(TypeError::AbsolutePath)
+        );
+        assert_eq!(
+            RelPath::parse("Cargo.toml."),
+            Err(TypeError::TraversalSegment)
+        );
+        assert_eq!(
+            RelPath::parse("Cargo.toml "),
+            Err(TypeError::TraversalSegment)
+        );
+
+        assert_eq!(RelPath::parse("src/").unwrap().as_str(), "src");
+        assert!(RelPath::parse(".github/workflows/ci.yml").is_ok());
+    }
 }
