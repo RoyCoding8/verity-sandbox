@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use verity_core::{CommitOid, RelPath, TaskId};
 
+#[cfg(test)]
+mod approval_trace;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
     CommandFailed {
@@ -68,7 +71,10 @@ pub fn run_git(repo_dir: &Path, args: &[&str]) -> Result<Output, GitError> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    cmd.output().map_err(|e| GitError::Io(e.to_string()))
+    let output = cmd.output().map_err(|e| GitError::Io(e.to_string()))?;
+    #[cfg(test)]
+    approval_trace::after_command(repo_dir, args, &output);
+    Ok(output)
 }
 
 fn require_git_ok(repo_dir: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
@@ -184,7 +190,8 @@ pub fn commit_worktree_changes(worktree_dir: &Path, message: &str) -> Result<Com
         .ok_or_else(|| GitError::InvalidOutput("missing HEAD after commit".to_string()))
 }
 
-/// Extracts changed paths between two commits via NUL-delimited git diff.
+/// Extracts validated regular-file changes from both sides of a committed diff.
+/// Git tree names are case-sensitive, regardless of the checkout filesystem.
 pub fn changed_paths(
     repo_dir: &Path,
     base: &CommitOid,
@@ -196,20 +203,43 @@ pub fn changed_paths(
             "diff",
             "--no-ext-diff",
             "--no-renames",
-            "--name-only",
+            "--raw",
+            "--no-abbrev",
+            "--ignore-submodules=none",
             "-z",
             base.as_str(),
             head.as_str(),
         ],
     )?;
     let mut out = Vec::new();
-    for raw in bytes.split(|&b| b == 0) {
-        if raw.is_empty() {
-            continue;
-        }
-        let s = std::str::from_utf8(raw)
+    if bytes.is_empty() {
+        return Ok(out);
+    }
+    let records = bytes
+        .strip_suffix(&[0])
+        .ok_or_else(|| GitError::InvalidOutput("unterminated raw git diff".into()))?;
+    let mut fields = records.split(|&b| b == 0);
+    while let Some(header) = fields.next() {
+        let name = fields
+            .next()
+            .ok_or_else(|| GitError::InvalidOutput("missing path in raw git diff".into()))?;
+        let s = std::str::from_utf8(name)
             .map_err(|_| GitError::InvalidOutput("non-utf8 path in git diff".to_string()))?;
         let rel = RelPath::parse(s).map_err(|e| GitError::InvalidOutput(e.to_string()))?;
+        let mut mode_fields = header.split(|&b| b == b' ');
+        let old_mode = mode_fields
+            .next()
+            .and_then(|field| field.strip_prefix(b":"));
+        let new_mode = mode_fields.next();
+        if ![old_mode, new_mode]
+            .into_iter()
+            .all(|mode| matches!(mode, Some(b"000000" | b"100644" | b"100755")))
+        {
+            return Err(GitError::InvalidOutput(format!(
+                "non-regular file in committed diff: {}",
+                rel.as_str()
+            )));
+        }
         out.push(rel);
     }
     Ok(out)

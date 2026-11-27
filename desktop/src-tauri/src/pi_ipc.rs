@@ -3558,6 +3558,231 @@ mod tests {
     }
 
     #[test]
+    fn restore_model_pi_boundaries() {
+        use crate::snapshots::checkpoints_path_for_project;
+        use crate::snapshots::tests::{
+            observe_restore, print_restore_trace, with_checkpoint_write_blocked,
+            RestoreObservation, TestEnv,
+        };
+
+        let script = r#"
+const fs = require("node:fs");
+const lines = require("node:readline").createInterface({ input: process.stdin });
+const [scenario, checkpoints] = process.argv.slice(1);
+let session = "Parent";
+function observe(event) {
+  const read = (name) => fs.readFileSync(name, "utf8").trim();
+  const redo = JSON.parse(read(checkpoints)).lastRedo !== null;
+  const state = [event, [read("a.txt"), read("z.txt")], read("sibling.txt"), session, redo];
+  fs.appendFileSync("../pi-restore-trace.jsonl", JSON.stringify(state) + "\n");
+}
+lines.on("line", (line) => {
+  const input = JSON.parse(line);
+  const reply = { type: "response", id: input.id, command: input.type, success: true };
+  switch (input.type) {
+    case "get_state":
+      reply.data = { id: session, name: session };
+      break;
+    case "get_messages":
+      reply.data = { messages: [] };
+      break;
+    case "get_fork_messages":
+      reply.data = { messages: [
+        { entryId: "first", role: "user", preview: "First" },
+        { entryId: "second", role: "user", preview: "Second" },
+      ] };
+      break;
+    case "fork":
+      observe("PiFork");
+      if (scenario === "compensation_stale") {
+        fs.writeFileSync("a.txt", "Edited\n");
+        observe("EditedPath");
+      }
+      if (scenario === "fallback" || scenario.startsWith("compensation")) {
+        reply.success = false;
+        reply.error = "Test Pi rejected fork";
+        if (scenario !== "fallback") observe("PiRejected");
+      } else {
+        session = "Child";
+        observe("PiAccepted");
+        reply.data = { id: session, name: session, messages: [] };
+      }
+      break;
+    case "new_session":
+      observe("PiNewSession");
+      session = "Child";
+      observe("PiAccepted");
+      reply.data = { id: session, name: session };
+      break;
+  }
+  console.log(JSON.stringify(reply));
+});
+"#;
+
+        for scenario in [
+            "fallback",
+            "compensation",
+            "compensation_stale",
+            "save_failure",
+            "clear_failure",
+        ] {
+            let env = TestEnv::new(scenario, true);
+            env.write("a.txt", "Checkpoint\n");
+            env.write("z.txt", "Checkpoint\n");
+            env.write("sibling.txt", "Before\n");
+            let target = env.capture();
+            let entry = if scenario == "fallback" {
+                "first"
+            } else {
+                "second"
+            };
+            record_turn_checkpoint(
+                &env.project,
+                "Parent".into(),
+                entry.into(),
+                None,
+                String::new(),
+                target.clone(),
+            )
+            .unwrap();
+            env.write("a.txt", "Before\n");
+            env.write("z.txt", "Before\n");
+            let before = env.capture();
+
+            let mut config = PiSessionConfig::default_pi(env.project.clone());
+            config.program = "node".into();
+            config.args = vec![
+                "-e".into(),
+                script.into(),
+                scenario.into(),
+                checkpoints_path_for_project(&env.project)
+                    .to_string_lossy()
+                    .into_owned(),
+            ];
+            let state = PiAppState::with_config(
+                env.project.clone(),
+                env.root.join("providers.json"),
+                config,
+            );
+            let sink: EventSink = Arc::new(|_| {});
+            let boot = state.bootstrap_with_sink(Arc::clone(&sink));
+            assert_eq!(boot.active_session_id, "Parent");
+            let revert =
+                || state.revert_turn_with_sink(Arc::clone(&sink), entry.into(), true, None, None);
+            let result = if scenario == "save_failure" {
+                with_checkpoint_write_blocked(&env.project, revert)
+            } else {
+                revert()
+            };
+            let mut trace: Vec<RestoreObservation> =
+                fs::read_to_string(env.root.join("pi-restore-trace.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            let active_session = || {
+                state
+                    .inner
+                    .active_session_id
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap()
+            };
+            let mut observe =
+                |event| trace.push(observe_restore(&env.project, event, &active_session()));
+
+            if scenario.starts_with("compensation") {
+                let err = result.unwrap_err();
+                assert!(err.contains("Test Pi rejected fork"), "{err}");
+                let stale = scenario == "compensation_stale";
+                assert_eq!(err.contains("stale redo"), stale, "{err}");
+                let a_expected = if stale { "Edited\n" } else { "Before\n" };
+                assert_eq!(
+                    fs::read_to_string(env.project.join("a.txt")).unwrap(),
+                    a_expected
+                );
+                assert_eq!(
+                    fs::read_to_string(env.project.join("z.txt")).unwrap(),
+                    if stale { "Checkpoint\n" } else { "Before\n" }
+                );
+                assert!(load_checkpoint_store(&env.project).last_redo.is_none());
+                observe(if stale {
+                    "CompensationStale"
+                } else {
+                    "Compensated"
+                });
+            } else {
+                let reverted = result.unwrap();
+                assert_eq!(reverted.session.id, "Child");
+                assert!(reverted.code_reverted);
+                assert_eq!(reverted.reverted_files, ["a.txt", "z.txt"]);
+                assert_eq!(env.capture(), target);
+                if scenario == "save_failure" {
+                    assert!(!reverted.can_redo);
+                    assert!(reverted
+                        .code_revert_note
+                        .unwrap()
+                        .contains("failed to write temp checkpoints file"));
+                    assert!(load_checkpoint_store(&env.project).last_redo.is_none());
+                    observe("RedoSaveFailed");
+                } else {
+                    assert!(reverted.can_redo);
+                    let persisted = load_checkpoint_store(&env.project).last_redo.unwrap();
+                    assert_eq!(persisted.session_id.as_deref(), Some("Child"));
+                    assert_eq!(persisted.target_tree_oid.as_deref(), Some(target.as_str()));
+                    assert_eq!(persisted.redo_tree_oid, before);
+                    assert_eq!(persisted.files, ["a.txt", "z.txt"]);
+                    observe("RedoSaved");
+                    if scenario == "clear_failure" {
+                        let err = redo_last_revert(&env.project, Some("Parent")).unwrap_err();
+                        assert!(
+                            err.contains("active session does not match revert owner"),
+                            "{err}"
+                        );
+                        observe("RedoWrongOwner");
+                        env.write("sibling.txt", "Edited\n");
+                        observe("EditedSibling");
+                        let err = with_checkpoint_write_blocked(&env.project, || {
+                            state.redo_revert_with_sink()
+                        })
+                        .unwrap_err();
+                        assert!(
+                            err.contains("failed to write temp checkpoints file"),
+                            "{err}"
+                        );
+                        assert_eq!(
+                            load_checkpoint_store(&env.project).last_redo.as_ref(),
+                            Some(&persisted)
+                        );
+                        observe("RedoClearFailed");
+                        assert!(state
+                            .redo_revert_with_sink()
+                            .unwrap_err()
+                            .contains("stale redo"));
+                        observe("RedoStale");
+                    } else {
+                        assert_eq!(
+                            state.redo_revert_with_sink().unwrap().restored_files,
+                            ["a.txt", "z.txt"]
+                        );
+                        assert_eq!(env.capture(), before);
+                        assert!(load_checkpoint_store(&env.project).last_redo.is_none());
+                        observe("RedoCleared");
+                        assert!(state
+                            .redo_revert_with_sink()
+                            .unwrap_err()
+                            .contains("No revert operation"));
+                        observe("RedoUnavailable");
+                    }
+                }
+            }
+            state.shutdown();
+            print_restore_trace(scenario, &trace);
+        }
+    }
+
+    #[test]
     fn session_wire_replies_commit_only_confirmed_workspace_and_prompt_target() {
         let root = unique_temp_dir("session-wire");
         let alpha = root.join("alpha");

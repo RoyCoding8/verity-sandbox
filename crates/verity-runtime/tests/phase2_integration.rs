@@ -131,6 +131,41 @@ fn git_reports_execution_failures_separately_from_missing_refs_and_conflicts() {
 }
 
 #[test]
+fn committed_scope_input_rejects_symlink_and_submodule_changes_on_either_side() {
+    let repo = temp_dir("scope_entry_modes");
+    init_test_repo(&repo);
+    let base = read_ref(&repo, "HEAD").unwrap().unwrap();
+    let git = |args: &[&str]| {
+        let output = verity_runtime::git::run_git(&repo, args).unwrap();
+        assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let blob = git(&["rev-parse", "HEAD:lib.rs"]);
+
+    for (mode, object, path) in [
+        ("120000", blob.as_str(), "file-link"),
+        ("160000", base.as_str(), "nested-module"),
+    ] {
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("{mode},{object},{path}"),
+        ]);
+        let tree = CommitOid::parse(&git(&["write-tree"])).unwrap();
+        let changed = commit_tree(&repo, &tree, &[&base], "fixture entry").unwrap();
+        for (from, to) in [(&base, &changed), (&changed, &base)] {
+            assert!(
+                matches!(changed_paths(&repo, from, to), Err(GitError::InvalidOutput(message))
+                    if message == format!("non-regular file in committed diff: {path}"))
+            );
+        }
+        git(&["update-index", "--force-remove", "--", path]);
+    }
+    fs::remove_dir_all(&repo).unwrap();
+}
+
+#[test]
 fn sandbox_enforces_readonly_git_dir_and_writable_worktree() {
     if !bwrap_available() {
         return;

@@ -95,11 +95,15 @@ fn live_kani_approves_standalone_and_cargo_candidates() {
     ] {
         let task_id = TaskId::parse(id).unwrap();
         let source = format!(
-            r#"mod proofs {{
+            r#"fn apply_candidate(n: u8) -> u8 {{
+    n.saturating_add({offset})
+}}
+
+mod proofs {{
     #[kani::proof]
     fn verify_addition_preserves_input() {{
         let n: u8 = kani::any();
-        assert!(n.saturating_add({offset}) == n);
+        assert!(super::apply_candidate(n) == n);
         kani::cover!(n == 42, "forty_two");
     }}
 }}
@@ -201,6 +205,16 @@ fn live_lean_approves_matching_proof_and_rejects_different_statement() {
             VerdictStatus::Inconclusive,
         ),
         (
+            "placeholder",
+            "theorem smoke : True := by sorry\n",
+            VerdictStatus::Inconclusive,
+        ),
+        (
+            "custom-axiom",
+            "axiom unapproved : True\ntheorem smoke : True := unapproved\n",
+            VerdictStatus::Inconclusive,
+        ),
+        (
             "matching",
             "theorem smoke : True := by trivial\n",
             VerdictStatus::Pass,
@@ -243,11 +257,15 @@ fn live_lean_approves_matching_proof_and_rejects_different_statement() {
                 );
             }
             VerdictStatus::Inconclusive => {
-                assert!(
-                    verdict.reason.contains("theorem statement do not match"),
-                    "{}",
-                    verdict.reason
-                );
+                if id == "different" {
+                    assert!(
+                        verdict.reason.contains("theorem statement do not match"),
+                        "{}",
+                        verdict.reason
+                    );
+                } else {
+                    assert!(!record.handoff.hygiene.is_clean());
+                }
                 assert!(matches!(approved, Err(OrchestratorError::GateFailed(_))));
                 assert_eq!(read_ref(&repo, "HEAD").unwrap(), Some(base.clone()));
             }

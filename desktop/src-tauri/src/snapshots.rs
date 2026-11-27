@@ -917,15 +917,15 @@ pub(crate) mod tests {
     pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    struct TestEnv {
-        root: PathBuf,
-        project: PathBuf,
+    pub(crate) struct TestEnv {
+        pub(crate) root: PathBuf,
+        pub(crate) project: PathBuf,
         prev_vh: Option<String>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestEnv {
-        fn new(prefix: &str, init_git: bool) -> Self {
+        pub(crate) fn new(prefix: &str, init_git: bool) -> Self {
             let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
             let ts = SystemTime::now()
@@ -954,7 +954,7 @@ pub(crate) mod tests {
         fn path(&self, rel: &str) -> PathBuf {
             self.project.join(rel)
         }
-        fn write(&self, rel: &str, content: &str) {
+        pub(crate) fn write(&self, rel: &str, content: &str) {
             let full = self.path(rel);
             if let Some(p) = full.parent() {
                 fs::create_dir_all(p).unwrap();
@@ -972,7 +972,7 @@ pub(crate) mod tests {
                 fs::remove_file(full).unwrap();
             }
         }
-        fn capture(&self) -> String {
+        pub(crate) fn capture(&self) -> String {
             capture_snapshot(&self.project).unwrap()
         }
         fn revert(&self, oid: &str) -> Result<TargetedRevertOutcome, String> {
@@ -991,6 +991,88 @@ pub(crate) mod tests {
             }
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    pub(crate) struct RestoreObservation(String, [String; 2], String, String, bool);
+
+    pub(crate) fn observe_restore(
+        project: &Path,
+        event: &str,
+        session: &str,
+    ) -> RestoreObservation {
+        let read = |path| match fs::read_to_string(project.join(path)) {
+            Ok(content) => content.trim().to_owned(),
+            Err(err) if err.kind() == ErrorKind::NotFound => "Missing".into(),
+            Err(err) => panic!("failed to read {path}: {err}"),
+        };
+        RestoreObservation(
+            event.into(),
+            [read("a.txt"), read("z.txt")],
+            read("sibling.txt"),
+            session.into(),
+            load_checkpoint_store(project).last_redo.is_some(),
+        )
+    }
+
+    pub(crate) fn print_restore_trace(case: &str, steps: &[RestoreObservation]) {
+        println!(
+            "VERITY_RESTORE_TRACE {}",
+            serde_json::to_string(&(case, steps)).unwrap()
+        );
+    }
+
+    pub(crate) fn with_checkpoint_write_blocked<T>(project: &Path, run: impl FnOnce() -> T) -> T {
+        let seq = CHECKPOINT_TMP_COUNTER.load(Ordering::Relaxed);
+        let tmp = checkpoints_path_for_project(project)
+            .with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
+        fs::create_dir(&tmp).unwrap();
+        let result = run();
+        fs::remove_dir(tmp).unwrap();
+        result
+    }
+
+    #[test]
+    fn restore_model_snapshot_boundaries() {
+        let env = TestEnv::new("restore-model-files", true);
+        env.write("a.txt", "Checkpoint\n");
+        env.write("z.txt", "Checkpoint\n");
+        env.write("sibling.txt", "Before\n");
+        env.write(".gitattributes", "z.txt filter=verity-test\n");
+        let target = env.capture();
+        env.write("a.txt", "Before\n");
+        env.write("z.txt", "Before\n");
+
+        env.write(".gitignore", "z.txt\n");
+        let refusal = env.revert(&target).unwrap_err();
+        assert!(refusal.contains("preflight collision"), "{refusal}");
+        assert_eq!(env.read("a.txt"), "Before\n");
+        assert_eq!(env.read("z.txt"), "Before\n");
+        print_restore_trace(
+            "preflight",
+            &[observe_restore(&env.project, "PreflightRefused", "Parent")],
+        );
+        env.rm(".gitignore");
+
+        let shadow = shadow_git_dir_for_project(&env.project);
+        for (key, value) in [
+            ("filter.verity-test.clean", "cat"),
+            ("filter.verity-test.smudge", "exit 1"),
+            ("filter.verity-test.required", "true"),
+        ] {
+            run_git(Some(&shadow), Some(&env.project), &["config", key, value]).unwrap();
+        }
+        let failure = env.revert(&target).unwrap_err();
+        assert!(failure.contains("smudge filter"), "{failure}");
+        assert_eq!(env.read("a.txt"), "Checkpoint\n");
+        match fs::read_to_string(env.path("z.txt")) {
+            Ok(content) => assert_eq!(content, "Before\n"),
+            Err(err) => assert_eq!(err.kind(), ErrorKind::NotFound, "{err}"),
+        }
+        print_restore_trace(
+            "partial_apply",
+            &[observe_restore(&env.project, "ApplyFailed", "Parent")],
+        );
     }
 
     #[test]

@@ -1150,7 +1150,20 @@ fn classify_kani_export_with_crate(
         );
     }
     let expected_probes: Vec<&str> = target.probes.iter().map(String::as_str).collect();
-    classify_kani_report(&export.report, &expected_probes)
+    let verdict = classify_kani_report(&export.report, &expected_probes);
+    if verdict.status == VerdictStatus::Pass
+        && !export
+            .report
+            .checks
+            .iter()
+            .any(|check| check.kind == CheckKind::Assertion && check.status == CheckStatus::Success)
+    {
+        return no_checker_evidence(
+            VerdictStatus::InvalidReport,
+            "Kani did not report a successful assertion for the requested proof",
+        );
+    }
+    verdict
 }
 
 const KANI_CRATE: &str = "verity_candidate";
@@ -1537,6 +1550,22 @@ mod tests {
             assert_ne!(raw, KANI_PASS, "fixture field {from} is missing");
             assert!(parse_kani_json(&raw).is_err(), "accepted {to}");
         }
+    }
+
+    #[test]
+    fn candidate_kani_report_requires_more_than_implicit_safety_and_cover_checks() {
+        let target = KaniTarget {
+            name: "verify_pass".into(),
+            source: RelPath::parse("proof.rs").unwrap(),
+            line: 3,
+            probes: vec!["forty_two".into()],
+        };
+        let safety_only =
+            KANI_PASS.replace(r#""category": "assertion""#, r#""category": "overflow""#);
+        assert_ne!(safety_only, KANI_PASS);
+        let verdict = classify_kani_export(&safety_only, Some(0), Path::new("/worktree"), &target);
+        assert_eq!(verdict.status, VerdictStatus::InvalidReport);
+        assert!(verdict.reason.contains("successful assertion"));
     }
 
     #[test]

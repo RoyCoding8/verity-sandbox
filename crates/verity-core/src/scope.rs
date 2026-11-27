@@ -1,6 +1,19 @@
 use crate::types::RelPath;
 use std::fmt;
 
+#[cfg(verus_only)]
+use self::proof::{
+    approved_path, matches_prefix, path_bytes, scope_error, scope_result, stable_path_view,
+    within_prefix,
+};
+#[cfg(verus_only)]
+use vstd::prelude::*;
+#[cfg(verus_only)]
+use vstd::string::StringSliceAdditionalSpecFns;
+#[cfg(verus_only)]
+pub(crate) mod proof;
+
+#[cfg_attr(verus_only, verus_verify)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeError {
     EmptyDiff,
@@ -9,6 +22,7 @@ pub enum ScopeError {
 }
 
 /// Allocation-free scope violation classification referencing the offending index.
+#[cfg_attr(verus_only, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScopeViolationKind {
     EmptyDiff,
@@ -38,11 +52,22 @@ impl std::error::Error for ScopeError {}
 
 /// Allocation-free byte-level containment check: returns true if `prefix` is non-empty
 /// and `path` equals `prefix` or sits directly beneath `prefix/`.
+#[cfg_attr(verus_only, verus_spec(result =>
+    ensures result == within_prefix(path@, prefix@),
+    no_unwind
+))]
 pub fn within_bytes(path: &[u8], prefix: &[u8]) -> bool {
     if prefix.is_empty() || path.len() < prefix.len() {
         return false;
     }
     let mut i = 0usize;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            i <= prefix@.len() <= path@.len(),
+            0 < prefix@.len(),
+            forall|j: int| 0 <= j < i ==> path@[j] == prefix@[j],
+        decreases prefix@.len() - i,
+    ))]
     while i < prefix.len() {
         if path[i] != prefix[i] {
             return false;
@@ -53,16 +78,57 @@ pub fn within_bytes(path: &[u8], prefix: &[u8]) -> bool {
 }
 
 /// Allocation-free string containment check delegating to `within_bytes`.
+#[cfg_attr(verus_only, verus_spec(result =>
+    ensures result == within_prefix(path.spec_bytes(), prefix.spec_bytes()),
+    no_unwind
+))]
 pub fn within_str(path: &str, prefix: &str) -> bool {
     within_bytes(path.as_bytes(), prefix.as_bytes())
 }
 
 /// Returns true if `path` equals `prefix` or sits directly beneath `prefix/`.
+#[cfg_attr(verus_only, verus_spec(result =>
+    ensures result == within_prefix(path_bytes(path), path_bytes(prefix)),
+    no_unwind
+))]
 pub fn within(path: &RelPath, prefix: &RelPath) -> bool {
     within_str(path.as_str(), prefix.as_str())
 }
 
-/// Allocation-free core scope check verified directly by Kani.
+#[cfg_attr(verus_only, verus_spec(result =>
+    requires stable_path_view::<P>(),
+    ensures result == matches_prefix(path.spec_bytes(), prefixes@),
+    no_unwind
+))]
+fn matches_scope<P: AsRef<str>>(path: &str, prefixes: &[P]) -> bool {
+    let mut index = 0usize;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            stable_path_view::<P>(),
+            index <= prefixes@.len(),
+            forall|i: int| 0 <= i < index ==>
+                !within_prefix(path.spec_bytes(), #[trigger] path_bytes(&prefixes@[i])),
+        decreases prefixes@.len() - index,
+    ))]
+    while index < prefixes.len() {
+        if within_str(path, prefixes[index].as_ref()) {
+            #[cfg(verus_only)]
+            proof! {
+                assert(within_prefix(path.spec_bytes(), path_bytes(&prefixes@[index as int])));
+            }
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Allocation-free core scope check.
+#[cfg_attr(verus_only, verus_spec(result =>
+    requires stable_path_view::<P>(),
+    ensures scope_result(result, changed_paths@, write_scope@, forbidden@),
+    no_unwind
+))]
 pub fn check_scope_core<P: AsRef<str>>(
     changed_paths: &[P],
     write_scope: &[P],
@@ -72,25 +138,21 @@ pub fn check_scope_core<P: AsRef<str>>(
         return Err(ScopeViolationKind::EmptyDiff);
     }
     let mut index = 0usize;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            stable_path_view::<P>(),
+            0 < changed_paths@.len(),
+            index <= changed_paths@.len(),
+            forall|i: int| 0 <= i < index ==>
+                approved_path(#[trigger] path_bytes(&changed_paths@[i]), write_scope@, forbidden@),
+        decreases changed_paths@.len() - index,
+    ))]
     while index < changed_paths.len() {
         let path = changed_paths[index].as_ref();
-        let mut f_idx = 0usize;
-        while f_idx < forbidden.len() {
-            if within_str(path, forbidden[f_idx].as_ref()) {
-                return Err(ScopeViolationKind::ForbiddenPath { index });
-            }
-            f_idx += 1;
+        if matches_scope(path, forbidden) {
+            return Err(ScopeViolationKind::ForbiddenPath { index });
         }
-        let mut allowed = false;
-        let mut w_idx = 0usize;
-        while w_idx < write_scope.len() {
-            if within_str(path, write_scope[w_idx].as_ref()) {
-                allowed = true;
-                break;
-            }
-            w_idx += 1;
-        }
-        if !allowed {
+        if !matches_scope(path, write_scope) {
             return Err(ScopeViolationKind::OutsideWriteScope { index });
         }
         index += 1;
@@ -100,20 +162,24 @@ pub fn check_scope_core<P: AsRef<str>>(
 
 /// Validates that a write task's diff is non-empty, contained in `write_scope`,
 /// and disjoint from `forbidden` (with `forbidden` taking precedence).
+#[cfg_attr(verus_only, verus_spec(result =>
+    ensures scope_error(result, changed_paths@, write_scope@, forbidden@),
+))]
 pub fn check_scope(
     changed_paths: &[RelPath],
     write_scope: &[RelPath],
     forbidden: &[RelPath],
 ) -> Result<(), ScopeError> {
-    check_scope_core(changed_paths, write_scope, forbidden).map_err(|err| match err {
-        ScopeViolationKind::EmptyDiff => ScopeError::EmptyDiff,
-        ScopeViolationKind::ForbiddenPath { index } => {
-            ScopeError::ForbiddenPath(changed_paths[index].clone())
+    match check_scope_core(changed_paths, write_scope, forbidden) {
+        Ok(()) => Ok(()),
+        Err(ScopeViolationKind::EmptyDiff) => Err(ScopeError::EmptyDiff),
+        Err(ScopeViolationKind::ForbiddenPath { index }) => {
+            Err(ScopeError::ForbiddenPath(changed_paths[index].clone()))
         }
-        ScopeViolationKind::OutsideWriteScope { index } => {
-            ScopeError::OutsideWriteScope(changed_paths[index].clone())
+        Err(ScopeViolationKind::OutsideWriteScope { index }) => {
+            Err(ScopeError::OutsideWriteScope(changed_paths[index].clone()))
         }
-    })
+    }
 }
 
 #[cfg(test)]

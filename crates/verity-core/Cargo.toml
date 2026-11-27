@@ -6,3 +6,6 @@ license = "Apache-2.0"
 description = "Zero-IO Rust domain types, Pi session activity, scope policy, and verdict gate for Verity"
 
 [dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }

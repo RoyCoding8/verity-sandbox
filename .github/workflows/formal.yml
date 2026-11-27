@@ -4,8 +4,68 @@ on:
   push:
     branches: [main, 'ci/verify/**']
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 6 * * *'
 
 jobs:
+  tla-approval:
+    name: TLA+ approval model and Git traces
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned TLC
+        run: bash formal/tla/install-tool.sh "$RUNNER_TEMP/tla2tools.jar"
+
+      - name: Check the approval model
+        working-directory: formal/tla/approval
+        run: |
+          java -XX:+UseParallelGC -jar "$RUNNER_TEMP/tla2tools.jar" \
+            -metadir "$RUNNER_TEMP/tlc-competing" -workers 1 -config Competing.cfg Approval.tla
+
+      - name: Select extended approval checks
+        id: affected
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ] && \
+            git diff --quiet "$BASE_SHA" HEAD -- crates/ formal/ .github/workflows/ Cargo.toml Cargo.lock; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check repeated task IDs and the freshness control
+        if: steps.affected.outputs.run == 'true'
+        working-directory: formal/tla/approval
+        run: |
+          java -XX:+UseParallelGC -jar "$RUNNER_TEMP/tla2tools.jar" \
+            -metadir "$RUNNER_TEMP/tlc-repeat" -workers 1 -config RepeatTask.cfg Approval.tla
+          status=0
+          java -XX:+UseParallelGC -jar "$RUNNER_TEMP/tla2tools.jar" \
+            -metadir "$RUNNER_TEMP/tlc-negative" -workers 1 -config LostUpdate.cfg Approval.tla \
+            > "$RUNNER_TEMP/tlc-negative.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/tlc-negative.log"
+          test "$status" -ne 0 && grep -F 'Invariant PreservesRefUpdates is violated.' "$RUNNER_TEMP/tlc-negative.log"
+
+      - name: Install Rust toolchain
+        if: steps.affected.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate production approval traces
+        if: steps.affected.outputs.run == 'true'
+        shell: bash
+        run: |
+          VERITY_TLC_JAR="$RUNNER_TEMP/tla2tools.jar" cargo test --locked -p verity-runtime --lib \
+            git::approval_trace::approval_model_and_production_traces -- --exact --ignored --nocapture \
+            | tee "$RUNNER_TEMP/approval-traces.log"
+          grep -Fx 'running 1 test' "$RUNNER_TEMP/approval-traces.log"
+
   kani:
     name: Kani proofs (formal/)
     runs-on: ubuntu-latest
@@ -56,6 +116,41 @@ jobs:
           done
           VERITY_KANI="$checkers/kani" VERITY_CARGO_KANI="$checkers/cargo-kani" \
             cargo test --locked -p verity-runtime --test phase3_e2e live_kani_approves -- --ignored --nocapture
+
+  verus-scope:
+    name: Verus scope proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select scope verification
+        id: affected
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ] && \
+            git diff --quiet "$BASE_SHA" HEAD -- crates/ formal/ .github/workflows/ Cargo.toml Cargo.lock; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install pinned Verus and prove the scope decision
+        if: steps.affected.outputs.run == 'true'
+        run: |
+          version=0.2026.11.22.1ce6a59
+          archive="$RUNNER_TEMP/verus.zip"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/verus-lang/verus/releases/download/release/$version/verus-$version-x86-linux.zip"
+          printf '%s  %s\n' c955d5958877f4f907cce80aa996d4239a481984829d82e325938c7bf242b0db "$archive" | sha256sum --check
+          unzip -q "$archive" -d "$RUNNER_TEMP"
+          rustup toolchain install 1.100.0 --profile minimal
+          "$RUNNER_TEMP/verus-x86-linux/verus" --cfg verus_only --edition 2021 --crate-type lib \
+            '-Zcrate-attr=feature(proc_macro_hygiene,sized_hierarchy)' --time crates/verity-core/src/lib.rs
 
   lean:
     name: Lean comparator (live Linux)

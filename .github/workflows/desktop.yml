@@ -15,6 +15,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -50,3 +52,26 @@ jobs:
 
       - name: Run tests (Tauri Rust shell)
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+
+      - name: Install pinned TLC
+        if: matrix.os == 'ubuntu-latest'
+        run: bash formal/tla/install-tool.sh "$RUNNER_TEMP/tla2tools.jar"
+
+      - name: Check the restore model
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: formal/tla/restore
+        run: |
+          java -XX:+UseParallelGC -jar "$RUNNER_TEMP/tla2tools.jar" \
+            -metadir "$RUNNER_TEMP/tlc-restore" -workers 1 -config Restore.cfg Restore.tla
+
+      - name: Validate production restore traces
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ] && \
+            git diff --quiet "$BASE_SHA" HEAD -- desktop/ crates/ formal/ .github/workflows/ Cargo.toml Cargo.lock; then
+            exit 0
+          fi
+          python3 formal/tla/restore/check_traces.py "$RUNNER_TEMP/tla2tools.jar"

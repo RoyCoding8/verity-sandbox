@@ -1,4 +1,6 @@
 use std::fmt;
+#[cfg(verus_only)]
+use vstd::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeError {
@@ -254,12 +256,33 @@ impl CommitOid {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(verus_only, verus_verify)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RelPath(String);
 
+#[cfg(verus_only)]
+verus! {
+    impl crate::scope::proof::ScopeAsRefImpl<str> for RelPath {
+        open spec fn has_scope_ref() -> bool { true }
+        closed spec fn scope_chars(&self) -> Seq<char> { self.0@ }
+        open spec fn ref_chars(value: &str) -> Seq<char> { value@ }
+    }
+}
+
+#[cfg_attr(verus_only, verus_verify)]
 impl AsRef<str> for RelPath {
     fn as_ref(&self) -> &str {
-        &self.0
+        self.0.as_str()
+    }
+}
+
+#[cfg_attr(verus_only, verus_verify)]
+impl Clone for RelPath {
+    #[cfg_attr(verus_only, verus_spec(result =>
+        ensures result == *self,
+    ))]
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -269,8 +292,12 @@ impl RelPath {
         Ok(Self(raw[..end].to_string()))
     }
 
+    #[cfg_attr(verus_only, verus_spec(result =>
+        ensures result@ == <Self as crate::scope::proof::ScopeAsRef<str>>::scope_chars(self),
+        no_unwind
+    ))]
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.as_ref()
     }
 }
 
