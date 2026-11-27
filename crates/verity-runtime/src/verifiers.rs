@@ -1,6 +1,7 @@
 use crate::sandbox::{default_offline_config, run_sandboxed, SandboxConfig, SandboxError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{env, fs};
 use verity_core::json::{parse_json, JsonValue};
@@ -1325,11 +1326,22 @@ fn capture_kani_verdict(
             format!(
                 "Kani produced no report (exit {:?}): {}",
                 out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim(),
+                checker_diagnostic(&out),
             ),
         )),
         Err(error) => Err(sandbox_io(error)),
     }
+}
+
+fn checker_diagnostic(out: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let output = if stderr.trim().is_empty() {
+        &stdout
+    } else {
+        &stderr
+    };
+    output.trim().chars().take(1024).collect()
 }
 
 fn sandbox_io(error: std::io::Error) -> SandboxError {
@@ -1380,6 +1392,7 @@ fn checker_sandbox(worktree_dir: &Path, program: &Path) -> Result<SandboxConfig,
     ])
     .map_err(|error| SandboxError::Io(error.to_string()))?;
     let mut cfg = default_offline_config(worktree_dir, None);
+    cfg.read_only_paths.push(program.to_path_buf());
     cfg.env_passthrough.push((
         "PATH".to_string(),
         path_arg(Path::new(&tool_path))?.to_string(),
@@ -1399,8 +1412,10 @@ pub fn run_lean_comparator_sandboxed(
         independent_checker_file(challenge_export, &worktree_dir, "Lean challenge export")?;
     let config_flag = format!("--config={}", path_arg(&config)?);
     let challenge_flag = format!("--challenge-from-export={}", path_arg(&challenge_export)?);
+    let mut sandbox = checker_sandbox(&worktree_dir, &program)?;
+    sandbox.read_only_paths.extend([config, challenge_export]);
     let out = run_sandboxed(
-        &checker_sandbox(&worktree_dir, &program)?,
+        &sandbox,
         path_arg(&program)?,
         &["comparator", &config_flag, &challenge_flag, "--paranoid"],
     )?;
@@ -1417,7 +1432,7 @@ pub fn run_lean_comparator_sandboxed(
         format!(
             "Lean comparator did not accept the proof (exit {:?}): {}",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim(),
+            checker_diagnostic(&out),
         ),
     ))
 }
@@ -1537,36 +1552,6 @@ mod tests {
             independent_checker_file(&independent, &worktree, "checker").unwrap(),
             canonical_path(&independent).unwrap(),
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "requires VERITY_KANI and a working native sandbox"]
-    fn standalone_kani_checks_the_discovered_proof() {
-        let worktree = env::temp_dir().join(format!("verity-kani-smoke-{}", std::process::id()));
-        fs::create_dir(&worktree).unwrap();
-        let source = r#"
-mod proofs {
-    #[kani::proof]
-    fn verify_pass() {
-        let n: u8 = kani::any();
-        assert!(n.saturating_add(0) == n);
-        kani::cover!(n == 42, "forty_two");
-    }
-}
-"#;
-        let path = RelPath::parse("proof.rs").unwrap();
-        fs::write(worktree.join(path.as_str()), source).unwrap();
-        let targets = discover_kani_proofs(&[(path, source.to_string())]);
-        let verdict = run_kani_proof_sandboxed(&worktree, &targets[0]);
-        let files = fs::read_dir(&worktree).unwrap().count();
-        fs::remove_dir_all(&worktree).unwrap();
-
-        let verdict = verdict.unwrap();
-        assert_eq!(verdict.status, VerdictStatus::Pass, "{}", verdict.reason);
-        assert_eq!(verdict.checks_passed, 1);
-        assert_eq!(verdict.probes_satisfied, 1);
-        assert_eq!(files, 1);
     }
 
     #[test]

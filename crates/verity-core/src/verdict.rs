@@ -154,8 +154,6 @@ pub struct CheckerVerdict {
 pub enum GateError {
     HygieneFailed(usize),
     VerdictNotPass(VerdictStatus),
-    MissingSpecDigest,
-    BlindBackTranslationUnverified,
 }
 
 impl fmt::Display for GateError {
@@ -166,12 +164,6 @@ impl fmt::Display for GateError {
             }
             GateError::VerdictNotPass(status) => {
                 write!(f, "machine checker verdict is {:?}, not Pass", status)
-            }
-            GateError::MissingSpecDigest => {
-                write!(f, "spec_digest is missing or unverified")
-            }
-            GateError::BlindBackTranslationUnverified => {
-                write!(f, "blind back-translation requirement is unmet")
             }
         }
     }
@@ -481,24 +473,6 @@ pub fn can_approve_gate_core(
     }
     if verdict_status != VerdictStatus::Pass {
         return Err(GateError::VerdictNotPass(verdict_status));
-    }
-    Ok(())
-}
-
-/// Allocation-free handoff approval gate enforcing hygiene, checker verdict,
-/// `spec_digest`, and `blind_back_translation` requirements.
-pub fn can_approve_handoff_gate_core(
-    hygiene_violations: usize,
-    verdict_status: VerdictStatus,
-    spec_digest_present: bool,
-    blind_back_translation_verified: bool,
-) -> Result<(), GateError> {
-    can_approve_gate_core(hygiene_violations, verdict_status)?;
-    if !spec_digest_present {
-        return Err(GateError::MissingSpecDigest);
-    }
-    if !blind_back_translation_verified {
-        return Err(GateError::BlindBackTranslationUnverified);
     }
     Ok(())
 }

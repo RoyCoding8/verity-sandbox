@@ -5,7 +5,7 @@ A Rust controller and Tauri v2 Material Design 3 desktop app for running coding 
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2-24C8D8?logo=tauri&logoColor=white)](https://v2.tauri.app/)
 [![Material Design 3](https://img.shields.io/badge/UI-Material%20Design%203-6750A4)](https://m3.material.io/)
-[![Kani](https://img.shields.io/badge/Kani-15%20direct%20proofs-2E7D32)](https://model-checking.github.io/kani/)
+[![Kani](https://img.shields.io/badge/Kani-bounded%20proofs-2E7D32)](https://model-checking.github.io/kani/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue)](https://www.apache.org/licenses/LICENSE-2.0)
 
 ## Why Verity?
@@ -39,7 +39,7 @@ flowchart LR
 | Multi-project desktop | Stores workspaces in `~/.verity/projects.json`, opens repositories through the native folder picker (`tauri-plugin-dialog`), and isolates Pi sessions per project. |
 | Pi RPC | Supports slash commands, skills, prompt templates, `!` and `!!` bash execution, a session settings and stats modal, and extension UI dialogs, toasts, and widgets. |
 | Turn revert and checkpoints | Captures shadow Git snapshots for targeted chat and code revert and redo. |
-| Formal verification and handoffs | Uses Kani or Lean to check write tasks and `git merge-tree` to integrate approved candidates. The repository's own proof suite in `formal/` runs 15 Kani proofs directly over shipped `crates/verity-core` functions, with zero shadow models. |
+| Formal verification and handoffs | Uses Kani or Lean to check write tasks and `git merge-tree` to integrate approved candidates. The repository's proof suite in `formal/` checks bounded Rust properties. |
 
 ## Quick start
 
@@ -87,7 +87,7 @@ The controller forwards API keys from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GE
 
 The desktop app locates the `verity` CLI beside its executable or on `PATH`. Set `VERITY_MCP_BIN` to an absolute executable path to override discovery.
 
-- For Kani, set `VERITY_KANI` to the absolute path of a trusted standalone Kani 0.68.0 launcher with a prepared toolchain. The controller verifies Rust source files as standalone crates. Cargo packages that require dependencies, features, or build scripts need separate verification.
+- For Kani, set `VERITY_KANI` to the absolute path of a trusted Kani 0.68.0 launcher with a prepared toolchain. The controller checks standalone Rust files by default. For a proof under `src/` in a Cargo package, set `VERITY_CARGO_KANI` to the absolute path of a trusted Cargo Kani launcher.
 - For Lean, set `VERITY_LEAN_COMPARATOR` to the absolute path of a trusted `lake` launcher and `VERITY_LEAN_COMPARATOR_CONFIG` to its trusted comparator configuration. Keep these files and `challenge.export` outside the candidate checkout.
 
 Review the proof statements and scope in the handoff before approving. The checker result applies to the candidate commit and the obligations it ran. If the target branch moves, rerun the task against the new base.
@@ -96,23 +96,23 @@ Review the proof statements and scope in the handoff before approving. The check
 
 | Path | Contents |
 | :--- | :--- |
-| `crates/verity-core` | Zero-IO pure Rust domain types, task state machine, Pi session exclusivity laws, Pi wire types, provider URL validation, write-scope rules, Kani verdict classifier, and JSON parser. |
+| `crates/verity-core` | Zero-IO Rust domain types, Pi session transitions and wire types, provider URL validation, write-scope rules, Kani verdict classification, and JSON parsing. |
 | `crates/verity-runtime` | Native `git worktree` and `git merge-tree` operations, rootless Linux `bubblewrap` and macOS `sandbox-exec` sandboxing, `O_NOFOLLOW` workspace path jail, comment-aware Kani and Lean 4 hygiene lints, Pi JSONL RPC client, write-subagent orchestrator, and spec-only handoff extractor. |
 | `crates/verity-cli` | Headless `verity` CLI (`run-readonly`, `spawn`, `review`, `merge`, `log`) and local STDIO MCP server (`verity mcp`). |
-| `formal/` | 15 Kani 0.68.0 proof harnesses directly verifying shipped `crates/verity-core` functions, with zero shadow models. |
+| `formal/` | Kani 0.68.0 proof harnesses for core parsing, validation, approval, and Pi session activity. |
 | `desktop/` | Tauri v2 Rust shell (`desktop/src-tauri/`) and Material Design 3 React 19 frontend (`desktop/ui/`). |
 
 ## Verification
 
 Verity uses a three-layer verification architecture:
 
-1. **Formal proofs (`formal/`, 15 Kani harnesses)** — Every harness directly proves shipped `crates/verity-core` functions with zero shadow models, covering scope containment, task state machine, Pi session exclusivity, Kani verdict and hygiene gate, provider URL SSRF/IPv6 validation, RFC 8259 JSON and UTF-16, Windows/NTFS `RelPath` and `TaskId`, `AssistantEventKind` allowlist, and `ClientLocal` rewind-target resolution.
-2. **Runtime and desktop integration tests (`crates/` + `desktop/src-tauri`)** — Verify real `git worktree`/`merge-tree`, hardened `bwrap` worker sandboxing (write and read-only), tamper-evident `spec_digest`, Kani 0.68.0 JSON export parsing, targeted shadow-git snapshot revert/redo with `.gitignore` protection, and Pi RPC streaming and lineage.
-3. **Frontend property and law suite (`desktop/ui/src/verify/piStore.laws.mjs`)** — Runs 21 realistic scenarios plus a 500-trace property fuzzer checking 8 step invariants.
+1. **Formal proofs (`formal/`)** check bounded inputs for core scope, paths, Pi session activity, verifier verdicts, provider URLs, and JSON helpers.
+2. **Runtime and desktop tests** exercise real Git worktrees and merges, Linux worker isolation, handoff digests, checker reports, targeted Git restore, and Pi JSONL commands.
+3. **Frontend tests** exercise the TypeScript event parser and reducer with example scenarios and generated traces. The rendering tests inspect approval and merge controls, and the offline Pi test loads the bundled extension.
 
 ### Running checks locally
 
-Run the 15 Kani proofs in `formal/` (requires Kani 0.68.0):
+Run the Kani proofs in `formal/` with Kani 0.68.0:
 
 ```sh
 npm run formal
@@ -130,10 +130,10 @@ Run the Tauri backend test suite by itself:
 cargo test --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
-Run the frontend property and law suite (requires `npm run setup` first):
+Run the frontend state and rendering tests after `npm run setup`:
 
 ```sh
-node --test desktop/ui/src/verify/piStore.laws.mjs
+node --test desktop/ui/src/verify/piStore.laws.mjs desktop/ui/src/verify/verificationViews.test.mjs
 ```
 
 ### Validate a local branch on GitHub

@@ -17,7 +17,7 @@ use crate::providers::{
 };
 use crate::snapshots::{
     capture_snapshot, find_checkpoint_with_lineage, load_checkpoint_store,
-    normalize_prompt_preview, record_captured_turn_checkpoint, redo_last_revert,
+    normalize_prompt_preview, record_turn_checkpoint, redo_last_revert,
     redo_targeted_revert_checked, revert_to_snapshot, save_last_redo,
 };
 use serde::{Deserialize, Serialize};
@@ -579,39 +579,87 @@ pub fn parse_history_tree(val: &JsonValue) -> Vec<HistoryTreeNode> {
     out
 }
 
-pub fn parse_fork_candidates(val: &JsonValue) -> Vec<ForkCandidate> {
-    let items = match val {
-        JsonValue::Array(arr) => arr,
-        JsonValue::Object(_) => match val
+fn fork_candidate_items(val: &JsonValue) -> Option<&[JsonValue]> {
+    match val {
+        JsonValue::Array(items) => Some(items),
+        JsonValue::Object(_) => val
             .get("messages")
             .or_else(|| val.get("candidates"))
             .or_else(|| val.get("entries"))
-            .and_then(JsonValue::as_array)
-        {
-            Some(arr) => arr,
-            None => return Vec::new(),
-        },
-        _ => return Vec::new(),
-    };
+            .and_then(JsonValue::as_array),
+        _ => None,
+    }
+}
 
-    items
+pub fn parse_fork_candidates(val: &JsonValue) -> Vec<ForkCandidate> {
+    fork_candidate_items(val)
+        .unwrap_or_default()
         .iter()
-        .enumerate()
-        .map(|(idx, item)| {
+        .filter_map(|item| {
+            let entry_id = opt_str(item, &["entryId", "entry_id", "id"])?;
+            if entry_id.trim().is_empty() {
+                return None;
+            }
             let role = match opt_str(item, &["role"]).as_deref() {
                 Some("assistant") => "assistant".to_string(),
                 _ => "user".to_string(),
             };
-            ForkCandidate {
-                entry_id: opt_str(item, &["entryId", "entry_id", "id"])
-                    .unwrap_or_else(|| format!("entry-{}", idx + 1)),
+            Some(ForkCandidate {
+                entry_id,
                 role,
                 preview: opt_str(item, &["preview", "text", "content"]).unwrap_or_default(),
                 timestamp: opt_timestamp(item, &["timestamp", "createdAt", "created_at"])
                     .unwrap_or_else(|| "now".to_string()),
-            }
+            })
         })
         .collect()
+}
+
+fn checkpoint_candidates(sup: &PiSessionSupervisor) -> Option<Vec<ForkCandidate>> {
+    let response = sup.get_fork_messages().ok()?;
+    let data = parse_data_json(&response)?;
+    let count = fork_candidate_items(&data)?.len();
+    let candidates = parse_fork_candidates(&data);
+    (candidates.len() == count).then_some(candidates)
+}
+
+fn submitted_turn(
+    sup: &PiSessionSupervisor,
+    before: &[ForkCandidate],
+    prompt: &str,
+) -> Option<ForkCandidate> {
+    // Pi can accept a prompt before its user entry appears in history.
+    for attempt in 0..6 {
+        if attempt != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let mut after = checkpoint_candidates(sup)?;
+        if after.len() < before.len()
+            || !after
+                .iter()
+                .zip(before)
+                .all(|(a, b)| a.entry_id == b.entry_id)
+        {
+            return None;
+        }
+        if after.len() == before.len() {
+            continue;
+        }
+        if after.len() != before.len() + 1 {
+            return None;
+        }
+        let turn = after.pop()?;
+        return (turn.role == "user"
+            && !is_synthetic_local_entry_id(&turn.entry_id)
+            && !before.iter().any(|old| old.entry_id == turn.entry_id)
+            && !turn.preview.trim().is_empty()
+            && turn
+                .preview
+                .split_whitespace()
+                .eq(prompt.split_whitespace()))
+        .then_some(turn);
+    }
+    None
 }
 
 pub fn parse_model_option(
@@ -2131,16 +2179,28 @@ impl PiAppState {
             return Err("The active chat changed. Reopen the chat before sending.".to_string());
         }
         let project_dir = PathBuf::from(current_project.path);
-        let checkpoint_prompt = message.clone();
-        let captured_tree_oid = capture_snapshot(&project_dir).ok();
-        sup.prompt(message, images).map_err(|e| e.to_string())?;
-        if let Some(tree_oid) = captured_tree_oid {
-            let _ = record_captured_turn_checkpoint(
-                &project_dir,
-                session_id,
-                checkpoint_prompt,
-                tree_oid,
-            );
+        let snapshot_and_history = checkpoint_candidates(&sup).and_then(|turns| {
+            capture_snapshot(&project_dir)
+                .ok()
+                .map(|tree_oid| (tree_oid, turns))
+        });
+        let response = sup
+            .prompt(message.clone(), images)
+            .map_err(|e| e.to_string())?;
+        let disposition = parse_data_json(&response).and_then(|v| opt_str(&v, &["disposition"]));
+        if let Some((tree_oid, before)) = snapshot_and_history {
+            if !matches!(disposition.as_deref(), Some("queued" | "handled")) {
+                if let Some(turn) = submitted_turn(&sup, &before, &message) {
+                    let _ = record_turn_checkpoint(
+                        &project_dir,
+                        session_id,
+                        turn.entry_id,
+                        None,
+                        message,
+                        tree_oid,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -2201,13 +2261,7 @@ impl PiAppState {
                     .and_then(|v| opt_str(&v, &["id", "sessionId", "session_id"]))
             });
 
-        // Step 1: Obtain Pi's authoritative user-turn fork candidates on the active branch.
-        let fork_candidates = sup
-            .get_fork_messages()
-            .ok()
-            .and_then(|r| parse_data_json(&r))
-            .map(|v| parse_fork_candidates(&v))
-            .unwrap_or_default();
+        let fork_candidates = checkpoint_candidates(&sup).unwrap_or_default();
 
         // Step 2: Resolve target user turn in priority order:
         // (1) exact entry_id match, (2) user_turn_index, (3) normalized prompt_text match.
@@ -2222,11 +2276,12 @@ impl PiAppState {
                     .map(normalize_prompt_preview)
                     .filter(|norm| !norm.is_empty())
                     .and_then(|norm| {
-                        fork_candidates
+                        let mut matches = fork_candidates
                             .iter()
                             .enumerate()
-                            .rev()
-                            .find(|(_, c)| normalize_prompt_preview(&c.preview) == norm)
+                            .filter(|(_, c)| normalize_prompt_preview(&c.preview) == norm);
+                        let first = matches.next()?;
+                        matches.next().is_none().then_some(first)
                     })
             });
 
@@ -2239,72 +2294,48 @@ impl PiAppState {
             FallbackNewSession,
         }
 
-        let (plan, resolved_entry_id, resolved_turn_index, preview_hint) =
-            if let Some((target_idx, target)) = resolved {
-                // Never pass synthetic local/stream/msg IDs to Pi fork.
-                if is_synthetic_local_entry_id(&target.entry_id) {
-                    return Err(format!(
-                        "Refusing to fork synthetic entry ID '{}'",
-                        target.entry_id
-                    ));
-                }
-                let target_entry_id = target.entry_id.clone();
-                let target_preview =
-                    (!target.preview.trim().is_empty()).then(|| target.preview.clone());
-                let hint = target_preview.clone().or_else(|| {
-                    prompt_text
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                        .map(ToString::to_string)
-                });
-                (
-                    RevertTargetPlan::Fork {
-                        target_idx,
-                        target_entry_id: target_entry_id.clone(),
-                        target_preview,
-                    },
-                    target_entry_id,
-                    Some(target_idx),
-                    hint,
-                )
-            } else if fork_candidates.is_empty() && user_turn_index.unwrap_or(0) == 0 {
-                let hint = prompt_text
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(ToString::to_string);
-                (
-                    RevertTargetPlan::FallbackNewSession,
-                    entry_id.clone(),
-                    Some(0),
-                    hint,
-                )
-            } else {
+        let plan = if let Some((target_idx, target)) = resolved {
+            if is_synthetic_local_entry_id(&target.entry_id) {
                 return Err(format!(
-                    "Unable to resolve entry ID '{}' to a valid user turn for forking.",
-                    entry_id
+                    "Refusing to fork synthetic entry ID '{}'",
+                    target.entry_id
                 ));
-            };
+            }
+            RevertTargetPlan::Fork {
+                target_idx,
+                target_entry_id: target.entry_id.clone(),
+                target_preview: (!target.preview.trim().is_empty()).then(|| target.preview.clone()),
+            }
+        } else if fork_candidates.is_empty() && user_turn_index.unwrap_or(0) == 0 {
+            RevertTargetPlan::FallbackNewSession
+        } else {
+            return Err(format!(
+                "Unable to resolve entry ID '{}' to a valid user turn for forking.",
+                entry_id
+            ));
+        };
 
         let project_dir = self.project_path();
         let project_id = project_from_path(&project_dir).id;
 
-        // Step 3: Resolve checkpoint across active + parent session lineage and apply code revert
-        // BEFORE forking Pi so any preflight collision fails cleanly without desyncing chat.
-        let pending_code_outcome = if revert_code {
+        let pending_code_outcome = if let (
+            true,
+            RevertTargetPlan::Fork {
+                target_entry_id,
+                target_preview,
+                ..
+            },
+        ) = (revert_code, &plan)
+        {
             let store = load_checkpoint_store(&project_dir);
             let lineage = self.session_lineage(&project_dir, session_id.as_deref());
-            let lineage_refs: Vec<&str> = lineage.iter().map(String::as_str).collect();
-            if let Some(cp) = find_checkpoint_with_lineage(
-                &store,
-                &lineage_refs,
-                &resolved_entry_id,
-                resolved_turn_index,
-                preview_hint.as_deref(),
-            ) {
-                Some(revert_to_snapshot(&project_dir, &cp.tree_oid)?)
-            } else {
-                None
-            }
+            let preview = target_preview
+                .as_deref()
+                .or(prompt_text.as_deref())
+                .map(normalize_prompt_preview);
+            find_checkpoint_with_lineage(&store, &lineage, target_entry_id, preview.as_deref())?
+                .map(|checkpoint| revert_to_snapshot(&project_dir, &checkpoint.tree_oid))
+                .transpose()?
         } else {
             None
         };
@@ -2415,12 +2446,16 @@ impl PiAppState {
                 Ok(ok) => ok,
                 Err(err) => {
                     if let Some(outcome) = pending_code_outcome {
-                        let _ = redo_targeted_revert_checked(
+                        if let Err(rollback) = redo_targeted_revert_checked(
                             &project_dir,
                             &outcome.redo_tree_oid,
                             &outcome.reverted_files,
                             Some(&outcome.target_tree_oid),
-                        );
+                        ) {
+                            return Err(format!(
+                                "{err}. Could not undo the code restore after Pi failed: {rollback}"
+                            ));
+                        }
                     }
                     return Err(err);
                 }
@@ -2508,6 +2543,7 @@ impl PiAppState {
         message: String,
         images: Vec<PendingAttachment>,
     ) -> Result<(), String> {
+        let _workspace = self.lock_workspace();
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
         sup.steer(message, images).map_err(|e| e.to_string())?;
         Ok(())
@@ -2519,6 +2555,7 @@ impl PiAppState {
         message: String,
         images: Vec<PendingAttachment>,
     ) -> Result<(), String> {
+        let _workspace = self.lock_workspace();
         let sup = self.ensure_supervisor_with_sink(event_sink)?;
         sup.follow_up(message, images).map_err(|e| e.to_string())?;
         Ok(())
@@ -4932,6 +4969,8 @@ done
 
         let store_path = dir.join("providers.json");
         let script = r#"
+PROMPTED=0
+FRESH=0
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
@@ -4943,24 +4982,33 @@ while IFS= read -r line; do
       printf '{"type":"response","id":"%s","command":"get_tree","success":true,"data":{"nodes":[{"id":"u-1","parentId":null,"role":"user","preview":"Refactor main","timestamp":"t1","depth":0,"isActiveBranch":true},{"id":"a-1","parentId":"u-1","role":"assistant","preview":"Done","timestamp":"t2","depth":1,"isActiveBranch":true},{"id":"u-2","parentId":"a-1","role":"user","preview":"Unrecorded turn","timestamp":"t3","depth":2,"isActiveBranch":true}]}}\n' "$id"
       ;;
     get_fork_messages)
-      printf '{"type":"response","id":"%s","command":"get_fork_messages","success":true,"data":{"messages":[{"entryId":"u-1","role":"user","preview":"Refactor main","timestamp":"t1"},{"entryId":"u-2","role":"user","preview":"Unrecorded turn","timestamp":"t3"}]}}\n' "$id"
+      turns=''
+      if [ "$PROMPTED" = 1 ]; then
+        turns='{"entryId":"u-1","role":"user","text":"Refactor main"}'
+      fi
+      if [ "$FRESH" = 1 ]; then
+        turns='{"entryId":"u-2","role":"user","text":"Unrecorded turn"}'
+      fi
+      printf '{"type":"response","id":"%s","command":"get_fork_messages","success":true,"data":{"messages":[%s]}}\n' "$id" "$turns"
       ;;
     get_messages)
       printf '{"type":"response","id":"%s","command":"get_messages","success":true,"data":{"messages":[{"id":"u-1","role":"user","content":"Refactor main","timestamp":"t1"},{"id":"u-2","role":"user","content":"Unrecorded turn","timestamp":"t3"}]}}\n' "$id"
       ;;
     fork)
       eid=$(printf '%s\n' "$line" | sed -n 's/.*"entryId":"\([^"]*\)".*/\1/p')
-      if [ "$eid" = "u-1" ]; then
+      if [ "$eid" = "u-1" ] && [ "$FRESH" = 0 ]; then
         printf '{"type":"response","id":"%s","command":"fork","success":false,"error":"cannot fork first turn"}\n' "$id"
       else
         printf '{"type":"response","id":"%s","command":"fork","success":true,"data":{"id":"sess-forked","name":"Forked","messages":[{"id":"u-1","role":"user","content":"Refactor main","timestamp":"t1"}]}}\n' "$id"
       fi
       ;;
     prompt)
+      PROMPTED=1
       printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
       printf '{"type":"agent_end"}\n'
       ;;
     new_session)
+      FRESH=1
       printf '{"type":"response","id":"%s","command":"new_session","success":true,"data":{"id":"sess-fresh","name":"New session"}}\n' "$id"
       ;;
     *)
@@ -4995,17 +5043,10 @@ done
         settled_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("agent should settle after prompt");
-        // Background pre-prompt snapshot capture finishes shortly after prompt_with_sink returns.
-        let mut cps = Vec::new();
-        for _ in 0..40 {
-            cps = state.list_checkpoints().unwrap();
-            if !cps.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        let cps = state.list_checkpoints().unwrap();
         assert_eq!(cps.len(), 1);
         assert!(cps[0].has_code_snapshot);
+        assert_eq!(cps[0].entry_id, "u-1");
         assert_eq!(cps[0].prompt_preview, "Refactor main");
 
         fs::write(&code_file, "fn main() { /* v2 */ }\n").unwrap();
@@ -5348,8 +5389,7 @@ done
     }
 
     #[test]
-    fn chained_revert_uses_parent_lineage_blocks_foreign_leaks_and_keeps_chat_in_sync_on_preflight_error(
-    ) {
+    fn chained_revert_resolves_entry_identity_and_compensates_when_pi_fails() {
         let _env_lock = crate::snapshots::tests::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -5377,6 +5417,9 @@ done
         let script = r#"
 CUR_ID="sess-root"
 FORK_SEQ=0
+ROOT_TURNS=0
+CHILD_TURNS=0
+CHILD_VISIBLE=0
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
@@ -5400,15 +5443,37 @@ while IFS= read -r line; do
       if printf '%s' "$line" | grep -q 'FAIL_THIS_PROMPT'; then
         printf '{"type":"response","id":"%s","command":"prompt","success":false,"error":"prompt rejected"}\n' "$id"
       else
+        if [ "$CUR_ID" = "sess-root" ]; then
+          ROOT_TURNS=$((ROOT_TURNS + 1))
+        else
+          CHILD_TURNS=$((CHILD_TURNS + 1))
+        fi
         printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
         printf '{"type":"agent_end","summary":"done"}\n'
       fi
       ;;
     get_fork_messages)
-      printf '{"type":"response","id":"%s","command":"get_fork_messages","success":true,"data":{"messages":[{"entryId":"u-1","role":"user","preview":"Turn one","timestamp":"t1"},{"entryId":"u-2","role":"user","preview":"Turn two","timestamp":"t2"}]}}\n' "$id"
+      turns=''
+      if [ "$ROOT_TURNS" -ge 1 ]; then
+        turns='{"entryId":"u-1","role":"user","preview":"Turn one"}'
+      fi
+      if [ "$CUR_ID" = "sess-root" ] && [ "$ROOT_TURNS" -ge 2 ]; then
+        turns="$turns,{\"entryId\":\"u-2\",\"role\":\"user\",\"preview\":\"Turn two\"}"
+      fi
+      if [ "$CUR_ID" = "sess-fork-1" ] && [ "$CHILD_VISIBLE" = 1 ]; then
+        turns="$turns,{\"entryId\":\"u-child\",\"role\":\"user\",\"preview\":\"Turn one\"}"
+      fi
+      printf '{"type":"response","id":"%s","command":"get_fork_messages","success":true,"data":{"messages":[%s]}}\n' "$id" "$turns"
+      if [ "$CHILD_TURNS" -ge 1 ]; then CHILD_VISIBLE=1; fi
       ;;
     fork)
       eid=$(printf '%s\n' "$line" | sed -n 's/.*"entryId":"\([^"]*\)".*/\1/p')
+      if [ -f ../reject-fork ]; then
+        cat app.rs > ../observed-during-fork
+        if [ -f ../conflict-during-fork ]; then printf 'changed during fork\n' > app.rs; fi
+        printf '{"type":"response","id":"%s","command":"fork","success":false,"error":"Pi rejected fork"}\n' "$id"
+        continue
+      fi
       FORK_SEQ=$((FORK_SEQ + 1))
       CUR_ID="sess-fork-$FORK_SEQ"
       if [ "$eid" = "u-2" ]; then
@@ -5443,18 +5508,18 @@ done
         crate::snapshots::record_turn_checkpoint(
             &project_dir,
             "sess-foreign".into(),
-            "turn-foreign".into(),
+            "u-1".into(),
             Some(0),
-            "Foreign secret".into(),
+            "Turn one".into(),
             "1111111111111111111111111111111111111111".into(),
         )
         .unwrap();
         crate::snapshots::record_turn_checkpoint(
             &project_dir,
             "default-session".into(),
-            "turn-default".into(),
+            "u-1".into(),
             Some(0),
-            "Default leak".into(),
+            "Turn one".into(),
             "2222222222222222222222222222222222222222".into(),
         )
         .unwrap();
@@ -5502,6 +5567,34 @@ done
 
         // Edit to v2, then revert to Turn two -> forks into sess-fork-1 and restores v1.
         fs::write(&code_file, "v2\n").unwrap();
+        fs::write(dir.join("reject-fork"), "").unwrap();
+        let err = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true, None, None)
+            .unwrap_err();
+        assert!(err.contains("Pi rejected fork"), "{err}");
+        assert_eq!(
+            fs::read_to_string(dir.join("observed-during-fork")).unwrap(),
+            "v1\n"
+        );
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "v2\n");
+        assert!(state.redo_revert_with_sink().is_err());
+
+        fs::write(dir.join("conflict-during-fork"), "").unwrap();
+        let err = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true, None, None)
+            .unwrap_err();
+        assert!(
+            err.contains("Pi rejected fork") && err.contains("stale redo"),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&code_file).unwrap(),
+            "changed during fork\n"
+        );
+        assert!(state.redo_revert_with_sink().is_err());
+        fs::remove_file(dir.join("reject-fork")).unwrap();
+        fs::remove_file(dir.join("conflict-during-fork")).unwrap();
+        fs::write(&code_file, "v2\n").unwrap();
         let rev_t2 = state
             .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true, None, None)
             .unwrap();
@@ -5527,9 +5620,48 @@ done
         assert_eq!(fs::read_to_string(&secret_file).unwrap(), "edited-secret\n");
         assert_eq!(fs::read_to_string(&code_file).unwrap(), "v1\n");
 
-        // Remove .gitignore collision -> chained revert from sess-fork-1 to Turn one finds
-        // sess-root's Turn one checkpoint via parent lineage and restores v0!
         fs::remove_file(project_dir.join(".gitignore")).unwrap();
+        fs::write(&code_file, "child-before\n").unwrap();
+        state
+            .prompt_with_sink(
+                Arc::clone(&sink),
+                "Turn one".to_string(),
+                vec![],
+                boot.active_project_id.clone(),
+                "sess-fork-1".to_string(),
+            )
+            .unwrap();
+        settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        fs::write(&code_file, "child-after\n").unwrap();
+
+        let ambiguous = state
+            .revert_turn_with_sink(
+                Arc::clone(&sink),
+                "local-1".to_string(),
+                true,
+                None,
+                Some("Turn one".to_string()),
+            )
+            .unwrap_err();
+        assert!(ambiguous.contains("Unable to resolve entry ID"));
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "child-after\n");
+
+        let project_store = crate::snapshots::load_checkpoint_store(&project_dir);
+        let mut legacy = project_store.clone();
+        for (index, checkpoint) in legacy.checkpoints.iter_mut().enumerate() {
+            if matches!(checkpoint.entry_id.as_str(), "u-1" | "u-child") {
+                checkpoint.entry_id = format!("turn-{}", index + 1);
+                checkpoint.turn_index = Some(0);
+            }
+        }
+        crate::snapshots::save_checkpoint_store(&project_dir, &legacy).unwrap();
+        let err = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true, None, None)
+            .unwrap_err();
+        assert!(err.contains("older code snapshot"));
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "child-after\n");
+
+        crate::snapshots::save_checkpoint_store(&project_dir, &project_store).unwrap();
         let rev_t1 = state
             .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true, None, None)
             .unwrap();

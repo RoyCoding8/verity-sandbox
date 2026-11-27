@@ -1,232 +1,165 @@
-#[cfg(kani)]
 use verity_core::provider::{
     is_loopback_host_bytes, validate_external_sign_in_url_bytes, validate_provider_url_bytes,
     ProviderError,
 };
-#[cfg(kani)]
-use verity_core::verdict::can_approve_handoff_gate_core;
-#[cfg(kani)]
 use verity_core::{
-    can_approve_gate_core, classify_kani_core, GateError, KaniCheckRef, VerdictStatus,
+    can_approve_gate_core, classify_kani_core, CheckKind, CheckStatus, GateError, KaniCheckRef,
+    VerdictReason, VerdictStatus,
 };
-#[cfg(kani)]
-use verity_core::{CheckKind, CheckStatus};
 
-#[cfg(kani)]
-fn any_check_kind() -> CheckKind {
-    let tag: u8 = kani::any();
-    kani::assume(tag < 3);
-    match tag {
-        0 => CheckKind::Assertion,
-        1 => CheckKind::Cover,
-        _ => CheckKind::Safety,
-    }
-}
-
-#[cfg(kani)]
-fn any_check_status() -> CheckStatus {
-    let tag: u8 = kani::any();
-    kani::assume(tag < 6);
-    match tag {
-        0 => CheckStatus::Success,
-        1 => CheckStatus::Failure,
-        2 => CheckStatus::Unreachable,
-        3 => CheckStatus::Undetermined,
-        4 => CheckStatus::Satisfied,
-        _ => CheckStatus::Unsatisfiable,
-    }
-}
-
-#[cfg(kani)]
 fn any_check_ref() -> KaniCheckRef<'static> {
-    let kind = any_check_kind();
-    let status = any_check_status();
-    let use_probe_name: bool = kani::any();
-    let description = if use_probe_name { "p" } else { "c" };
+    let kinds = [CheckKind::Assertion, CheckKind::Cover, CheckKind::Safety];
+    let statuses = [
+        CheckStatus::Success,
+        CheckStatus::Failure,
+        CheckStatus::Unreachable,
+        CheckStatus::Undetermined,
+        CheckStatus::Satisfied,
+        CheckStatus::Unsatisfiable,
+    ];
+    let names = ["p", "c", "other"];
+    let kind: usize = kani::any();
+    let status: usize = kani::any();
+    let name: usize = kani::any();
+    kani::assume(kind < kinds.len() && status < statuses.len() && name < names.len());
     KaniCheckRef {
-        kind,
-        description,
-        status,
+        kind: kinds[kind],
+        description: names[name],
+        status: statuses[status],
     }
 }
 
-/// Law 4: Empty check sets, failed/undetermined/unreachable assertions,
-/// unsatisfied `kani::cover!` probes, hygiene findings, and unmet
-/// `spec_digest` / `blind_back_translation` requirements must always fail
-/// classification or the approval gate.
-#[cfg(kani)]
+/// All report flags and lists of up to three checks and two required probes.
+/// Check names range over the two required names and one unmatched name.
 #[kani::proof]
 #[kani::unwind(5)]
 pub fn prove_verdict_and_hygiene_gate() {
     let checks_buf = [any_check_ref(), any_check_ref(), any_check_ref()];
     let len: usize = kani::any();
-    kani::assume(len <= 3);
+    kani::assume(len <= checks_buf.len());
     let checks = &checks_buf[..len];
-
-    let has_harness_name: bool = kani::any();
+    let probe_names = [
+        if kani::any() { "p" } else { "c" },
+        if kani::any() { "p" } else { "c" },
+    ];
+    let probe_count: usize = kani::any();
+    kani::assume(probe_count <= probe_names.len());
+    let expected_probes = &probe_names[..probe_count];
+    let named: bool = kani::any();
     let should_panic: bool = kani::any();
     let solver_error: bool = kani::any();
-    let require_probe: bool = kani::any();
     let hygiene_violations: usize = kani::any();
-    let spec_digest_present: bool = kani::any();
-    let blind_back_translation_verified: bool = kani::any();
-
-    let expected_probes: &[&str] = if require_probe { &["p"] } else { &[] };
-
-    let verdict = classify_kani_core(
-        has_harness_name,
-        should_panic,
-        solver_error,
-        checks,
-        expected_probes,
-    );
+    let verdict = classify_kani_core(named, should_panic, solver_error, checks, expected_probes);
     let gate = can_approve_gate_core(hygiene_violations, verdict.status);
-    let handoff_gate = can_approve_handoff_gate_core(
-        hygiene_violations,
-        verdict.status,
-        spec_digest_present,
-        blind_back_translation_verified,
-    );
 
-    let mut any_pass_check = false;
-    let mut any_fail_check = false;
-    let mut any_unreachable_assertion = false;
-    let mut any_undetermined_check = false;
-    let mut any_cover_unsatisfied = false;
-    let mut any_cover_undetermined = false;
-    let mut i = 0usize;
-    while i < len {
-        let c = checks[i];
-        match c.kind {
-            CheckKind::Assertion => match c.status {
-                CheckStatus::Success => any_pass_check = true,
-                CheckStatus::Failure => any_fail_check = true,
-                CheckStatus::Unreachable => any_unreachable_assertion = true,
-                CheckStatus::Undetermined | CheckStatus::Satisfied | CheckStatus::Unsatisfiable => {
-                    any_undetermined_check = true
-                }
-            },
-            CheckKind::Safety => match c.status {
-                CheckStatus::Success => any_pass_check = true,
-                CheckStatus::Unreachable => {}
-                CheckStatus::Failure => any_fail_check = true,
-                CheckStatus::Undetermined | CheckStatus::Satisfied | CheckStatus::Unsatisfiable => {
-                    any_undetermined_check = true
-                }
-            },
-            CheckKind::Cover => match c.status {
-                CheckStatus::Satisfied => {}
-                CheckStatus::Unsatisfiable | CheckStatus::Unreachable | CheckStatus::Failure => {
-                    any_cover_unsatisfied = true
-                }
-                CheckStatus::Undetermined | CheckStatus::Success => any_cover_undetermined = true,
-            },
-        }
-        i += 1;
-    }
+    let successes = checks
+        .iter()
+        .filter(|check| {
+            matches!(check.kind, CheckKind::Assertion | CheckKind::Safety)
+                && check.status == CheckStatus::Success
+        })
+        .count();
+    let all_checks_acceptable = checks.iter().all(|check| {
+        matches!(
+            (check.kind, check.status),
+            (
+                CheckKind::Assertion | CheckKind::Safety,
+                CheckStatus::Success
+            ) | (CheckKind::Safety, CheckStatus::Unreachable)
+                | (CheckKind::Cover, CheckStatus::Satisfied)
+        )
+    });
+    let unique_expected_covers = expected_probes.iter().all(|expected| {
+        checks
+            .iter()
+            .filter(|check| check.kind == CheckKind::Cover && check.description == *expected)
+            .count()
+            == 1
+    });
+    let metadata_valid = named && !should_panic && !solver_error;
+    let should_pass =
+        metadata_valid && successes > 0 && all_checks_acceptable && unique_expected_covers;
+    assert_eq!(verdict.status == VerdictStatus::Pass, should_pass);
 
-    // Vacuous-empty rejection: empty checks or zero passing checks can never Pass.
-    if len == 0 || !any_pass_check {
-        assert_ne!(verdict.status, VerdictStatus::Pass);
-        assert!(gate.is_err());
-        assert!(handoff_gate.is_err());
-    }
-
-    // Failure-overrides-pass soundness: any assertion/safety failure yields Counterexample
-    // whenever metadata and solver are valid, even if other checks succeeded or were undetermined.
-    if has_harness_name && !should_panic && !solver_error && any_fail_check {
+    let first_failure = checks.iter().position(|check| {
+        matches!(check.kind, CheckKind::Assertion | CheckKind::Safety)
+            && check.status == CheckStatus::Failure
+    });
+    if !named || should_panic {
+        assert_eq!(verdict.status, VerdictStatus::InvalidReport);
+        assert_eq!(verdict.reason, VerdictReason::InvalidMetadataOrShouldPanic);
+    } else if solver_error {
+        assert_eq!(verdict.status, VerdictStatus::Inconclusive);
+        assert_eq!(verdict.reason, VerdictReason::SolverError);
+    } else if let Some(check_index) = first_failure {
         assert_eq!(verdict.status, VerdictStatus::Counterexample);
-        assert!(gate.is_err());
-        assert!(handoff_gate.is_err());
+        assert_eq!(verdict.reason, VerdictReason::CheckFailed { check_index });
+    } else if all_checks_acceptable && !unique_expected_covers && successes > 0 {
+        assert_eq!(verdict.status, VerdictStatus::InvalidReport);
+        assert!(matches!(
+            verdict.reason,
+            VerdictReason::ProbeMatchCountMismatch { .. }
+        ));
+    }
+    if should_pass {
+        assert_eq!(verdict.checks_passed, successes);
+        assert_eq!(verdict.probes_satisfied, probe_count);
+        assert_eq!(verdict.reason, VerdictReason::AllPassed);
     }
 
-    // Unreachable assertion, undetermined check, or any unsatisfied cover must never Pass.
-    if any_unreachable_assertion
-        || any_undetermined_check
-        || any_cover_unsatisfied
-        || any_cover_undetermined
-    {
-        assert_ne!(verdict.status, VerdictStatus::Pass);
-        assert!(gate.is_err());
-        assert!(handoff_gate.is_err());
-    }
-
-    // Hygiene violations always reject both core and handoff gates.
     if hygiene_violations > 0 {
         assert_eq!(gate, Err(GateError::HygieneFailed(hygiene_violations)));
-        assert_eq!(
-            handoff_gate,
-            Err(GateError::HygieneFailed(hygiene_violations))
-        );
+    } else if should_pass {
+        assert_eq!(gate, Ok(()));
+    } else {
+        assert_eq!(gate, Err(GateError::VerdictNotPass(verdict.status)));
     }
 
-    // Unmet spec_digest or blind_back_translation always rejects handoff gate.
-    if !spec_digest_present || !blind_back_translation_verified {
-        assert!(handoff_gate.is_err());
-    }
-
-    // Exact gate soundness.
-    assert_eq!(
-        gate.is_ok(),
-        hygiene_violations == 0 && verdict.status == VerdictStatus::Pass
-    );
-    assert_eq!(
-        handoff_gate.is_ok(),
-        hygiene_violations == 0
-            && verdict.status == VerdictStatus::Pass
-            && spec_digest_present
-            && blind_back_translation_verified
-    );
-
-    // Non-vacuity reachability probes.
     kani::cover!(
-        gate.is_ok() && handoff_gate.is_ok(),
-        "gate_accept_reachable"
+        gate.is_ok() && probe_count == 2 && probe_names[0] != probe_names[1],
+        "gate_accept_two_distinct_probes"
     );
     kani::cover!(
-        len == 0 && verdict.status == VerdictStatus::InvalidReport,
+        metadata_valid && len == 0 && verdict.status == VerdictStatus::InvalidReport,
         "vacuous_empty_rejected"
     );
     kani::cover!(
-        has_harness_name
-            && !should_panic
-            && !solver_error
-            && any_cover_unsatisfied
-            && verdict.status == VerdictStatus::Counterexample,
+        matches!(verdict.reason, VerdictReason::CoverUnsatisfied { .. }),
         "cover_unsatisfied_rejected"
     );
     kani::cover!(
-        has_harness_name
-            && !should_panic
-            && !solver_error
-            && any_pass_check
-            && any_fail_check
-            && verdict.status == VerdictStatus::Counterexample,
-        "failure_overrides_pass_reachable"
+        successes > 0 && matches!(verdict.reason, VerdictReason::CheckFailed { .. }),
+        "failure_overrides_pass"
     );
     kani::cover!(
-        has_harness_name
-            && !should_panic
-            && !solver_error
-            && any_unreachable_assertion
-            && verdict.status == VerdictStatus::Counterexample,
+        matches!(verdict.reason, VerdictReason::AssertionUnreachable { .. }),
         "unreachable_assertion_rejected"
     );
     kani::cover!(
-        matches!(gate, Err(GateError::HygieneFailed(_))),
+        matches!(
+            verdict.reason,
+            VerdictReason::ProbeMatchCountMismatch {
+                matched_count: 0,
+                ..
+            }
+        ) && successes > 0,
+        "missing_required_probe_rejected"
+    );
+    kani::cover!(
+        matches!(
+            verdict.reason,
+            VerdictReason::ProbeMatchCountMismatch {
+                matched_count: 2,
+                ..
+            }
+        ) && successes > 0,
+        "duplicate_required_probe_rejected"
+    );
+    kani::cover!(
+        matches!(gate, Err(GateError::HygieneFailed(_))) && should_pass,
         "gate_hygiene_reject_reachable"
     );
-    kani::cover!(
-        matches!(handoff_gate, Err(GateError::MissingSpecDigest)),
-        "missing_spec_digest_rejected"
-    );
-    kani::cover!(
-        matches!(handoff_gate, Err(GateError::BlindBackTranslationUnverified)),
-        "blind_back_translation_rejected"
-    );
 }
-
-#[cfg(kani)]
 fn starts_with(haystack: &[u8], prefix: &[u8]) -> bool {
     if haystack.len() < prefix.len() {
         return false;
@@ -241,7 +174,6 @@ fn starts_with(haystack: &[u8], prefix: &[u8]) -> bool {
     true
 }
 
-#[cfg(kani)]
 fn extract_host_from_http_url(slice: &[u8]) -> &[u8] {
     let rest = &slice[7..];
     let mut auth_end = rest.len();
@@ -281,7 +213,6 @@ fn extract_host_from_http_url(slice: &[u8]) -> &[u8] {
 /// - `javascript:`/`file:`/`data:` schemes, empty hosts, or non-loopback `http://` URLs.
 /// Also proves `validate_external_sign_in_url_bytes` strictly requires `https://` and implies
 /// `validate_provider_url_bytes` acceptance.
-#[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(18)]
 pub fn prove_provider_url_injection_and_loopback_laws() {

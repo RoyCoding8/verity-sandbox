@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use verity_core::{
-    transition, CheckerVerdict, CommitOid, GateError, RelPath, ScopeError, TaskEvent, TaskId,
-    TaskMode, TaskState, VerdictStatus, VerifierKind,
+    CheckerVerdict, CommitOid, GateError, RelPath, ScopeError, TaskId, VerdictStatus, VerifierKind,
 };
 use verity_runtime::git::{
     commit_tree, commit_worktree_changes, create_worktree, read_ref, remove_worktree, run_git,
@@ -73,6 +72,191 @@ fn mock_pi_config(script: &str) -> PiRpcConfig {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Kani 0.68.0 launchers and working Linux bubblewrap"]
+fn live_kani_approves_standalone_and_cargo_candidates() {
+    assert!(pi_sandbox_available(), "Pi sandbox is required");
+    assert!(std::env::var_os("VERITY_KANI").is_some());
+    assert!(std::env::var_os("VERITY_CARGO_KANI").is_some());
+    let repo = temp_dir("live_kani");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    commit_worktree_changes(&repo, "configure fixture package").unwrap();
+
+    for (id, path, offset) in [
+        ("standalone", "proof.rs", 0),
+        ("cargo", "src/lib.rs", 0),
+        ("counterexample", "proof.rs", 1),
+    ] {
+        let task_id = TaskId::parse(id).unwrap();
+        let source = format!(
+            r#"mod proofs {{
+    #[kani::proof]
+    fn verify_addition_preserves_input() {{
+        let n: u8 = kani::any();
+        assert!(n.saturating_add({offset}) == n);
+        kani::cover!(n == 42, "forty_two");
+    }}
+}}
+"#
+        );
+        let worker = format!(
+            "read -r prompt\ncat > '{path}' <<'RUST'\n{source}RUST\n\
+             printf '%s\\n' '{{\"type\":\"agent_settled\"}}'"
+        );
+        let record = spawn_write_task(WriteTaskRequest {
+            repo_dir: repo.clone(),
+            task_id: task_id.clone(),
+            base_ref: "HEAD".into(),
+            write_scope: vec![RelPath::parse(path).unwrap()],
+            forbidden: Vec::new(),
+            verifier: VerifierKind::RustKani,
+            goal: "Verify lossless addition of zero".into(),
+            pi_config: Some(mock_pi_config(&worker)),
+        })
+        .unwrap();
+        let persisted = load_handoff(&repo, &task_id).unwrap();
+        assert_eq!(persisted, record);
+        let verdict = &persisted.handoff.verdict;
+        assert!(!worktree_path_for(&repo, &task_id).exists());
+        assert!(!repo.join(".verity/checker-worktrees").join(id).exists());
+
+        let merged = approve_and_merge(
+            &repo,
+            &task_id,
+            "main",
+            &persisted.handoff.spec_digest.to_hex(),
+        );
+        if offset > 0 {
+            assert_eq!(
+                verdict.status,
+                VerdictStatus::Counterexample,
+                "{}",
+                verdict.reason
+            );
+            assert!(matches!(merged, Err(OrchestratorError::GateFailed(_))));
+            assert_eq!(
+                read_ref(&repo, "HEAD").unwrap(),
+                Some(persisted.base_commit)
+            );
+            continue;
+        }
+        assert_eq!(
+            verdict.status,
+            VerdictStatus::Pass,
+            "{id}: {}",
+            verdict.reason
+        );
+        assert_eq!(verdict.checks_passed, 1);
+        assert_eq!(verdict.probes_satisfied, 1);
+        assert!(
+            matches!(
+                merged,
+                Ok(MergeResult::Merged {
+                    already_merged: false,
+                    ..
+                })
+            ),
+            "{merged:?}"
+        );
+        assert_eq!(fs::read_to_string(repo.join(path)).unwrap(), source);
+    }
+
+    fs::remove_dir_all(&repo).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Lean 4.35 Lake, a trusted smoke challenge export/config, and Linux bubblewrap"]
+fn live_lean_approves_matching_proof_and_rejects_different_statement() {
+    assert!(pi_sandbox_available(), "Pi sandbox is required");
+    assert!(std::env::var_os("VERITY_LEAN_COMPARATOR").is_some());
+    assert!(std::env::var_os("VERITY_LEAN_COMPARATOR_CONFIG").is_some());
+    let export = std::env::var_os("VERITY_LEAN_CHALLENGE_EXPORT").unwrap();
+    let repo = temp_dir("live_lean");
+    init_git_repo(&repo);
+    fs::write(
+        repo.join("lakefile.toml"),
+        "name = \"smoke\"\n[[lean_lib]]\nname = \"Solution\"\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("lake-manifest.json"),
+        r#"{"version":"1.3.0","packagesDir":".lake/packages","packages":[],"name":"smoke","lakeDir":".lake","fixedToolchain":false}"#,
+    )
+    .unwrap();
+    commit_worktree_changes(&repo, "prepare Lean workspace").unwrap();
+    fs::copy(export, repo.join("challenge.export")).unwrap();
+    let base = read_ref(&repo, "HEAD").unwrap().unwrap();
+
+    for (id, source, status) in [
+        (
+            "different",
+            "theorem smoke : 1 = 1 := rfl\n",
+            VerdictStatus::Inconclusive,
+        ),
+        (
+            "matching",
+            "theorem smoke : True := by trivial\n",
+            VerdictStatus::Pass,
+        ),
+    ] {
+        let task_id = TaskId::parse(id).unwrap();
+        let worker = format!(
+            "read -r prompt\ncat > Solution.lean <<'LEAN'\n{source}LEAN\n\
+             printf '%s\\n' '{{\"type\":\"agent_settled\"}}'"
+        );
+        let record = spawn_write_task(WriteTaskRequest {
+            repo_dir: repo.clone(),
+            task_id: task_id.clone(),
+            base_ref: "HEAD".into(),
+            write_scope: vec![RelPath::parse("Solution.lean").unwrap()],
+            forbidden: Vec::new(),
+            verifier: VerifierKind::Lean4Comparator,
+            goal: "Prove the trusted smoke theorem".into(),
+            pi_config: Some(mock_pi_config(&worker)),
+        })
+        .unwrap();
+        let verdict = &record.handoff.verdict;
+        assert_eq!(verdict.status, status, "{}", verdict.reason);
+        let approved = approve_and_merge(
+            &repo,
+            &task_id,
+            "main",
+            &record.handoff.spec_digest.to_hex(),
+        );
+        match status {
+            VerdictStatus::Pass => {
+                assert_eq!(verdict.checks_passed, 1);
+                assert!(
+                    matches!(approved, Ok(MergeResult::Merged { .. })),
+                    "{approved:?}"
+                );
+                assert_eq!(
+                    fs::read_to_string(repo.join("Solution.lean")).unwrap(),
+                    source
+                );
+            }
+            VerdictStatus::Inconclusive => {
+                assert!(
+                    verdict.reason.contains("theorem statement do not match"),
+                    "{}",
+                    verdict.reason
+                );
+                assert!(matches!(approved, Err(OrchestratorError::GateFailed(_))));
+                assert_eq!(read_ref(&repo, "HEAD").unwrap(), Some(base.clone()));
+            }
+            _ => unreachable!(),
+        }
+    }
+    fs::remove_dir_all(&repo).unwrap();
+}
+
 #[test]
 fn pi_rpc_handles_jsonl_stream_and_enforces_tool_budget_and_timeout() {
     let dir = temp_dir("pi_rpc");
@@ -135,7 +319,7 @@ printf '{"type":"tool_call","name":"read"}\n'"#
 }
 
 #[test]
-fn spec_only_handoff_strips_impl_and_drives_full_state_machine() {
+fn spec_only_handoff_preserves_contract_and_records_candidate_digest() {
     let dir = temp_dir("handoff");
     let src = r#"
 pub fn safe_sub(a: u32, b: u32) -> u32 {
@@ -159,9 +343,7 @@ fn verify_safe_sub() {
     // Implementation body line must NOT leak into the main agent's spec view.
     assert!(!spec.contains("secret_internal_body"));
 
-    let oid_a = CommitOid::parse(&"a".repeat(40)).unwrap();
     let oid_b = CommitOid::parse(&"b".repeat(40)).unwrap();
-    let oid_c = CommitOid::parse(&"c".repeat(40)).unwrap();
 
     let handoff = build_spec_handoff(
         oid_b,
@@ -177,40 +359,29 @@ fn verify_safe_sub() {
     );
     let digest = handoff.spec_digest;
 
-    let mode = TaskMode::write(
-        oid_a,
-        vec![RelPath::parse("src").unwrap()],
-        vec![],
-        VerifierKind::RustKani,
-    )
-    .unwrap();
-    let s1 = transition(&mode, TaskState::Queued, TaskEvent::StartAttempt, 2).unwrap();
-    let s2 = transition(&mode, s1, TaskEvent::SubmitHandoff { handoff }, 2).unwrap();
-    let s3 = transition(
-        &mode,
-        s2,
-        TaskEvent::ApproveSpec {
-            approved_digest: digest,
-        },
-        2,
-    )
-    .unwrap();
-    let s4 = transition(
-        &mode,
-        s3,
-        TaskEvent::CompleteMerge {
-            merged_commit: oid_c,
-            verified_digest: digest,
-        },
-        2,
-    )
-    .unwrap();
-    assert!(matches!(s4, TaskState::Merged { .. }));
+    assert_eq!(handoff.extracted_spec, spec);
+    assert_eq!(handoff.candidate_commit.as_str(), "b".repeat(40));
 
     let log = RunLog::open(&dir).unwrap();
     log.append_event("math-1", "merged", &digest.to_hex())
         .unwrap();
-    assert_eq!(log.read_lines().unwrap().len(), 1);
+    let lines = log.read_lines().unwrap();
+    let [line] = lines.as_slice() else {
+        panic!("expected one run-log entry: {lines:?}");
+    };
+    let event = verity_core::json::parse_json(line).unwrap();
+    assert_eq!(
+        event
+            .get("kind")
+            .and_then(verity_core::json::JsonValue::as_str),
+        Some("merged")
+    );
+    assert_eq!(
+        event
+            .get("detail")
+            .and_then(verity_core::json::JsonValue::as_str),
+        Some(digest.to_hex().as_str())
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

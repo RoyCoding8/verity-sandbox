@@ -382,8 +382,14 @@ fn check_dir_all_descendants_removable(
     dir_rel: &str,
     removals_lookup: &HashSet<String>,
 ) -> Result<(), String> {
-    let entries = fs::read_dir(dir_abs)
-        .map_err(|e| format!("preflight failed reading directory '{dir_rel}': {e}"))?;
+    let mut entries = fs::read_dir(dir_abs)
+        .map_err(|e| format!("preflight failed reading directory '{dir_rel}': {e}"))?
+        .peekable();
+    if entries.peek().is_none() {
+        return Err(format!(
+            "preflight collision: replacing '{dir_rel}' would lose an empty directory that Git cannot restore"
+        ));
+    }
     for entry_res in entries {
         let entry =
             entry_res.map_err(|e| format!("preflight failed reading entry in '{dir_rel}': {e}"))?;
@@ -428,25 +434,7 @@ fn prune_empty_parent_dirs(project_root: &Path, file_path: &Path) {
     }
 }
 
-fn remove_empty_dir_tree(dir: &Path) -> Result<(), String> {
-    for entry_res in
-        fs::read_dir(dir).map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?
-    {
-        let child = entry_res
-            .map_err(|e| format!("failed to iterate directory {}: {e}", dir.display()))?
-            .path();
-        let meta = fs::symlink_metadata(&child)
-            .map_err(|e| format!("failed to inspect {}: {e}", child.display()))?;
-        if is_real_dir(&meta) {
-            remove_empty_dir_tree(&child)?;
-        } else {
-            return Err(format!(
-                "refusing to delete non-empty directory {} containing {}",
-                dir.display(),
-                child.display()
-            ));
-        }
-    }
+fn remove_worktree_dir(dir: &Path) -> Result<(), String> {
     fs::remove_dir(dir).map_err(|e| format!("failed to remove directory {}: {e}", dir.display()))
 }
 
@@ -454,7 +442,7 @@ fn remove_worktree_file(project_root: &Path, rel: &Path) -> Result<(), String> {
     let full = project_root.join(rel);
     if let Ok(meta) = fs::symlink_metadata(&full) {
         if is_real_dir(&meta) {
-            remove_empty_dir_tree(&full)?;
+            remove_worktree_dir(&full)?;
         } else {
             fs::remove_file(&full)
                 .map_err(|e| format!("failed to remove file {}: {e}", full.display()))?;
@@ -470,7 +458,6 @@ struct RestorePlan {
     restores: Vec<(String, PathBuf, bool)>,
     removals_lookup: HashSet<String>,
     restores_ancestors: HashSet<String>,
-    check_ignored: bool,
 }
 
 fn apply_restore_plan(
@@ -488,8 +475,10 @@ fn apply_restore_plan(
             &format!("preflight failed inspecting removal target '{rel}'"),
         )? {
             if is_real_dir(&meta) {
-                check_dir_all_descendants_removable(&full, rel, &plan.removals_lookup)?;
-            } else if plan.check_ignored && is_git_ignored(shadow, project, rel)? {
+                if !plan.restores_ancestors.contains(&fs_key(rel)) {
+                    check_dir_all_descendants_removable(&full, rel, &plan.removals_lookup)?;
+                }
+            } else if is_git_ignored(shadow, project, rel)? {
                 return Err(format!(
                     "preflight collision: refusing to delete ignored file '{rel}'"
                 ));
@@ -515,9 +504,7 @@ fn apply_restore_plan(
         )? {
             if is_real_dir(&meta) {
                 check_dir_all_descendants_removable(&full, rel, &plan.removals_lookup)?;
-            } else if *refuse_if_present
-                || (plan.check_ignored && is_git_ignored(shadow, project, rel)?)
-            {
+            } else if *refuse_if_present || is_git_ignored(shadow, project, rel)? {
                 return Err(format!(
                     "preflight collision: refusing to overwrite ignored or unindexed file '{rel}'"
                 ));
@@ -536,7 +523,7 @@ fn apply_restore_plan(
     for (rel, buf, _) in &plan.restores {
         let full = project.join(buf);
         if fs::symlink_metadata(&full).is_ok_and(|m| is_real_dir(&m)) {
-            remove_empty_dir_tree(&full)?;
+            remove_worktree_dir(&full)?;
         }
         run_git(
             Some(shadow),
@@ -610,7 +597,6 @@ pub fn revert_to_snapshot(
             restores,
             removals_lookup,
             restores_ancestors,
-            check_ignored: true,
         },
     )?;
     Ok(TargetedRevertOutcome {
@@ -712,7 +698,6 @@ fn redo_targeted_revert_locked(
             restores,
             removals_lookup,
             restores_ancestors,
-            check_ignored: true,
         },
     )
 }
@@ -786,7 +771,6 @@ pub fn save_checkpoint_store(project_dir: &Path, store: &CheckpointStore) -> Res
     })
 }
 
-#[allow(dead_code)]
 pub fn record_turn_checkpoint(
     project_dir: &Path,
     session_id: String,
@@ -809,54 +793,6 @@ pub fn record_turn_checkpoint(
     store.checkpoints.push(cp.clone());
     save_checkpoint_store(project_dir, &store)?;
     Ok(cp)
-}
-
-fn persist_turn_checkpoint_unlocked(
-    project_dir: &Path,
-    session_id: String,
-    prompt_preview: String,
-    tree_oid: String,
-) -> Result<TurnCheckpoint, String> {
-    let mut store = load_checkpoint_store_unlocked(project_dir);
-    let turn_index = store
-        .checkpoints
-        .iter()
-        .filter(|c| c.session_id == session_id)
-        .count();
-    let cp = TurnCheckpoint {
-        session_id,
-        entry_id: format!("turn-{}", store.checkpoints.len() + 1),
-        turn_index: Some(turn_index),
-        prompt_preview: normalize_prompt_preview(&prompt_preview),
-        tree_oid,
-        created_at: now_epoch_secs_string(),
-    };
-    store.checkpoints.push(cp.clone());
-    save_checkpoint_store(project_dir, &store)?;
-    Ok(cp)
-}
-
-pub fn record_captured_turn_checkpoint(
-    project_dir: &Path,
-    session_id: String,
-    prompt_preview: String,
-    tree_oid: String,
-) -> Result<TurnCheckpoint, String> {
-    let tree_oid = validate_tree_oid(&tree_oid)?;
-    let _guard = SNAPSHOT_GIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    persist_turn_checkpoint_unlocked(project_dir, session_id, prompt_preview, tree_oid)
-}
-
-#[allow(dead_code)]
-pub fn capture_and_record_turn_checkpoint(
-    project_dir: &Path,
-    session_id: String,
-    prompt_preview: String,
-) -> Result<TurnCheckpoint, String> {
-    let _guard = SNAPSHOT_GIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let (project, shadow) = ensure_shadow_git_dir(project_dir)?;
-    let tree_oid = capture_snapshot_in(&project, &shadow)?;
-    persist_turn_checkpoint_unlocked(project_dir, session_id, prompt_preview, tree_oid)
 }
 
 pub fn save_last_redo(
@@ -926,132 +862,51 @@ fn resolved_session_id(session_id: &str) -> Option<&str> {
     (!trimmed.is_empty() && trimmed != UNRESOLVED_SESSION_ID).then_some(trimmed)
 }
 
-fn prompts_compatible(recorded: &str, requested: &str) -> bool {
-    recorded.is_empty()
-        || recorded == requested
-        || recorded.starts_with(requested)
-        || requested.starts_with(recorded)
+fn is_legacy_checkpoint(checkpoint: &TurnCheckpoint) -> bool {
+    checkpoint
+        .entry_id
+        .strip_prefix("turn-")
+        .is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
-fn find_checkpoint_in_session(
-    store: &CheckpointStore,
-    sid: &str,
-    entry_id: &str,
-    turn_index: Option<usize>,
-    prompt_text: Option<&str>,
-) -> Option<TurnCheckpoint> {
-    let cps: Vec<&TurnCheckpoint> = store
-        .checkpoints
-        .iter()
-        .filter(|c| c.session_id.trim() == sid && validate_tree_oid(&c.tree_oid).is_ok())
-        .collect();
-    if cps.is_empty() {
-        return None;
-    }
-    let norm_prompt = prompt_text
-        .map(normalize_prompt_preview)
-        .filter(|s| !s.is_empty());
-
-    let trimmed_entry = entry_id.trim();
-    if !trimmed_entry.is_empty() {
-        let m: Vec<&TurnCheckpoint> = cps
-            .iter()
-            .copied()
-            .filter(|c| c.entry_id.trim() == trimmed_entry)
-            .collect();
-        if m.len() == 1 {
-            let cand = m[0];
-            let conflict = turn_index.is_some_and(|idx| {
-                cand.turn_index != Some(idx)
-                    && cps
-                        .iter()
-                        .any(|o| !std::ptr::eq(*o, cand) && o.turn_index == Some(idx))
-            });
-            return (!conflict).then(|| cand.clone());
-        }
-        if m.len() > 1 {
-            return None;
-        }
-    }
-    if let Some(idx) = turn_index {
-        let m: Vec<&TurnCheckpoint> = cps
-            .iter()
-            .copied()
-            .filter(|c| c.turn_index == Some(idx))
-            .collect();
-        if m.len() == 1 {
-            let cand = m[0];
-            if norm_prompt
-                .as_deref()
-                .is_none_or(|norm| prompts_compatible(&cand.prompt_preview, norm))
-            {
-                return Some(cand.clone());
-            }
-        }
-        if m.len() > 1 {
-            if let Some(ref norm) = norm_prompt {
-                let d: Vec<&TurnCheckpoint> = m
-                    .into_iter()
-                    .filter(|c| c.prompt_preview == *norm)
-                    .collect();
-                if d.len() == 1 {
-                    return Some(d[0].clone());
-                }
-            }
-            return None;
-        }
-    }
-    if let Some(ref norm) = norm_prompt {
-        let m: Vec<&TurnCheckpoint> = cps
-            .iter()
-            .copied()
-            .filter(|c| c.prompt_preview == *norm)
-            .collect();
-        if m.len() == 1 {
-            return Some(m[0].clone());
-        }
-    }
-    None
-}
-
-/// Finds a checkpoint across an ordered session lineage (active session first, then parent
-/// session(s)), stopping at the first resolved session that matches cleanly.
+/// Match Pi's entry identity across the lineage. Older checkpoints stored local ordinals, so
+/// their prompt previews can identify a possible missing binding but cannot select a snapshot.
 pub fn find_checkpoint_with_lineage(
     store: &CheckpointStore,
-    session_ids: &[&str],
+    session_ids: &[String],
     entry_id: &str,
-    turn_index: Option<usize>,
     prompt_preview: Option<&str>,
-) -> Option<TurnCheckpoint> {
-    let mut seen = HashSet::new();
-    for raw_sid in session_ids {
-        let Some(sid) = resolved_session_id(raw_sid) else {
-            continue;
+) -> Result<Option<TurnCheckpoint>, String> {
+    let checkpoints = store.checkpoints.iter().filter(|checkpoint| {
+        session_ids
+            .iter()
+            .any(|id| id == checkpoint.session_id.trim())
+            && validate_tree_oid(&checkpoint.tree_oid).is_ok()
+    });
+    let mut exact = checkpoints
+        .clone()
+        .filter(|checkpoint| !is_legacy_checkpoint(checkpoint) && checkpoint.entry_id == entry_id);
+    if let Some(checkpoint) = exact.next() {
+        return if exact.next().is_none() {
+            Ok(Some(checkpoint.clone()))
+        } else {
+            Err("Multiple code snapshots claim this Pi entry. The project files were left unchanged.".into())
         };
-        if !seen.insert(sid) {
-            continue;
-        }
-        if let Some(cp) =
-            find_checkpoint_in_session(store, sid, entry_id, turn_index, prompt_preview)
-        {
-            return Some(cp);
-        }
     }
-    None
+
+    if checkpoints.into_iter().any(|checkpoint| {
+        is_legacy_checkpoint(checkpoint)
+            && prompt_preview.is_none_or(|prompt| {
+                checkpoint.prompt_preview.is_empty() || checkpoint.prompt_preview == prompt
+            })
+    }) {
+        return Err("An older code snapshot lacks the Pi entry ID needed to restore this turn. Revert the chat without restoring project files to continue.".into());
+    }
+    Ok(None)
 }
 
-/// Finds a checkpoint strictly bound to `session_id` (unique entry_id -> unique turn_index -> unique prompt).
-#[allow(dead_code)]
-pub fn find_checkpoint(
-    store: &CheckpointStore,
-    session_id: Option<&str>,
-    entry_id: &str,
-    turn_index: Option<usize>,
-    prompt_text: Option<&str>,
-) -> Option<TurnCheckpoint> {
-    let sid = session_id?;
-    find_checkpoint_with_lineage(store, &[sid], entry_id, turn_index, prompt_text)
-}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1139,11 +994,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sha256_matches_fips_180_4_vector() {
+    fn snapshots_belong_to_the_canonical_project() {
+        let env = TestEnv::new("project-isolation", false);
+        let sibling = env.root.join("sibling");
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("notes.txt"), "other project").unwrap();
+        env.write("notes.txt", "original");
+        let tree = env.capture();
+        assert_eq!(capture_snapshot(&env.project.join(".")).unwrap(), tree);
+        capture_snapshot(&sibling).unwrap();
+
+        assert!(revert_to_snapshot(&sibling, &tree).is_err());
         assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            fs::read_to_string(sibling.join("notes.txt")).unwrap(),
+            "other project"
         );
+
+        env.write("notes.txt", "changed");
+        revert_to_snapshot(&env.project.join("."), &tree).unwrap();
+        assert_eq!(env.read("notes.txt"), "original");
     }
 
     #[test]
@@ -1241,137 +1110,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn checkpoint_persistence_and_lookup_work_by_entry_id_and_prompt() {
-        let env = TestEnv::new("cp", false);
-        let oid = "0123456789abcdef0123456789abcdef01234567".to_string();
-        record_turn_checkpoint(
-            &env.project,
-            "sess-1".into(),
-            "turn-1".into(),
-            Some(0),
-            "  Fix   the login bug  ".into(),
-            oid.clone(),
-        )
-        .unwrap();
-        let store = load_checkpoint_store(&env.project);
-        assert_eq!(store.checkpoints[0].prompt_preview, "Fix the login bug");
-        assert_eq!(
-            find_checkpoint(&store, Some("sess-1"), "turn-1", None, None)
-                .unwrap()
-                .tree_oid,
-            oid
-        );
-        assert_eq!(
-            find_checkpoint(&store, Some("sess-1"), "pi-99", Some(0), None)
-                .unwrap()
-                .tree_oid,
-            oid
-        );
-        assert_eq!(
-            find_checkpoint(
-                &store,
-                Some("sess-1"),
-                "pi-99",
-                Some(99),
-                Some("Fix the login bug")
-            )
-            .unwrap()
-            .tree_oid,
-            oid
-        );
-        assert!(
-            find_checkpoint(&store, Some("sess-1"), "unknown", Some(5), Some("other")).is_none()
-        );
-    }
-
-    #[test]
-    fn foreign_or_unresolved_session_checkpoint_never_applies() {
-        let env = TestEnv::new("foreign-cp", false);
-        record_turn_checkpoint(
-            &env.project,
-            "session-a".into(),
-            "turn-1".into(),
-            Some(0),
-            "Shared".into(),
-            "1111111111111111111111111111111111111111".into(),
-        )
-        .unwrap();
-        record_turn_checkpoint(
-            &env.project,
-            "default-session".into(),
-            "turn-2".into(),
-            Some(0),
-            "Default".into(),
-            "2222222222222222222222222222222222222222".into(),
-        )
-        .unwrap();
-        let store = load_checkpoint_store(&env.project);
-        for (sid, eid, prompt) in [
-            (Some("session-b"), "turn-1", "Shared"),
-            (Some("session-b"), "turn-2", "Default"),
-            (Some("   "), "turn-1", "Shared"),
-            (Some("default-session"), "turn-2", "Default"),
-            (None, "turn-1", "Shared"),
-        ] {
-            assert!(find_checkpoint(&store, sid, eid, Some(0), Some(prompt)).is_none());
-        }
-    }
-
-    #[test]
-    fn ambiguous_same_session_checkpoints_never_apply_without_unique_disambiguation() {
-        let env = TestEnv::new("ambig-cp", false);
-        let oid0 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let oid_b = "dddddddddddddddddddddddddddddddddddddddd".to_string();
-        for (eid, idx, prompt, oid) in [
-            ("turn-1", 0, "continue", oid0.clone()),
-            (
-                "turn-2",
-                1,
-                "continue",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-            ),
-            (
-                "turn-3",
-                2,
-                "alpha task",
-                "cccccccccccccccccccccccccccccccccccccccc".into(),
-            ),
-            ("turn-4", 2, "beta task", oid_b.clone()),
-        ] {
-            record_turn_checkpoint(
-                &env.project,
-                "session-a".into(),
-                eid.into(),
-                Some(idx),
-                prompt.into(),
-                oid,
-            )
-            .unwrap();
-        }
-        let store = load_checkpoint_store(&env.project);
-        assert!(find_checkpoint(&store, Some("session-a"), "x", None, Some("continue")).is_none());
-        assert_eq!(
-            find_checkpoint(&store, Some("session-a"), "x", Some(0), Some("continue"))
-                .unwrap()
-                .tree_oid,
-            oid0
-        );
-        assert!(find_checkpoint(&store, Some("session-a"), "x", Some(2), None).is_none());
-        assert_eq!(
-            find_checkpoint(&store, Some("session-a"), "x", Some(2), Some("beta task"))
-                .unwrap()
-                .tree_oid,
-            oid_b
-        );
-        assert!(find_checkpoint(&store, Some("session-a"), "turn-1", Some(1), None).is_none());
-    }
-
-    #[test]
     fn revert_and_redo_preserve_sibling_ignored_file_inside_shared_directory() {
         let env = TestEnv::new("sib-ign", true);
         env.write(".gitignore", "*.ignored\n");
         env.write("shape/keep.txt", "v1");
         env.write("shape/local.ignored", "stay safe");
+        fs::create_dir(env.path("shape/local-empty")).unwrap();
         let snap1 = env.capture();
 
         env.write("shape/keep.txt", "v2");
@@ -1380,11 +1124,13 @@ pub(crate) mod tests {
         assert_eq!(env.read("shape/keep.txt"), "v1");
         assert!(!env.path("shape/added.txt").exists());
         assert_eq!(env.read("shape/local.ignored"), "stay safe");
+        assert!(env.path("shape/local-empty").is_dir());
 
         env.redo(&outcome).unwrap();
         assert_eq!(env.read("shape/keep.txt"), "v2");
         assert_eq!(env.read("shape/added.txt"), "extra");
         assert_eq!(env.read("shape/local.ignored"), "stay safe");
+        assert!(env.path("shape/local-empty").is_dir());
     }
 
     #[test]
@@ -1555,7 +1301,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn revert_and_redo_succeed_for_dir_to_file_transition_with_empty_untracked_subdir() {
+    fn revert_refuses_a_directory_to_file_transition_with_an_empty_subdirectory() {
         let env = TestEnv::new("shape-empty-sub", true);
         env.write("aaa.txt", "before");
         env.write("shape", "original file");
@@ -1566,14 +1312,43 @@ pub(crate) mod tests {
         env.write("shape/visible.txt", "dir file");
         fs::create_dir_all(env.path("shape/empty_sub")).unwrap();
 
-        let outcome = env.revert(&snap1).unwrap();
-        assert_eq!(env.read("aaa.txt"), "before");
-        assert!(!env.path("shape").is_dir());
-        assert_eq!(env.read("shape"), "original file");
-
-        env.redo(&outcome).unwrap();
+        assert!(env.revert(&snap1).unwrap_err().contains("empty directory"));
         assert_eq!(env.read("aaa.txt"), "after");
         assert_eq!(env.read("shape/visible.txt"), "dir file");
+        assert!(env.path("shape/empty_sub").is_dir());
+    }
+
+    #[test]
+    fn redo_refuses_a_directory_to_file_transition_with_an_empty_subdirectory() {
+        let env = TestEnv::new("redo-shape-empty-sub", false);
+        env.write("aaa.txt", "before");
+        env.write("shape/visible.txt", "dir file");
+        let snap1 = env.capture();
+        env.write("aaa.txt", "after");
+        env.rm("shape");
+        env.write("shape", "replacement file");
+        let outcome = env.revert(&snap1).unwrap();
+        save_last_redo(
+            &env.project,
+            outcome.redo_tree_oid,
+            outcome.reverted_files,
+            outcome.target_tree_oid,
+            "session-a",
+        )
+        .unwrap();
+        fs::create_dir_all(env.path("shape/nested/empty_sub")).unwrap();
+
+        assert!(redo_last_revert(&env.project, Some("session-a"))
+            .unwrap_err()
+            .contains("empty directory"));
+        assert_eq!(env.read("aaa.txt"), "before");
+        assert_eq!(env.read("shape/visible.txt"), "dir file");
+        assert!(env.path("shape/nested/empty_sub").is_dir());
+        fs::remove_dir(env.path("shape/nested/empty_sub")).unwrap();
+        fs::remove_dir(env.path("shape/nested")).unwrap();
+        redo_last_revert(&env.project, Some("session-a")).unwrap();
+        assert_eq!(env.read("aaa.txt"), "after");
+        assert_eq!(env.read("shape"), "replacement file");
     }
 
     #[test]
@@ -1596,106 +1371,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn find_checkpoint_with_lineage_resolves_active_then_parent_and_blocks_foreign() {
-        let env = TestEnv::new("lineage-cp", false);
-        let oid_p0 = "1111111111111111111111111111111111111111".to_string();
-        let oid_p1 = "2222222222222222222222222222222222222222".to_string();
-        let oid_c0 = "3333333333333333333333333333333333333333".to_string();
-        let oid_foreign = "4444444444444444444444444444444444444444".to_string();
-
-        record_turn_checkpoint(
-            &env.project,
-            "session-parent".into(),
-            "turn-1".into(),
-            Some(0),
-            "First prompt".into(),
-            oid_p0.clone(),
-        )
-        .unwrap();
-        record_turn_checkpoint(
-            &env.project,
-            "session-parent".into(),
-            "turn-2".into(),
-            Some(1),
-            "Second prompt".into(),
-            oid_p1.clone(),
-        )
-        .unwrap();
-        record_turn_checkpoint(
-            &env.project,
-            "session-child".into(),
-            "turn-3".into(),
-            Some(0),
-            "Revised second prompt".into(),
-            oid_c0.clone(),
-        )
-        .unwrap();
-        record_turn_checkpoint(
-            &env.project,
-            "session-foreign".into(),
-            "turn-4".into(),
-            Some(0),
-            "Foreign prompt".into(),
-            oid_foreign,
-        )
-        .unwrap();
-
-        let store = load_checkpoint_store(&env.project);
-        let lineage = ["session-child", "session-parent"];
-
-        // Active child session checkpoint wins when matching its own turn.
-        assert_eq!(
-            find_checkpoint_with_lineage(
-                &store,
-                &lineage,
-                "pi-c1",
-                Some(0),
-                Some("Revised second prompt"),
-            )
-            .unwrap()
-            .tree_oid,
-            oid_c0
-        );
-
-        // Chained revert to an earlier parent turn falls through cleanly to parent session.
-        assert_eq!(
-            find_checkpoint_with_lineage(&store, &lineage, "pi-p0", Some(0), Some("First prompt"))
-                .unwrap()
-                .tree_oid,
-            oid_p0
-        );
-        assert_eq!(
-            find_checkpoint_with_lineage(
-                &store,
-                &lineage,
-                "pi-p1",
-                Some(1),
-                Some("Second prompt"),
-            )
-            .unwrap()
-            .tree_oid,
-            oid_p1
-        );
-
-        // Foreign session checkpoints are never matched.
-        assert!(find_checkpoint_with_lineage(
-            &store,
-            &lineage,
-            "turn-4",
-            Some(0),
-            Some("Foreign prompt"),
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn clean_git_command_suppresses_windows_console_and_terminal_prompts() {
+    fn clean_git_command_disables_terminal_prompts() {
         let cmd = clean_git_command();
         assert!(cmd
             .get_envs()
             .any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v == Some(std::ffi::OsStr::new("0"))));
-        let source = include_str!("snapshots.rs");
-        assert!(source.contains("CREATE_NO_WINDOW"));
-        assert!(source.contains("Stdio::null()"));
     }
 }

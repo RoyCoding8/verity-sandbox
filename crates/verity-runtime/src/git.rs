@@ -105,8 +105,16 @@ pub fn read_ref(repo_dir: &Path, ref_name: &str) -> Result<Option<CommitOid>, Gi
             ref_name,
         ],
     )?;
-    if !out.status.success() {
-        return Ok(None);
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(None),
+        code => {
+            return Err(GitError::CommandFailed {
+                args: vec!["rev-parse".to_string(), ref_name.to_string()],
+                code,
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
     }
     let hex = String::from_utf8_lossy(&out.stdout).trim().to_string();
     CommitOid::parse(&hex)
@@ -250,39 +258,38 @@ pub fn merge_tree(
             "--write-tree",
             "--name-only",
             "--no-messages",
+            "-z",
             target_oid.as_str(),
             candidate_oid.as_str(),
         ],
     )?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut lines = stdout.lines().filter(|l| !l.trim().is_empty());
-    let first = lines
+    let conflicted = match out.status.code() {
+        Some(0) => false,
+        Some(1) if !out.stdout.is_empty() => true,
+        code => {
+            return Err(GitError::CommandFailed {
+                args: vec!["merge-tree".to_string()],
+                code,
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+    };
+    let stdout = std::str::from_utf8(&out.stdout)
+        .map_err(|_| GitError::InvalidOutput("non-UTF-8 merge-tree output".to_string()))?;
+    let mut fields = stdout.split_terminator('\0');
+    let first = fields
         .next()
         .ok_or_else(|| GitError::InvalidOutput("empty merge-tree output".to_string()))?;
+    let tree_oid = CommitOid::parse(first)
+        .map_err(|e| GitError::InvalidOutput(format!("bad tree oid: {}", e)))?;
 
-    if out.status.success() {
-        let tree_oid = CommitOid::parse(first.trim())
-            .map_err(|e| GitError::InvalidOutput(format!("bad tree oid: {}", e)))?;
+    if !conflicted {
         return Ok(MergeOutcome::Clean { tree_oid });
     }
-
-    if out.status.code() == Some(1) {
-        let mut conflicted = Vec::new();
-        for line in lines {
-            if let Ok(rel) = RelPath::parse(line.trim()) {
-                conflicted.push(rel);
-            }
-        }
-        return Ok(MergeOutcome::Conflict {
-            conflicted_paths: conflicted,
-        });
-    }
-
-    Err(GitError::CommandFailed {
-        args: vec!["merge-tree".to_string()],
-        code: out.status.code(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    })
+    let conflicted_paths = fields
+        .map(|path| RelPath::parse(path).map_err(|e| GitError::InvalidOutput(e.to_string())))
+        .collect::<Result<_, _>>()?;
+    Ok(MergeOutcome::Conflict { conflicted_paths })
 }
 
 pub fn commit_tree(

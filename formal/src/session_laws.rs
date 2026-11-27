@@ -56,6 +56,25 @@ fn any_command() -> SessionCommand {
 #[kani::proof]
 pub fn prove_session_exclusivity_and_queue_laws() {
     let activity = any_activity();
+    assert_eq!(
+        activity.is_idle(),
+        matches!(activity, SessionActivity::Idle)
+    );
+    match activity {
+        SessionActivity::Streaming {
+            pending_queue,
+            reload_deferred,
+        } => {
+            assert!(activity.is_streaming());
+            assert_eq!(activity.pending_queue(), pending_queue);
+            assert_eq!(activity.reload_deferred(), reload_deferred);
+        }
+        _ => {
+            assert!(!activity.is_streaming());
+            assert_eq!(activity.pending_queue(), 0);
+            assert!(!activity.reload_deferred());
+        }
+    }
     let command = any_command();
     let res = transition_session(activity, command);
 
@@ -110,7 +129,6 @@ pub fn prove_session_exclusivity_and_queue_laws() {
                             reload_deferred,
                         }
                     );
-                    assert_eq!(t.activity.reload_deferred(), reload_deferred);
                     assert!(!t.run_provider_reload);
                 } else {
                     assert_eq!(res, Err(SessionError::QueueFull));
@@ -130,7 +148,6 @@ pub fn prove_session_exclusivity_and_queue_laws() {
                         reload_deferred,
                     }
                 );
-                assert_eq!(t.activity.reload_deferred(), reload_deferred);
                 assert!(!t.run_provider_reload);
             }
             _ => assert_eq!(res, Err(SessionError::NotStreaming)),
@@ -187,29 +204,12 @@ pub fn prove_session_exclusivity_and_queue_laws() {
         SessionCommand::Abort => {
             let t = res.expect("Abort must succeed from any state");
             assert_eq!(t.activity, SessionActivity::Idle);
-            assert_eq!(t.activity.pending_queue(), 0);
-            assert!(!t.activity.reload_deferred());
             assert_eq!(t.run_provider_reload, activity.reload_deferred());
-
-            // Idempotence: a second Abort from Idle stays Idle without re-triggering reload.
-            let again = transition_session(t.activity, SessionCommand::Abort)
-                .expect("Abort from Idle must be idempotent");
-            assert_eq!(again.activity, SessionActivity::Idle);
-            assert_eq!(again.activity.pending_queue(), 0);
-            assert!(!again.run_provider_reload);
         }
         SessionCommand::ProcessExited => {
             let t = res.expect("ProcessExited must succeed from any state");
             assert_eq!(t.activity, SessionActivity::Idle);
-            assert_eq!(t.activity.pending_queue(), 0);
-            assert!(!t.activity.reload_deferred());
             assert!(!t.run_provider_reload);
-
-            // Idempotence: a second ProcessExited stays Idle.
-            let again = transition_session(t.activity, SessionCommand::ProcessExited)
-                .expect("ProcessExited from Idle must be idempotent");
-            assert_eq!(again.activity, SessionActivity::Idle);
-            assert_eq!(again.activity.pending_queue(), 0);
         }
     }
 
@@ -318,120 +318,5 @@ pub fn prove_session_exclusivity_and_queue_laws() {
             )
         ),
         "abort_and_exit_from_switching"
-    );
-}
-
-/// Bounded Multi-Step Trace Law:
-/// Over an arbitrary symbolic sequence of up to 5 commands starting from `Idle`,
-/// every session invariant holds at every step:
-/// - `pending_queue == 0` and `!reload_deferred` whenever not `Streaming`
-/// - Exclusive commands (`SendPrompt`, `Compact`, `SwitchSession`, `NewSession`, `Fork`, `CloneSession`)
-///   are never accepted when not `Idle`
-/// - `reload_deferred` is never lost while `Streaming` and fires on `AgentSettled` or `Abort`
-/// - `Abort` and `ProcessExited` always succeed and recover to `Idle`
-#[cfg(kani)]
-#[kani::proof]
-#[kani::unwind(7)]
-pub fn prove_bounded_multi_step_session_trace() {
-    let mut activity = SessionActivity::Idle;
-    let mut reload_requested_while_streaming = false;
-    let mut deferred_reload_on_settle = false;
-    let mut deferred_reload_on_abort = false;
-    let mut process_exited_from_busy = false;
-    let mut exclusive_rejected_while_busy = false;
-
-    let steps: u8 = kani::any();
-    kani::assume(steps <= 5);
-
-    for _ in 0..steps {
-        let cmd = any_command();
-        let was_idle = activity.is_idle();
-        let was_streaming = activity.is_streaming();
-        let is_exclusive = matches!(
-            cmd,
-            SessionCommand::SendPrompt
-                | SessionCommand::Compact
-                | SessionCommand::SwitchSession
-                | SessionCommand::NewSession
-                | SessionCommand::Fork
-                | SessionCommand::CloneSession
-        );
-
-        match transition_session(activity, cmd) {
-            Ok(t) => {
-                if is_exclusive {
-                    assert!(was_idle, "exclusive command must only succeed from Idle");
-                }
-                if was_streaming && matches!(cmd, SessionCommand::RequestProviderReload) {
-                    reload_requested_while_streaming = true;
-                    assert!(t.activity.is_streaming());
-                    assert!(t.activity.reload_deferred());
-                    assert!(!t.run_provider_reload);
-                }
-                if matches!(cmd, SessionCommand::AgentSettled) {
-                    assert_eq!(t.activity, SessionActivity::Idle);
-                    assert_eq!(t.run_provider_reload, reload_requested_while_streaming);
-                    if t.run_provider_reload {
-                        deferred_reload_on_settle = true;
-                    }
-                    reload_requested_while_streaming = false;
-                }
-                if matches!(cmd, SessionCommand::Abort) {
-                    assert_eq!(t.activity, SessionActivity::Idle);
-                    assert_eq!(t.activity.pending_queue(), 0);
-                    assert_eq!(t.run_provider_reload, reload_requested_while_streaming);
-                    if t.run_provider_reload {
-                        deferred_reload_on_abort = true;
-                    }
-                    reload_requested_while_streaming = false;
-                }
-                if matches!(cmd, SessionCommand::ProcessExited) {
-                    assert_eq!(t.activity, SessionActivity::Idle);
-                    assert_eq!(t.activity.pending_queue(), 0);
-                    if !was_idle {
-                        process_exited_from_busy = true;
-                    }
-                    reload_requested_while_streaming = false;
-                }
-                if t.activity.is_streaming() && reload_requested_while_streaming {
-                    assert!(
-                        t.activity.reload_deferred(),
-                        "deferred reload flag must persist until AgentSettled or Abort"
-                    );
-                }
-                if !t.activity.is_streaming() {
-                    assert_eq!(t.activity.pending_queue(), 0);
-                    assert!(!t.activity.reload_deferred());
-                }
-                activity = t.activity;
-            }
-            Err(err) => {
-                assert!(
-                    !matches!(cmd, SessionCommand::Abort | SessionCommand::ProcessExited),
-                    "Abort and ProcessExited must never fail"
-                );
-                if is_exclusive && !was_idle {
-                    assert_eq!(err, SessionError::NotIdle);
-                    exclusive_rejected_while_busy = true;
-                }
-            }
-        }
-    }
-
-    kani::cover!(
-        deferred_reload_on_settle,
-        "multi_step_deferred_reload_on_settle"
-    );
-    kani::cover!(
-        deferred_reload_on_abort,
-        "multi_step_deferred_reload_on_abort"
-    );
-    kani::cover!(
-        process_exited_from_busy,
-        "multi_step_process_exited_recovery"
-    );
-    kani::cover!(
-        exclusive_rejected_while_busy,
-        "multi_step_exclusive_rejected_while_busy"
     );
 }

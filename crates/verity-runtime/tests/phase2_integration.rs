@@ -2,10 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use verity_core::classify_kani_report;
-use verity_core::{RelPath, TaskId, VerdictStatus};
+use verity_core::{CommitOid, RelPath, TaskId, VerdictStatus};
 use verity_runtime::git::{
     changed_paths, commit_tree, commit_worktree_changes, create_worktree, git_common_dir,
-    merge_tree, read_ref, remove_worktree, update_ref_cas, MergeOutcome,
+    merge_tree, read_ref, remove_worktree, update_ref_cas, GitError, MergeOutcome,
 };
 use verity_runtime::jail::{JailError, WorkspaceJail};
 use verity_runtime::sandbox::{bwrap_available, default_offline_config, run_sandboxed};
@@ -59,6 +59,9 @@ fn git_worktree_merge_tree_and_cas_ref_lifecycle() {
     fs::create_dir_all(&repo).unwrap();
     init_test_repo(&repo);
 
+    let file = "café overview.rs";
+    fs::rename(repo.join("lib.rs"), repo.join(file)).unwrap();
+    commit_worktree_changes(&repo, "rename fixture").unwrap();
     let base = read_ref(&repo, "refs/heads/main").unwrap().unwrap();
     let wt_path = root.join("worktrees/task-1");
     let task_id = TaskId::parse("task-1").unwrap();
@@ -66,12 +69,12 @@ fn git_worktree_merge_tree_and_cas_ref_lifecycle() {
     create_worktree(&repo, &wt_path, &task_id, &base).unwrap();
 
     let change = "pub fn add(a: u32, b: u32) -> u32 { a.saturating_add(b) }\n";
-    fs::write(wt_path.join("lib.rs"), change).unwrap();
+    fs::write(wt_path.join(file), change).unwrap();
     assert!(create_worktree(&repo, &wt_path, &task_id, &base).is_err());
-    assert_eq!(fs::read_to_string(wt_path.join("lib.rs")).unwrap(), change);
+    assert_eq!(fs::read_to_string(wt_path.join(file)).unwrap(), change);
     let cand = commit_worktree_changes(&wt_path, "task-1 candidate").unwrap();
     let diffs = changed_paths(&repo, &base, &cand).unwrap();
-    assert_eq!(diffs, vec![RelPath::parse("lib.rs").unwrap()]);
+    assert_eq!(diffs, vec![RelPath::parse(file).unwrap()]);
 
     // Clean lock-free merge-tree + commit-tree + CAS ref update.
     let merged_tree = match merge_tree(&repo, &base, &cand).unwrap() {
@@ -88,14 +91,14 @@ fn git_worktree_merge_tree_and_cas_ref_lifecycle() {
     let wt2 = root.join("worktrees/task-2");
     create_worktree(&repo, &wt2, &TaskId::parse("task-2").unwrap(), &base).unwrap();
     fs::write(
-        wt2.join("lib.rs"),
+        wt2.join(file),
         "pub fn add(a: u32, b: u32) -> u32 { a.wrapping_add(b) }\n",
     )
     .unwrap();
     let cand2 = commit_worktree_changes(&wt2, "task-2 conflicting").unwrap();
     match merge_tree(&repo, &merged_commit, &cand2).unwrap() {
         MergeOutcome::Conflict { conflicted_paths } => {
-            assert_eq!(conflicted_paths, vec![RelPath::parse("lib.rs").unwrap()]);
+            assert_eq!(conflicted_paths, vec![RelPath::parse(file).unwrap()]);
         }
         MergeOutcome::Clean { .. } => panic!("expected conflict"),
     }
@@ -103,6 +106,28 @@ fn git_worktree_merge_tree_and_cas_ref_lifecycle() {
     remove_worktree(&repo, &wt_path).unwrap();
     remove_worktree(&repo, &wt2).unwrap();
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn git_reports_execution_failures_separately_from_missing_refs_and_conflicts() {
+    let root = temp_dir("git_failures");
+    assert!(matches!(
+        read_ref(&root, "refs/heads/main"),
+        Err(GitError::CommandFailed {
+            code: Some(128),
+            ..
+        })
+    ));
+    init_test_repo(&root);
+    assert_eq!(read_ref(&root, "refs/heads/missing").unwrap(), None);
+
+    let base = read_ref(&root, "HEAD").unwrap().unwrap();
+    let missing = CommitOid::parse(&"1".repeat(40)).unwrap();
+    let error = merge_tree(&root, &base, &missing).unwrap_err();
+    assert!(matches!(error, GitError::CommandFailed { .. }), "{error}");
+    assert_eq!(read_ref(&root, "HEAD").unwrap(), Some(base));
+
+    fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

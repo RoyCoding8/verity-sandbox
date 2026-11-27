@@ -64,96 +64,63 @@ pub fn prove_utf16_surrogate_pair_and_hex4_laws() {
     kani::cover!(parsed.is_none(), "hex4_invalid");
 }
 
-/// Law: Strict RFC 8259 number byte validation is panic-free on all bounded
-/// byte slices (len 0..=8), rejects malformed forms, and accepts valid
-/// integers, negatives, decimals, and scientific notation.
+#[cfg(kani)]
+fn decimal_digits(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)
+}
+
+#[cfg(kani)]
+fn json_number_grammar(bytes: &[u8]) -> bool {
+    let mut exponent_parts = bytes.splitn(2, |&byte| matches!(byte, b'e' | b'E'));
+    let mantissa = exponent_parts.next().unwrap_or_default();
+    if let Some(exponent) = exponent_parts.next() {
+        let digits = match exponent {
+            [b'+' | b'-', digits @ ..] => digits,
+            _ => exponent,
+        };
+        if !decimal_digits(digits) {
+            return false;
+        }
+    }
+
+    let mut mantissa_parts = mantissa.splitn(2, |&byte| byte == b'.');
+    let integer = mantissa_parts.next().unwrap_or_default();
+    let integer = match integer {
+        [b'-', digits @ ..] => digits,
+        _ => integer,
+    };
+    let integer_valid = match integer {
+        b"0" => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    integer_valid && mantissa_parts.next().is_none_or(decimal_digits)
+}
+
+/// Exact RFC 8259 number syntax over all byte slices of length zero to eight.
 #[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(10)]
 pub fn prove_json_number_syntax_laws() {
     let buf: [u8; 8] = kani::any();
     let len: usize = kani::any();
-    kani::assume(len <= 8);
+    kani::assume(len <= buf.len());
     let bytes = &buf[..len];
 
     let valid = validate_json_number_bytes(bytes);
+    assert_eq!(valid, json_number_grammar(bytes));
 
-    if len == 0 {
-        assert!(!valid);
-    }
-
-    if len >= 2 && bytes[0] == b'0' && bytes[1].is_ascii_digit() {
-        assert!(!valid);
-    }
-    if len >= 3 && bytes[0] == b'-' && bytes[1] == b'0' && bytes[2].is_ascii_digit() {
-        assert!(!valid);
-    }
-
-    if len >= 1 {
-        let first = bytes[0];
-        let last = bytes[len - 1];
-        if matches!(last, b'.' | b'e' | b'E' | b'+' | b'-') {
-            assert!(!valid);
-        }
-        if valid {
-            assert!(first == b'-' || first.is_ascii_digit());
-            assert!(last.is_ascii_digit());
-        }
-    }
-
-    let mut dot_count = 0usize;
-    let mut exp_count = 0usize;
-    let mut i = 0usize;
-    while i < len {
-        let b = bytes[i];
-        if valid {
-            assert!(matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'));
-        }
-        if b == b'.' {
-            dot_count += 1;
-        }
-        if b == b'e' || b == b'E' {
-            exp_count += 1;
-        }
-        i += 1;
-    }
-
-    if valid {
-        assert!(dot_count <= 1);
-        assert!(exp_count <= 1);
-    }
-
-    let has_dot = dot_count > 0;
-    let has_exp = exp_count > 0;
-
-    // Valid classes
+    kani::cover!(valid && bytes == b"0", "zero_accepted");
+    kani::cover!(valid && bytes == b"-12", "negative_integer_accepted");
+    kani::cover!(valid && bytes == b"1.2", "decimal_accepted");
+    kani::cover!(valid && bytes == b"1.2e-6", "scientific_notation_accepted");
+    kani::cover!(!valid && bytes == b"-01", "leading_zero_rejected");
     kani::cover!(
-        valid && len >= 1 && bytes[0] != b'-' && !has_dot && !has_exp,
-        "number_valid_integer"
+        !valid && bytes == b"1e+",
+        "missing_exponent_digits_rejected"
     );
-    kani::cover!(
-        valid && len >= 2 && bytes[0] == b'-' && !has_dot && !has_exp,
-        "number_valid_negative"
-    );
-    kani::cover!(valid && has_dot && !has_exp, "number_valid_decimal");
-    kani::cover!(
-        valid && bytes == b"1.2e-6",
-        "number_valid_scientific_1_2e_6"
-    );
-
-    // Rejected classes
-    kani::cover!(!valid && len == 0, "number_reject_empty");
-    kani::cover!(!valid && bytes == b"01", "number_reject_leading_zero");
-    kani::cover!(!valid && bytes == b"1.", "number_reject_dangling_dot");
-    kani::cover!(!valid && bytes == b"1e", "number_reject_dangling_exp");
-    kani::cover!(!valid && bytes == b"1e+", "number_reject_dangling_exp_plus");
-    kani::cover!(
-        !valid && bytes == b"1e-",
-        "number_reject_dangling_exp_minus"
-    );
-    kani::cover!(!valid && bytes == b"1.2.3", "number_reject_double_dot");
+    kani::cover!(!valid && bytes == b"1.2.3", "second_decimal_point_rejected");
 }
-
 /// Law: JSON number serialization classification never emits non-finite floats
 /// (all NaN/+Inf/-Inf bit patterns map to `NonFinite`), and string escape
 /// classification never passes through control chars (< 0x20), `"`, or `\`.
@@ -191,7 +158,9 @@ pub fn prove_json_number_serialization_and_escape_laws() {
     let half_base: i16 = kani::any();
     let frac_f = (half_base as f64) + 0.5;
     match classify_json_number(frac_f) {
-        JsonNumberKind::Float(f) => assert!(f.is_finite()),
+        JsonNumberKind::Float(f) => {
+            assert!(f.is_finite());
+        }
         _ => unreachable!("x + 0.5 for i16 must classify as finite Float"),
     }
 

@@ -12,7 +12,7 @@ pub struct SandboxConfig {
     pub allow_network: bool,
     /// When true, mounts `worktree_dir` read-only (`--ro-bind`) and sets `HOME=/tmp`.
     pub readonly_worktree: bool,
-    /// Additional trusted installation files visible to a Pi worker.
+    /// Additional trusted files visible to a sandboxed command.
     pub read_only_paths: Vec<PathBuf>,
     pub env_passthrough: Vec<(String, String)>,
     /// Optional wall-clock timeout in seconds for `run_sandboxed`.
@@ -86,6 +86,7 @@ pub fn run_sandboxed(
             cfg.readonly_worktree,
             &worktree,
             git_dir.as_deref(),
+            &cfg.read_only_paths,
         )?
     } else {
         macos_command(
@@ -347,6 +348,7 @@ fn linux_command(
     readonly_worktree: bool,
     worktree: &Path,
     git_dir: Option<&Path>,
+    read_only_paths: &[PathBuf],
 ) -> Result<Command, SandboxError> {
     let mut cmd = bwrap_command()?;
     cmd.args(["--ro-bind", "/", "/"])
@@ -367,7 +369,10 @@ fn linux_command(
         cmd.arg("--unshare-net");
     }
     if let Some(git_dir) = git_dir {
-        cmd.arg("--ro-bind").arg(git_dir).arg(git_dir);
+        bind_read_only(&mut cmd, git_dir);
+    }
+    for path in read_only_paths {
+        bind_read_only(&mut cmd, path);
     }
     cmd.arg("--");
     Ok(cmd)

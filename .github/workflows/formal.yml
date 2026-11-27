@@ -1,4 +1,4 @@
-name: Formal verification (Kani)
+name: Formal verification
 
 on:
   push:
@@ -34,3 +34,76 @@ jobs:
 
       - name: Run Kani proofs on verity-formal
         run: cargo kani -p verity-formal
+
+      - name: Install bubblewrap for the live verifier test
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Run both live Kani modes through the controller
+        run: |
+          checkers="$RUNNER_TEMP/verity-checkers"
+          mkdir -p "$checkers"
+          toolchain="$(cat "$HOME/.kani/kani-0.68.0/rust-toolchain-version")"
+          rust_bin="$(dirname "$(rustup which --toolchain "$toolchain" rustc)")"
+          for tool in kani cargo-kani; do
+            cat > "$checkers/$tool" <<EOF
+          #!/bin/sh
+          export KANI_HOME="$HOME/.kani"
+          export RUSTUP_HOME="$HOME/.rustup"
+          export PATH="$HOME/.cargo/bin:$rust_bin:\$PATH"
+          exec "$HOME/.cargo/bin/$tool" "\$@"
+          EOF
+            chmod +x "$checkers/$tool"
+          done
+          VERITY_KANI="$checkers/kani" VERITY_CARGO_KANI="$checkers/cargo-kani" \
+            cargo test --locked -p verity-runtime --test phase3_e2e live_kani_approves -- --ignored --nocapture
+
+  lean:
+    name: Lean comparator (live Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build bubblewrap 0.11.1 for the Lean runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcap-dev meson ninja-build zstd
+          source_dir="$RUNNER_TEMP/bubblewrap"
+          archive="$RUNNER_TEMP/bubblewrap.tar.xz"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/containers/bubblewrap/releases/download/v0.11.1/bubblewrap-0.11.1.tar.xz
+          echo "c1b7455a1283b1295879a46d5f001dfd088c0bb0f238abb5e128b3583a246f71  $archive" | sha256sum --check
+          mkdir -p "$source_dir"
+          tar --extract --file "$archive" --directory "$source_dir" --strip-components=1
+          meson setup --buildtype=release -Dman=disabled -Dbash_completion=disabled -Dzsh_completion=disabled -Dtests=false "$source_dir/build" "$source_dir"
+          meson compile -C "$source_dir/build"
+          sudo install -m755 "$source_dir/build/bwrap" /usr/bin/bwrap
+
+      - name: Install Lean 4.35.0
+        run: |
+          archive="$RUNNER_TEMP/lean.tar.zst"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/lean4/releases/download/v4.35.0/lean-4.35.0-linux.tar.zst
+          echo "7289597a44543246c9227b8cae501767e095ce17f6d448b95fc4a8dc97268f6d  $archive" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/lean"
+          tar --zstd --extract --file "$archive" --directory "$RUNNER_TEMP/lean" --strip-components=1
+
+      - name: Run the live Lean comparator through the controller
+        run: |
+          lean_bin="$RUNNER_TEMP/lean/bin"
+          export PATH="$lean_bin:$PATH"
+          fixture="$RUNNER_TEMP/lean-challenge"
+          mkdir -p "$fixture"
+          (
+            cd "$fixture"
+            printf 'theorem smoke : True := by trivial\n' > Challenge.lean
+            "$lean_bin/lean" -o Challenge.olean Challenge.lean
+            LEAN_PATH="$fixture" "$lean_bin/leanexport" Challenge > challenge.export
+            printf '%s\n' '{"challenge_module":"Challenge","solution_module":"Solution","theorem_names":["smoke"],"permitted_axioms":["propext","Quot.sound","Classical.choice"]}' > comparator.json
+          )
+          VERITY_LEAN_COMPARATOR="$lean_bin/lake" \
+            VERITY_LEAN_COMPARATOR_CONFIG="$fixture/comparator.json" \
+            VERITY_LEAN_CHALLENGE_EXPORT="$fixture/challenge.export" \
+            cargo test --locked -p verity-runtime --test phase3_e2e live_lean_approves -- --ignored --nocapture

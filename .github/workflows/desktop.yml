@@ -49,10 +49,4 @@ jobs:
         run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run tests (Tauri Rust shell)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml
-
-      - name: Check Tauri Rust shell
-        if: matrix.os != 'ubuntu-latest'
-        working-directory: desktop/src-tauri
-        run: cargo check
+        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml

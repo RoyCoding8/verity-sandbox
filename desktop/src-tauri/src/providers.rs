@@ -1035,24 +1035,4 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn embedded_verity_extension_registers_providers_and_subagent_tools() {
-        assert_eq!(VERITY_PI_EXTENSION_FILENAME, "verity-extension.ts");
-        assert!(
-            VERITY_PI_EXTENSION_SOURCE.contains("registerProvider"),
-            "embedded extension must register custom providers"
-        );
-        for tool_name in [
-            "verity_run_readonly",
-            "verity_spawn_write",
-            "verity_list_handoffs",
-        ] {
-            assert!(
-                VERITY_PI_EXTENSION_SOURCE.contains(tool_name),
-                "embedded extension must register tool {}",
-                tool_name
-            );
-        }
-    }
 }

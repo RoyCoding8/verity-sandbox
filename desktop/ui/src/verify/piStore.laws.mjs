@@ -236,7 +236,7 @@ function assertStepInvariants(prevState, action, nextState, context, rawPayload 
 async function main() {
   const server = await createServer({
     root: uiRoot,
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, ws: false },
     optimizeDeps: { noDiscovery: true, include: [] },
     appType: "custom",
     logLevel: "error",
@@ -560,6 +560,14 @@ async function main() {
         "S6.prompt"
       );
       s = dispatchEvent(s, { type: "tool_execution_start", tool_call_id: "tc-crash", tool_name: "bash" }, "S6.tool");
+      const dialog = {
+        type: "extension_ui_request",
+        id: "dialog-6",
+        kind: "confirm",
+        title: "Continue?",
+      };
+      s = dispatchEvent(s, dialog, "S6.dialog");
+      assert.equal(s.extensionDialogs.length, 1);
       s = dispatchEvent(
         s,
         { type: "process_exited", exit_code: 137, stderr_tail: "OOMKilled" },
@@ -568,11 +576,16 @@ async function main() {
       assert.equal(s.isStreaming, false);
       assert.equal(s.connectionState, "disconnected");
       assert.equal(hasVisibleError(s), true);
+      assert.deepEqual(s.extensionDialogs, []);
 
       s = dispatchEvent(s, { type: "agent_settled", summary: "exited" }, "S6.trailing_settled");
       assert.equal(s.isStreaming, false);
       assert.equal(s.connectionState, "disconnected");
       assert.equal(hasVisibleError(s), true);
+
+      s = dispatchEvent(s, { ...dialog, title: "Continue after restart?" }, "S6.restarted_dialog");
+      assert.equal(s.extensionDialogs.length, 1);
+      assert.equal(s.extensionDialogs[0].title, "Continue after restart?");
     }]);
 
     // ------------------------------------------------------------

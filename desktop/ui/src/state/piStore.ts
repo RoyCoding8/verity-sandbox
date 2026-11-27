@@ -1269,6 +1269,7 @@ function applyPiEvent(state: PiWorkspaceState, event: PiUiEvent): PiWorkspaceSta
         pendingQueueCount: 0,
         liveTools: [],
         messages,
+        extensionDialogs: [],
         extensionSnackbars: [...state.extensionSnackbars.slice(-3), snackbar],
       };
     }

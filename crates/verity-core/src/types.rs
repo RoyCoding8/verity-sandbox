@@ -13,7 +13,6 @@ pub enum TypeError {
     DotGitSegment,
     ReservedDeviceName,
     ControlCharInPath,
-    EmptyWriteScope,
 }
 
 impl fmt::Display for TypeError {
@@ -34,9 +33,6 @@ impl fmt::Display for TypeError {
             TypeError::DotGitSegment => write!(f, "path cannot reference '.git'"),
             TypeError::ReservedDeviceName => write!(f, "path segment uses a reserved device name"),
             TypeError::ControlCharInPath => write!(f, "path contains control characters"),
-            TypeError::EmptyWriteScope => {
-                write!(f, "write task requires at least one write scope path")
-            }
         }
     }
 }
@@ -321,50 +317,6 @@ impl SpecDigest {
 pub enum VerifierKind {
     RustKani,
     Lean4Comparator,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaskMode {
-    ReadOnly {
-        read_scope: Vec<RelPath>,
-    },
-    Write {
-        base: CommitOid,
-        write_scope: Vec<RelPath>,
-        forbidden: Vec<RelPath>,
-        verifier: VerifierKind,
-    },
-}
-
-impl TaskMode {
-    pub fn read_only(read_scope: Vec<RelPath>) -> Self {
-        Self::ReadOnly { read_scope }
-    }
-
-    pub fn write(
-        base: CommitOid,
-        write_scope: Vec<RelPath>,
-        forbidden: Vec<RelPath>,
-        verifier: VerifierKind,
-    ) -> Result<Self, TypeError> {
-        if write_scope.is_empty() {
-            return Err(TypeError::EmptyWriteScope);
-        }
-        Ok(Self::Write {
-            base,
-            write_scope,
-            forbidden,
-            verifier,
-        })
-    }
-
-    pub fn is_read_only(&self) -> bool {
-        matches!(self, Self::ReadOnly { .. })
-    }
-
-    pub fn needs_worktree(&self) -> bool {
-        matches!(self, Self::Write { .. })
-    }
 }
 
 /// Pure FIPS 180-4 SHA-256 implementation so verity-core stays zero-dependency.

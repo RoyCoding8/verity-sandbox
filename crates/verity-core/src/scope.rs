@@ -115,3 +115,57 @@ pub fn check_scope(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{check_scope_core, ScopeViolationKind};
+
+    fn cases() -> Vec<Vec<&'static str>> {
+        const PATHS: [&str; 6] = ["a/b", "a/b/c", "a/b/s", "a/b/s/x", "a/b_2/c", "r"];
+        let mut lists = vec![vec![]];
+        for first in PATHS {
+            lists.push(vec![first]);
+            for second in PATHS {
+                lists.push(vec![first, second]);
+            }
+        }
+        lists
+    }
+
+    #[test]
+    fn scope_decision_matches_the_policy_for_every_bounded_list() {
+        let lists = cases();
+        for changed in &lists {
+            for allowed in &lists {
+                for forbidden in &lists {
+                    let expected = if changed.is_empty() {
+                        Err(ScopeViolationKind::EmptyDiff)
+                    } else {
+                        let first_violation =
+                            changed.iter().enumerate().find_map(|(index, path)| {
+                                let under = |prefix: &&str| {
+                                    path == prefix
+                                        || path
+                                            .strip_prefix(prefix)
+                                            .is_some_and(|tail| tail.starts_with('/'))
+                                };
+                                if forbidden.iter().any(under) {
+                                    Some(ScopeViolationKind::ForbiddenPath { index })
+                                } else if !allowed.iter().any(under) {
+                                    Some(ScopeViolationKind::OutsideWriteScope { index })
+                                } else {
+                                    None
+                                }
+                            });
+                        first_violation.map_or(Ok(()), Err)
+                    };
+                    assert_eq!(
+                        check_scope_core(changed, allowed, forbidden),
+                        expected,
+                        "changed={changed:?}, allowed={allowed:?}, forbidden={forbidden:?}"
+                    );
+                }
+            }
+        }
+    }
+}

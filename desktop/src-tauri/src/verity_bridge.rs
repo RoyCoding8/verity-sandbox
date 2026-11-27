@@ -7,7 +7,7 @@ use verity_runtime::orchestrator::{
     approve_and_merge, load_handoff, parse_verifier_kind, spawn_write_task, verifier_kind_str,
     MergeResult, PersistedHandoff, WriteTaskRequest,
 };
-use verity_runtime::pi_rpc::{run_pi_prompt, PiRpcConfig};
+use verity_runtime::pi_rpc::{run_readonly_pi_prompt, PiRpcConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HygieneViolationView {
@@ -231,7 +231,8 @@ pub async fn run_readonly_subagent(
     tauri::async_runtime::spawn_blocking(move || {
         let repo = PathBuf::from(&repo_path);
         let cfg = PiRpcConfig::default_pi(repo.clone(), true);
-        let res = run_pi_prompt(&cfg, "desktop-readonly", &goal).map_err(|e| e.to_string())?;
+        let res =
+            run_readonly_pi_prompt(&cfg, "desktop-readonly", &goal).map_err(|e| e.to_string())?;
         if let Ok(log) = RunLog::open(&repo) {
             let _ = log.append_event("desktop-readonly", "completed_readonly", &res.final_text);
         }
