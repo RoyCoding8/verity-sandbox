@@ -591,4 +591,44 @@ mod tests {
             Err(RevertResolutionError::UnresolvableEntryId)
         );
     }
+
+    #[test]
+    fn assistant_event_kind_parser_classifies_known_and_unknown_events() {
+        assert_eq!(
+            AssistantEventKind::parse_str("text_delta"),
+            AssistantEventKind::TextDelta
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("text_end"),
+            AssistantEventKind::TextEnd
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("thinking_start"),
+            AssistantEventKind::ThinkingStart
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("thinking_delta"),
+            AssistantEventKind::ThinkingDelta
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("reasoning_delta"),
+            AssistantEventKind::ThinkingDelta
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("thinking_end"),
+            AssistantEventKind::ThinkingEnd
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("toolcall_delta"),
+            AssistantEventKind::ToolCall
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("input_json_delta"),
+            AssistantEventKind::ToolCall
+        );
+        assert_eq!(
+            AssistantEventKind::parse_str("unknown_event"),
+            AssistantEventKind::Ignored
+        );
+    }
 }

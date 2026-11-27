@@ -1,190 +1,11 @@
 //! Kani symbolic verification harnesses for the Verity chat-turn and
 //! Pi RPC to UI streaming contract (`verity_core::pi_wire`).
 
-use verity_core::pi_wire::WireStopReason;
 #[cfg(kani)]
 use verity_core::pi_wire::{
-    step_ui_turn, AssistantEventKind, UiTurnEvent, UiTurnPhase, UiTurnState, WireRole,
+    resolve_rewind_target, step_ui_turn, AssistantEventKind, EntryIdKind, RevertResolutionError,
+    RewindTarget, UiTurnEvent, UiTurnPhase, UiTurnState, WireRole, WireStopReason,
 };
-
-/// Delta payload kind carried by an incremental `message_update` event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamDeltaKind {
-    /// Incremental thinking/reasoning delta.
-    Thinking,
-    /// Non-whitespace incremental assistant text delta.
-    Text,
-    /// Non-empty whitespace incremental assistant text delta (e.g. `" "`, `"\n"`).
-    WhitespaceText,
-}
-
-/// Wire events for the incremental streaming buffer delivery model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamingWireEvent {
-    MessageStart,
-    ThinkingStart,
-    ThinkingEnd,
-    MessageUpdate {
-        kind: StreamDeltaKind,
-        delta_len: u8,
-    },
-    ToolCallDelta {
-        delta_len: u8,
-    },
-    Ignored {
-        delta_len: u8,
-    },
-    MessageEnd {
-        final_text_len: u8,
-        final_thinking_len: u8,
-        stop_reason: WireStopReason,
-    },
-}
-
-/// Allocation-free streaming buffer state tracking streamed vs. visible lengths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamBufferState {
-    pub is_streaming: bool,
-    pub message_started: bool,
-    pub message_ended: bool,
-    pub thinking_active: bool,
-    pub thinking_duration_sealed: bool,
-    pub streamed_text_len: u16,
-    pub streamed_thinking_len: u16,
-    pub visible_text_len: u16,
-    pub visible_thinking_len: u16,
-}
-
-impl StreamBufferState {
-    pub const fn idle() -> Self {
-        Self {
-            is_streaming: false,
-            message_started: false,
-            message_ended: false,
-            thinking_active: false,
-            thinking_duration_sealed: false,
-            streamed_text_len: 0,
-            streamed_thinking_len: 0,
-            visible_text_len: 0,
-            visible_thinking_len: 0,
-        }
-    }
-}
-
-/// Returns `true` for terminal `stop_reason` values that must settle streaming.
-pub const fn is_terminal_stop_reason(reason: WireStopReason) -> bool {
-    matches!(
-        reason,
-        WireStopReason::Stop
-            | WireStopReason::Length
-            | WireStopReason::Aborted
-            | WireStopReason::Error
-    )
-}
-
-/// Pure transition function for incremental streaming delta delivery.
-///
-/// Guarantees:
-/// - Every non-empty `Text` or `WhitespaceText` delta immediately increases
-///   `visible_text_len` BEFORE `message_end` arrives (never buffered until end).
-/// - `ToolCallDelta` and `Ignored` NEVER increase `visible_text_len` or
-///   `visible_thinking_len`.
-/// - Thinking activation (`ThinkingStart` or `Thinking` delta) followed by
-///   `ThinkingEnd`, first `Text`/`WhitespaceText` delta, or `MessageEnd` seals
-///   `thinking_duration_sealed == true`.
-/// - `message_end` NEVER clobbers already-streamed text or thinking; it only
-///   hydrates `visible_*_len` from `final_*_len` when `streamed_*_len == 0`.
-/// - Terminal `stop_reason` always settles `is_streaming == false`.
-pub const fn step_stream_buffer(
-    state: StreamBufferState,
-    event: StreamingWireEvent,
-) -> StreamBufferState {
-    match event {
-        StreamingWireEvent::MessageStart => StreamBufferState {
-            is_streaming: true,
-            message_started: true,
-            message_ended: false,
-            thinking_active: false,
-            thinking_duration_sealed: false,
-            streamed_text_len: 0,
-            streamed_thinking_len: 0,
-            visible_text_len: 0,
-            visible_thinking_len: 0,
-        },
-        StreamingWireEvent::ThinkingStart => {
-            if !state.is_streaming || !state.message_started || state.message_ended {
-                return state;
-            }
-            StreamBufferState {
-                thinking_active: true,
-                ..state
-            }
-        }
-        StreamingWireEvent::ThinkingEnd => {
-            if !state.is_streaming || !state.message_started || state.message_ended {
-                return state;
-            }
-            StreamBufferState {
-                thinking_duration_sealed: state.thinking_duration_sealed || state.thinking_active,
-                ..state
-            }
-        }
-        StreamingWireEvent::MessageUpdate { kind, delta_len } => {
-            if !state.is_streaming || !state.message_started || state.message_ended {
-                return state;
-            }
-            let d = delta_len as u16;
-            match kind {
-                StreamDeltaKind::Thinking => StreamBufferState {
-                    thinking_active: true,
-                    streamed_thinking_len: state.streamed_thinking_len.saturating_add(d),
-                    visible_thinking_len: state.visible_thinking_len.saturating_add(d),
-                    ..state
-                },
-                StreamDeltaKind::Text | StreamDeltaKind::WhitespaceText => StreamBufferState {
-                    thinking_duration_sealed: state.thinking_duration_sealed
-                        || state.thinking_active,
-                    streamed_text_len: state.streamed_text_len.saturating_add(d),
-                    visible_text_len: state.visible_text_len.saturating_add(d),
-                    ..state
-                },
-            }
-        }
-        StreamingWireEvent::ToolCallDelta { .. } | StreamingWireEvent::Ignored { .. } => state,
-        StreamingWireEvent::MessageEnd {
-            final_text_len,
-            final_thinking_len,
-            stop_reason,
-        } => {
-            if !state.message_started {
-                return state;
-            }
-            let visible_text_len = if state.streamed_text_len == 0 {
-                final_text_len as u16
-            } else {
-                state.visible_text_len
-            };
-            let visible_thinking_len = if state.streamed_thinking_len == 0 {
-                final_thinking_len as u16
-            } else {
-                state.visible_thinking_len
-            };
-            let is_streaming = if is_terminal_stop_reason(stop_reason) {
-                false
-            } else {
-                state.is_streaming
-            };
-            StreamBufferState {
-                is_streaming,
-                message_ended: true,
-                thinking_duration_sealed: state.thinking_duration_sealed || state.thinking_active,
-                visible_text_len,
-                visible_thinking_len,
-                ..state
-            }
-        }
-    }
-}
 
 #[cfg(kani)]
 fn any_phase() -> UiTurnPhase {
@@ -292,59 +113,6 @@ fn any_ui_turn_event() -> UiTurnEvent {
         },
         14 => UiTurnEvent::UserAbort,
         _ => UiTurnEvent::SessionSwitched,
-    }
-}
-
-#[cfg(kani)]
-fn any_streaming_wire_event() -> StreamingWireEvent {
-    let tag: u8 = kani::any();
-    kani::assume(tag <= 8);
-    match tag {
-        0 => StreamingWireEvent::MessageStart,
-        1..=7 => {
-            let delta_len: u8 = kani::any();
-            kani::assume(delta_len <= 4);
-            let raw = match tag {
-                1 => "text_delta",
-                2 => "thinking_start",
-                3 => "thinking_delta",
-                4 => "thinking_end",
-                5 => "toolcall_delta",
-                6 => "input_json_delta",
-                _ => "unknown",
-            };
-            match AssistantEventKind::parse_str(raw) {
-                AssistantEventKind::TextDelta => {
-                    let kind = if kani::any() {
-                        StreamDeltaKind::Text
-                    } else {
-                        StreamDeltaKind::WhitespaceText
-                    };
-                    StreamingWireEvent::MessageUpdate { kind, delta_len }
-                }
-                AssistantEventKind::ThinkingStart => StreamingWireEvent::ThinkingStart,
-                AssistantEventKind::ThinkingDelta => StreamingWireEvent::MessageUpdate {
-                    kind: StreamDeltaKind::Thinking,
-                    delta_len,
-                },
-                AssistantEventKind::ThinkingEnd => StreamingWireEvent::ThinkingEnd,
-                AssistantEventKind::ToolCall => StreamingWireEvent::ToolCallDelta { delta_len },
-                AssistantEventKind::TextEnd | AssistantEventKind::Ignored => {
-                    StreamingWireEvent::Ignored { delta_len }
-                }
-            }
-        }
-        _ => {
-            let final_text_len: u8 = kani::any();
-            let final_thinking_len: u8 = kani::any();
-            kani::assume(final_text_len <= 8);
-            kani::assume(final_thinking_len <= 8);
-            StreamingWireEvent::MessageEnd {
-                final_text_len,
-                final_thinking_len,
-                stop_reason: any_stop_reason(),
-            }
-        }
     }
 }
 
@@ -692,295 +460,176 @@ pub fn prove_bounded_ui_turn_trace_invariants() {
     kani::cover!(saw_toolcall_delta_isolated, "reach_toolcall_delta_isolated");
 }
 
-/// Law 3: Incremental Streaming Delta Delivery & Allowlist Isolation Law.
+#[cfg(kani)]
+fn contains_u8(slice: &[u8], needle: u8) -> bool {
+    let mut i = 0;
+    while i < slice.len() {
+        if slice[i] == needle {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Law 3: Direct `verity-core` assistant event allowlist classification and
+/// rewind target resolution laws.
 ///
-/// Exercises `AssistantEventKind::parse_str` on real wire strings and proves
-/// over all bounded 5-step sequences of `message_start`, `thinking_start`,
-/// `thinking_end`, incremental `message_update` (thinking deltas, text deltas,
-/// and non-empty whitespace deltas), `toolcall_delta`/`input_json_delta`,
-/// `unknown`/`Ignored`, and `message_end`:
-/// 1. Every non-empty `text_delta` (including non-empty whitespace deltas)
-///    strictly increases `visible_text_len` BEFORE `message_end` arrives.
-/// 2. `ToolCallDelta` and `Ignored` NEVER increase `visible_text_len` or
-///    `visible_thinking_len`.
-/// 3. Thinking activation followed by `ThinkingEnd`, first `TextDelta`, or
-///    `MessageEnd` seals `thinking_duration_sealed == true`.
-/// 4. `message_end` NEVER clobbers already-streamed text or thinking, only
-///    hydrating when the corresponding streamed length was 0.
-/// 5. Terminal `stop_reason` (`Stop`, `Length`, `Aborted`, `Error`) always
-///    settles `is_streaming == false`.
+/// Part 1 directly proves `AssistantEventKind::parse_str` across real Pi RPC
+/// wire event strings, ensuring non-prose events NEVER classify as `TextDelta`
+/// or `ThinkingDelta`.
+///
+/// Part 2 directly proves `resolve_rewind_target` over symbolic `EntryIdKind`,
+/// symbolic `user_turn_idx: Option<usize>`, and symbolic bounded `server_entries`
+/// (`len <= 3`), proving:
+/// - `Ok(RewindTarget::ForkToServer(id))` ALWAYS satisfies `contains_u8(server_entries, id)`
+///   so a `ClientLocal` ID can NEVER leak into `ForkToServer`.
+/// - `Ok(RewindTarget::NewSession)` ONLY happens when `server_entries.is_empty()`
+///   and `user_turn_idx == Some(0)`.
+/// - Out-of-bounds / missing IDs ALWAYS return `Err(RevertResolutionError::UnresolvableEntryId)`.
 #[cfg(kani)]
 #[kani::proof]
 #[kani::unwind(18)]
-pub fn prove_incremental_streaming_delta_delivery_laws() {
-    // Explicit boundary parser checks on real Pi RPC wire strings.
-    assert_eq!(
-        AssistantEventKind::parse_str("text_delta"),
-        AssistantEventKind::TextDelta
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("text_end"),
-        AssistantEventKind::TextEnd
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("thinking_start"),
-        AssistantEventKind::ThinkingStart
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("thinking_delta"),
-        AssistantEventKind::ThinkingDelta
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("reasoning_delta"),
-        AssistantEventKind::ThinkingDelta
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("thinking_end"),
-        AssistantEventKind::ThinkingEnd
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("toolcall_start"),
-        AssistantEventKind::ToolCall
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("toolcall_delta"),
-        AssistantEventKind::ToolCall
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("toolcall_end"),
-        AssistantEventKind::ToolCall
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("input_json_delta"),
-        AssistantEventKind::ToolCall
-    );
-    assert_eq!(
-        AssistantEventKind::parse_str("unknown"),
-        AssistantEventKind::Ignored
-    );
+pub fn prove_assistant_event_allowlist_and_rewind_resolution() {
+    // Part 1: AssistantEventKind::parse_str allowlist across real wire strings.
+    let wire_tag: u8 = kani::any();
+    kani::assume(wire_tag <= 12);
+    let raw = match wire_tag {
+        0 => "text_delta",
+        1 => "text_end",
+        2 => "thinking_start",
+        3 => "thinking_delta",
+        4 => "reasoning_delta",
+        5 => "thinking_end",
+        6 => "toolcall_start",
+        7 => "toolcall_delta",
+        8 => "toolcall_end",
+        9 => "input_json_delta",
+        10 => "start",
+        11 => "done",
+        _ => "unknown",
+    };
 
-    let mut state = StreamBufferState::idle();
+    let parsed = AssistantEventKind::parse_str(raw);
+    match wire_tag {
+        0 => assert_eq!(parsed, AssistantEventKind::TextDelta),
+        1 => assert_eq!(parsed, AssistantEventKind::TextEnd),
+        2 => assert_eq!(parsed, AssistantEventKind::ThinkingStart),
+        3 | 4 => assert_eq!(parsed, AssistantEventKind::ThinkingDelta),
+        5 => assert_eq!(parsed, AssistantEventKind::ThinkingEnd),
+        6..=9 => assert_eq!(parsed, AssistantEventKind::ToolCall),
+        _ => assert_eq!(parsed, AssistantEventKind::Ignored),
+    }
 
-    let mut saw_incremental_text = false;
-    let mut saw_incremental_whitespace = false;
-    let mut saw_incremental_thinking = false;
-    let mut saw_toolcall_or_ignored_isolated = false;
-    let mut saw_thinking_end_seals_duration = false;
-    let mut saw_text_delta_seals_thinking_duration = false;
-    let mut saw_message_end_seals_thinking_duration = false;
-    let mut saw_end_preserves_streamed_text = false;
-    let mut saw_end_hydrates_unstreamed_text = false;
-    let mut saw_terminal_stop_settles = false;
+    if !matches!(wire_tag, 0 | 3 | 4) {
+        assert_ne!(
+            parsed,
+            AssistantEventKind::TextDelta,
+            "non-prose wire event must never classify as TextDelta"
+        );
+        assert_ne!(
+            parsed,
+            AssistantEventKind::ThinkingDelta,
+            "non-prose wire event must never classify as ThinkingDelta"
+        );
+    }
 
-    for _ in 0..5 {
-        let event = any_streaming_wire_event();
-        let prev = state;
-        let next = step_stream_buffer(prev, event);
+    // Part 2: resolve_rewind_target over symbolic EntryIdKind, user_turn_idx, and server_entries.
+    let requested = if kani::any() {
+        EntryIdKind::Server(kani::any())
+    } else {
+        EntryIdKind::ClientLocal(kani::any())
+    };
+    let user_turn_idx: Option<usize> = if kani::any() {
+        let idx: usize = kani::any();
+        kani::assume(idx <= 4);
+        Some(idx)
+    } else {
+        None
+    };
+    let buf: [u8; 3] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= 3);
+    let server_entries = &buf[..len];
 
-        match event {
-            StreamingWireEvent::MessageStart => {
-                assert!(next.is_streaming);
-                assert!(next.message_started);
-                assert!(!next.message_ended);
-                assert!(!next.thinking_active);
-                assert!(!next.thinking_duration_sealed);
-                assert_eq!(next.streamed_text_len, 0);
-                assert_eq!(next.visible_text_len, 0);
-                assert_eq!(next.streamed_thinking_len, 0);
-                assert_eq!(next.visible_thinking_len, 0);
-            }
-            StreamingWireEvent::ThinkingStart => {
-                if prev.is_streaming && prev.message_started && !prev.message_ended {
-                    assert!(next.thinking_active);
-                    assert_eq!(next.visible_text_len, prev.visible_text_len);
-                    assert_eq!(next.visible_thinking_len, prev.visible_thinking_len);
-                } else {
-                    assert_eq!(next, prev);
+    let resolved = resolve_rewind_target(requested, user_turn_idx, server_entries);
+
+    match resolved {
+        Ok(RewindTarget::ForkToServer(id)) => {
+            assert!(
+                contains_u8(server_entries, id),
+                "ForkToServer must always resolve to an authoritative server entry"
+            );
+            match requested {
+                EntryIdKind::Server(req_id) if contains_u8(server_entries, req_id) => {
+                    assert_eq!(id, req_id);
                 }
-            }
-            StreamingWireEvent::ThinkingEnd => {
-                if prev.is_streaming && prev.message_started && !prev.message_ended {
-                    if prev.thinking_active {
-                        assert!(
-                            next.thinking_duration_sealed,
-                            "ThinkingEnd after thinking activation must seal thinking_duration_sealed"
-                        );
-                        if !prev.thinking_duration_sealed {
-                            saw_thinking_end_seals_duration = true;
-                        }
-                    }
-                    assert_eq!(next.visible_text_len, prev.visible_text_len);
-                    assert_eq!(next.visible_thinking_len, prev.visible_thinking_len);
-                } else {
-                    assert_eq!(next, prev);
-                }
-            }
-            StreamingWireEvent::MessageUpdate { kind, delta_len } => {
-                if prev.is_streaming && prev.message_started && !prev.message_ended {
-                    assert!(!next.message_ended);
-                    match kind {
-                        StreamDeltaKind::Text | StreamDeltaKind::WhitespaceText => {
-                            if prev.thinking_active {
-                                assert!(
-                                    next.thinking_duration_sealed,
-                                    "first TextDelta after thinking activation must seal thinking_duration_sealed"
-                                );
-                                if !prev.thinking_duration_sealed {
-                                    saw_text_delta_seals_thinking_duration = true;
-                                }
-                            }
-                            if delta_len > 0 {
-                                assert!(
-                                    next.visible_text_len > prev.visible_text_len,
-                                    "non-empty text/whitespace delta must strictly increase visible text before message_end"
-                                );
-                                assert_eq!(
-                                    next.visible_text_len,
-                                    prev.visible_text_len + delta_len as u16
-                                );
-                                if kind == StreamDeltaKind::Text {
-                                    saw_incremental_text = true;
-                                } else {
-                                    saw_incremental_whitespace = true;
-                                }
-                            } else {
-                                assert_eq!(next.visible_text_len, prev.visible_text_len);
-                            }
-                        }
-                        StreamDeltaKind::Thinking => {
-                            assert!(next.thinking_active);
-                            if delta_len > 0 {
-                                assert!(
-                                    next.visible_thinking_len > prev.visible_thinking_len,
-                                    "non-empty thinking delta must strictly increase visible thinking before message_end"
-                                );
-                                saw_incremental_thinking = true;
-                            }
-                            assert_eq!(next.visible_text_len, prev.visible_text_len);
-                        }
-                    }
-                } else {
-                    assert_eq!(next, prev);
-                }
-            }
-            StreamingWireEvent::ToolCallDelta { delta_len }
-            | StreamingWireEvent::Ignored { delta_len } => {
-                assert_eq!(
-                    next.visible_text_len, prev.visible_text_len,
-                    "ToolCallDelta/Ignored must NEVER increase visible_text_len"
-                );
-                assert_eq!(
-                    next.visible_thinking_len, prev.visible_thinking_len,
-                    "ToolCallDelta/Ignored must NEVER increase visible_thinking_len"
-                );
-                assert_eq!(next, prev);
-                if prev.is_streaming && prev.message_started && !prev.message_ended && delta_len > 0
-                {
-                    saw_toolcall_or_ignored_isolated = true;
-                }
-            }
-            StreamingWireEvent::MessageEnd {
-                final_text_len,
-                final_thinking_len,
-                stop_reason,
-            } => {
-                if prev.message_started {
-                    assert!(next.message_ended);
-                    if prev.thinking_active {
-                        assert!(
-                            next.thinking_duration_sealed,
-                            "MessageEnd after thinking activation must seal thinking_duration_sealed"
-                        );
-                        if !prev.thinking_duration_sealed {
-                            saw_message_end_seals_thinking_duration = true;
-                        }
-                    }
-                    if prev.streamed_text_len > 0 {
-                        assert_eq!(
-                            next.visible_text_len, prev.visible_text_len,
-                            "message_end must never clobber already-streamed text"
-                        );
-                        if final_text_len as u16 != prev.visible_text_len {
-                            saw_end_preserves_streamed_text = true;
-                        }
-                    } else {
-                        assert_eq!(
-                            next.visible_text_len, final_text_len as u16,
-                            "message_end must hydrate text when streamed_text_len == 0"
-                        );
-                        if final_text_len > 0 {
-                            saw_end_hydrates_unstreamed_text = true;
-                        }
-                    }
-
-                    if prev.streamed_thinking_len > 0 {
-                        assert_eq!(
-                            next.visible_thinking_len, prev.visible_thinking_len,
-                            "message_end must never clobber already-streamed thinking"
-                        );
-                    } else {
-                        assert_eq!(
-                            next.visible_thinking_len, final_thinking_len as u16,
-                            "message_end must hydrate thinking when streamed_thinking_len == 0"
-                        );
-                    }
-
-                    if is_terminal_stop_reason(stop_reason) {
-                        assert!(
-                            !next.is_streaming,
-                            "terminal stop_reason must always settle is_streaming == false"
-                        );
-                        if prev.is_streaming {
-                            saw_terminal_stop_settles = true;
-                        }
-                    }
-                } else {
-                    assert_eq!(next, prev);
+                _ => {
+                    let idx = user_turn_idx.expect("fallback ForkToServer requires user_turn_idx");
+                    assert!(idx < server_entries.len());
+                    assert_eq!(id, server_entries[idx]);
                 }
             }
         }
-
-        state = next;
+        Ok(RewindTarget::NewSession) => {
+            assert!(
+                server_entries.is_empty() && user_turn_idx == Some(0),
+                "NewSession is only permitted when server_entries is empty and user_turn_idx == Some(0)"
+            );
+        }
+        Err(RevertResolutionError::UnresolvableEntryId) => {
+            let direct_server_match = matches!(
+                requested,
+                EntryIdKind::Server(req_id) if contains_u8(server_entries, req_id)
+            );
+            assert!(!direct_server_match);
+            if let Some(idx) = user_turn_idx {
+                assert!(idx >= server_entries.len());
+                assert!(!(idx == 0 && server_entries.is_empty()));
+            }
+        }
     }
 
+    // Explicit out-of-bounds / missing ID invariant:
+    let has_direct_server_match = matches!(
+        requested,
+        EntryIdKind::Server(req_id) if contains_u8(server_entries, req_id)
+    );
+    let has_valid_turn_idx = matches!(user_turn_idx, Some(idx) if idx < server_entries.len());
+    let is_empty_first_turn = server_entries.is_empty() && user_turn_idx == Some(0);
+    if !has_direct_server_match && !has_valid_turn_idx && !is_empty_first_turn {
+        assert_eq!(resolved, Err(RevertResolutionError::UnresolvableEntryId));
+    }
+
+    // Cover probes: every branch must be reachable (SATISFIED).
     kani::cover!(
-        saw_incremental_text,
-        "incremental_text_delta_before_message_end"
+        matches!(
+            requested,
+            EntryIdKind::Server(req_id)
+                if resolved == Ok(RewindTarget::ForkToServer(req_id))
+                    && contains_u8(server_entries, req_id)
+        ),
+        "server_direct_match"
     );
     kani::cover!(
-        saw_incremental_whitespace,
-        "incremental_whitespace_delta_before_message_end"
+        matches!(requested, EntryIdKind::ClientLocal(_))
+            && matches!(resolved, Ok(RewindTarget::ForkToServer(_))),
+        "client_local_resolved_via_user_turn_idx"
     );
     kani::cover!(
-        saw_incremental_thinking,
-        "incremental_thinking_delta_before_message_end"
+        resolved == Ok(RewindTarget::NewSession),
+        "new_session_fallback"
     );
     kani::cover!(
-        saw_toolcall_or_ignored_isolated,
-        "toolcall_or_ignored_never_mutates_visible_buffers"
+        resolved == Err(RevertResolutionError::UnresolvableEntryId),
+        "unresolvable_entry_id"
     );
     kani::cover!(
-        saw_thinking_end_seals_duration,
-        "thinking_end_seals_thinking_duration"
+        parsed == AssistantEventKind::ToolCall,
+        "toolcall_allowlist_rejected"
     );
     kani::cover!(
-        saw_text_delta_seals_thinking_duration,
-        "text_delta_seals_thinking_duration"
-    );
-    kani::cover!(
-        saw_message_end_seals_thinking_duration,
-        "message_end_seals_thinking_duration"
-    );
-    kani::cover!(
-        saw_end_preserves_streamed_text,
-        "message_end_preserves_streamed_text_without_clobber"
-    );
-    kani::cover!(
-        saw_end_hydrates_unstreamed_text,
-        "message_end_hydrates_unstreamed_text"
-    );
-    kani::cover!(
-        saw_terminal_stop_settles,
-        "terminal_stop_reason_settles_streaming"
+        parsed == AssistantEventKind::Ignored,
+        "ignored_allowlist_rejected"
     );
 }

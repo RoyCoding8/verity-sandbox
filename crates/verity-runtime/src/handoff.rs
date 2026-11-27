@@ -4,7 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use verity_core::json::escape_json_string;
 use verity_core::{
-    CheckerVerdict, CommitOid, HygieneReport, RelPath, SpecDigest, SpecHandoff, VerifierKind,
+    CheckerVerdict, CommitOid, HygieneReport, RelPath, SpecDigest, SpecHandoff, VerdictStatus,
+    VerifierKind,
 };
 
 /// Extracts ONLY formal definitions, public signatures, contracts, assume/unwind
@@ -78,24 +79,53 @@ pub fn build_spec_handoff(
         violations.extend(report.violations);
     }
 
+    let hygiene = HygieneReport { violations };
     let extracted_spec = extract_spec_only(verifier, files);
-    let spec_digest = candidate_spec_digest(&candidate_commit, &extracted_spec);
+    let spec_digest = candidate_spec_digest(
+        &candidate_commit,
+        verifier,
+        &verdict,
+        &hygiene,
+        &extracted_spec,
+    );
 
     SpecHandoff {
         candidate_commit,
         changed_paths,
         extracted_spec,
         back_translation,
-        hygiene: HygieneReport { violations },
+        hygiene,
         verdict,
         spec_digest,
     }
 }
 
-pub(crate) fn candidate_spec_digest(candidate: &CommitOid, spec: &str) -> SpecDigest {
+pub(crate) fn candidate_spec_digest(
+    candidate: &CommitOid,
+    verifier: VerifierKind,
+    verdict: &CheckerVerdict,
+    hygiene: &HygieneReport,
+    spec: &str,
+) -> SpecDigest {
+    let verifier_str = match verifier {
+        VerifierKind::RustKani => "kani",
+        VerifierKind::Lean4Comparator => "lean",
+    };
+    let status_str = match verdict.status {
+        VerdictStatus::Pass => "pass",
+        VerdictStatus::Counterexample => "counterexample",
+        VerdictStatus::Inconclusive => "inconclusive",
+        VerdictStatus::InvalidReport => "invalid_report",
+    };
     SpecDigest::of_spec(&format!(
-        "verity-handoff-v2\n{}\n{spec}",
-        candidate.as_str()
+        "verity-handoff-v3\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{spec}",
+        candidate.as_str(),
+        verifier_str,
+        status_str,
+        verdict.checks_passed,
+        verdict.probes_satisfied,
+        hygiene.is_clean(),
+        hygiene.violations.len(),
     ))
 }
 

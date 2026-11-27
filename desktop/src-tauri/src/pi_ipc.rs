@@ -16,11 +16,12 @@ use crate::providers::{
     PublicProviderProfile,
 };
 use crate::snapshots::{
-    capture_and_record_turn_checkpoint, find_checkpoint, load_checkpoint_store,
-    normalize_prompt_preview, redo_last_revert, revert_to_snapshot, save_last_redo,
+    capture_snapshot, find_checkpoint_with_lineage, load_checkpoint_store,
+    normalize_prompt_preview, record_captured_turn_checkpoint, redo_last_revert,
+    redo_targeted_revert_checked, revert_to_snapshot, save_last_redo,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -992,6 +993,7 @@ struct PiAppStateInner {
     thinking_level_pending_sync: AtomicBool,
     provider_reload_pending: Arc<AtomicBool>,
     active_session_id: Mutex<Option<String>>,
+    session_parents: Mutex<HashMap<String, String>>,
 }
 
 impl PiAppStateInner {
@@ -1044,6 +1046,7 @@ impl PiAppState {
                 thinking_level_pending_sync: AtomicBool::new(false),
                 provider_reload_pending: Arc::new(AtomicBool::new(false)),
                 active_session_id: Mutex::new(None),
+                session_parents: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -1074,6 +1077,7 @@ impl PiAppState {
                 thinking_level_pending_sync: AtomicBool::new(false),
                 provider_reload_pending: Arc::new(AtomicBool::new(false)),
                 active_session_id: Mutex::new(None),
+                session_parents: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -1241,6 +1245,70 @@ impl PiAppState {
             return Err("Wait for Pi to finish before switching projects.".to_string());
         }
         Ok(())
+    }
+
+    fn record_session_parent(&self, child_id: &str, parent_id: &str) {
+        let child = child_id.trim();
+        let parent = parent_id.trim();
+        if child.is_empty()
+            || parent.is_empty()
+            || child == "default-session"
+            || parent == "default-session"
+            || child == parent
+        {
+            return;
+        }
+        self.inner
+            .session_parents
+            .lock()
+            .expect("session_parents lock poisoned")
+            .insert(child.to_string(), parent.to_string());
+    }
+
+    fn session_lineage(&self, project_dir: &Path, active_session_id: Option<&str>) -> Vec<String> {
+        let Some(start) = active_session_id
+            .map(str::trim)
+            .filter(|sid| !sid.is_empty() && *sid != "default-session")
+        else {
+            return Vec::new();
+        };
+        let archived = load_archived_session_ids_from(&self.inner.session_meta_path);
+        let project_id = project_from_path(project_dir).id;
+        let sessions = scan_project_sessions_with_archived(&project_id, project_dir, &archived);
+        let parent_map = self
+            .inner
+            .session_parents
+            .lock()
+            .expect("session_parents lock poisoned")
+            .clone();
+
+        let mut lineage = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = start.to_string();
+        while seen.insert(current.clone()) {
+            lineage.push(current.clone());
+            let disk_parent = sessions
+                .iter()
+                .find(|s| s.id == current)
+                .and_then(|s| s.parent_session_id.as_deref())
+                .map(str::trim)
+                .filter(|p| !p.is_empty() && *p != "default-session")
+                .map(|parent_ref| {
+                    sessions
+                        .iter()
+                        .find(|s| s.id == parent_ref || s.path == parent_ref)
+                        .map(|s| s.id.clone())
+                        .unwrap_or_else(|| parent_ref.to_string())
+                });
+            let next = disk_parent.or_else(|| parent_map.get(&current).cloned());
+            match next {
+                Some(parent_id) if !parent_id.is_empty() && parent_id != "default-session" => {
+                    current = parent_id;
+                }
+                _ => break,
+            }
+        }
+        lineage
     }
 
     fn replay_pending_preferences(&self, sup: &PiSessionSupervisor) {
@@ -1730,8 +1798,8 @@ impl PiAppState {
             None => &current_project,
         };
         let cross_project = current_project.id != target.id;
+        self.require_idle_supervisor()?;
         let (candidate, staged) = if cross_project {
-            self.require_idle_supervisor()?;
             let (candidate, committed) = self.staged_supervisor(target, event_sink)?;
             (candidate, Some(committed))
         } else {
@@ -1819,6 +1887,9 @@ impl PiAppState {
                     .map_err(|e| e.to_string())
             })?;
         if let Some(confirmed) = result.as_mut() {
+            if let Some(ref parent_id) = parent_session {
+                self.record_session_parent(&confirmed.session.id, parent_id);
+            }
             confirmed.session.parent_session_id = parent_session;
         }
         Ok(result)
@@ -1900,11 +1971,21 @@ impl PiAppState {
         }
         let result =
             self.parse_session_with_messages(&sup, &resp, "session-fork", "Forked session")?;
-        *self
+        let mut active_guard = self
             .inner
             .active_session_id
             .lock()
-            .expect("active_session_id lock poisoned") = Some(result.session.id.clone());
+            .expect("active_session_id lock poisoned");
+        let prev_session_id = active_guard.replace(result.session.id.clone());
+        drop(active_guard);
+        if let Some(parent_id) = result
+            .session
+            .parent_session_id
+            .as_deref()
+            .or(prev_session_id.as_deref())
+        {
+            self.record_session_parent(&result.session.id, parent_id);
+        }
         Ok(result)
     }
 
@@ -1921,11 +2002,21 @@ impl PiAppState {
         }
         let result =
             self.parse_session_with_messages(&sup, &resp, "session-clone", "Cloned session")?;
-        *self
+        let mut active_guard = self
             .inner
             .active_session_id
             .lock()
-            .expect("active_session_id lock poisoned") = Some(result.session.id.clone());
+            .expect("active_session_id lock poisoned");
+        let prev_session_id = active_guard.replace(result.session.id.clone());
+        drop(active_guard);
+        if let Some(parent_id) = result
+            .session
+            .parent_session_id
+            .as_deref()
+            .or(prev_session_id.as_deref())
+        {
+            self.record_session_parent(&result.session.id, parent_id);
+        }
         Ok(result)
     }
 
@@ -2041,10 +2132,16 @@ impl PiAppState {
         }
         let project_dir = PathBuf::from(current_project.path);
         let checkpoint_prompt = message.clone();
-        std::thread::spawn(move || {
-            let _ = capture_and_record_turn_checkpoint(&project_dir, session_id, checkpoint_prompt);
-        });
+        let captured_tree_oid = capture_snapshot(&project_dir).ok();
         sup.prompt(message, images).map_err(|e| e.to_string())?;
+        if let Some(tree_oid) = captured_tree_oid {
+            let _ = record_captured_turn_checkpoint(
+                &project_dir,
+                session_id,
+                checkpoint_prompt,
+                tree_oid,
+            );
+        }
         Ok(())
     }
 
@@ -2057,16 +2154,16 @@ impl PiAppState {
             .lock()
             .expect("active_session_id lock poisoned")
             .clone();
+        let lineage = self.session_lineage(&project_dir, active_session.as_deref());
+        if lineage.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lineage_set: HashSet<&str> = lineage.iter().map(String::as_str).collect();
 
         let filtered: Vec<TurnCheckpointView> = store
             .checkpoints
             .iter()
-            .filter(|cp| match active_session.as_deref() {
-                Some(sid) if !sid.is_empty() => {
-                    cp.session_id == sid || cp.session_id == "default-session"
-                }
-                _ => true,
-            })
+            .filter(|cp| lineage_set.contains(cp.session_id.trim()))
             .map(|cp| TurnCheckpointView {
                 entry_id: cp.entry_id.clone(),
                 prompt_preview: cp.prompt_preview.clone(),
@@ -2074,19 +2171,6 @@ impl PiAppState {
                 created_at: cp.created_at.clone(),
             })
             .collect();
-
-        if filtered.is_empty() && !store.checkpoints.is_empty() {
-            return Ok(store
-                .checkpoints
-                .into_iter()
-                .map(|cp| TurnCheckpointView {
-                    entry_id: cp.entry_id,
-                    prompt_preview: cp.prompt_preview,
-                    has_code_snapshot: cp.tree_oid.len() == 40,
-                    created_at: cp.created_at,
-                })
-                .collect());
-        }
 
         Ok(filtered)
     }
@@ -2101,6 +2185,7 @@ impl PiAppState {
     ) -> Result<RevertTurnResult, String> {
         let entry_id = require_non_empty("entryId", &entry_id)?;
         let _workspace = self.lock_workspace();
+        self.require_idle_supervisor()?;
         let sup = self.ensure_supervisor_with_sink(Arc::clone(&event_sink))?;
 
         let session_id = self
@@ -2145,8 +2230,84 @@ impl PiAppState {
                     })
             });
 
+        enum RevertTargetPlan {
+            Fork {
+                target_idx: usize,
+                target_entry_id: String,
+                target_preview: Option<String>,
+            },
+            FallbackNewSession,
+        }
+
+        let (plan, resolved_entry_id, resolved_turn_index, preview_hint) =
+            if let Some((target_idx, target)) = resolved {
+                // Never pass synthetic local/stream/msg IDs to Pi fork.
+                if is_synthetic_local_entry_id(&target.entry_id) {
+                    return Err(format!(
+                        "Refusing to fork synthetic entry ID '{}'",
+                        target.entry_id
+                    ));
+                }
+                let target_entry_id = target.entry_id.clone();
+                let target_preview =
+                    (!target.preview.trim().is_empty()).then(|| target.preview.clone());
+                let hint = target_preview.clone().or_else(|| {
+                    prompt_text
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(ToString::to_string)
+                });
+                (
+                    RevertTargetPlan::Fork {
+                        target_idx,
+                        target_entry_id: target_entry_id.clone(),
+                        target_preview,
+                    },
+                    target_entry_id,
+                    Some(target_idx),
+                    hint,
+                )
+            } else if fork_candidates.is_empty() && user_turn_index.unwrap_or(0) == 0 {
+                let hint = prompt_text
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(ToString::to_string);
+                (
+                    RevertTargetPlan::FallbackNewSession,
+                    entry_id.clone(),
+                    Some(0),
+                    hint,
+                )
+            } else {
+                return Err(format!(
+                    "Unable to resolve entry ID '{}' to a valid user turn for forking.",
+                    entry_id
+                ));
+            };
+
         let project_dir = self.project_path();
         let project_id = project_from_path(&project_dir).id;
+
+        // Step 3: Resolve checkpoint across active + parent session lineage and apply code revert
+        // BEFORE forking Pi so any preflight collision fails cleanly without desyncing chat.
+        let pending_code_outcome = if revert_code {
+            let store = load_checkpoint_store(&project_dir);
+            let lineage = self.session_lineage(&project_dir, session_id.as_deref());
+            let lineage_refs: Vec<&str> = lineage.iter().map(String::as_str).collect();
+            if let Some(cp) = find_checkpoint_with_lineage(
+                &store,
+                &lineage_refs,
+                &resolved_entry_id,
+                resolved_turn_index,
+                preview_hint.as_deref(),
+            ) {
+                Some(revert_to_snapshot(&project_dir, &cp.tree_oid)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let fallback_new_session =
             |sup: &PiSessionSupervisor| -> Result<SessionWithMessages, String> {
@@ -2199,73 +2360,81 @@ impl PiAppState {
                 })
             };
 
-        let (
-            SessionWithMessages { session, messages },
-            restored_prompt,
-            resolved_entry_id,
-            resolved_turn_index,
-        ) = if let Some((target_idx, target)) = resolved {
-            // Never pass synthetic local/stream/msg IDs to Pi fork.
-            if is_synthetic_local_entry_id(&target.entry_id) {
-                return Err(format!(
-                    "Refusing to fork synthetic entry ID '{}'",
-                    target.entry_id
-                ));
-            }
-
-            let target_entry_id = target.entry_id.clone();
-            let target_preview =
-                (!target.preview.trim().is_empty()).then(|| target.preview.clone());
-
-            match sup.fork(&target_entry_id) {
+        let chat_result: Result<(SessionWithMessages, Option<String>, bool), String> = match plan {
+            RevertTargetPlan::Fork {
+                target_idx,
+                target_entry_id,
+                target_preview,
+            } => match sup.fork(&target_entry_id) {
                 Ok(resp) => {
                     let fork_data = parse_data_json(&resp);
                     if fork_data.as_ref().and_then(|v| opt_bool(v, &["cancelled"])) == Some(true) {
-                        return Err("Revert was cancelled.".to_string());
+                        Err("Revert was cancelled.".to_string())
+                    } else {
+                        let fork_text = fork_data
+                            .as_ref()
+                            .and_then(|v| opt_str(v, &["text"]))
+                            .filter(|s| !s.trim().is_empty());
+                        let prompt = fork_text.or(target_preview).or_else(|| {
+                            prompt_text
+                                .as_deref()
+                                .filter(|s| !s.trim().is_empty())
+                                .map(ToString::to_string)
+                        });
+                        self.parse_session_with_messages(
+                            &sup,
+                            &resp,
+                            "session-revert",
+                            "Reverted session",
+                        )
+                        .map(|swm| (swm, prompt, true))
                     }
-                    let fork_text = fork_data
-                        .as_ref()
-                        .and_then(|v| opt_str(v, &["text"]))
-                        .filter(|s| !s.trim().is_empty());
-                    let prompt = fork_text.or(target_preview).or_else(|| {
-                        prompt_text
-                            .as_deref()
-                            .filter(|s| !s.trim().is_empty())
-                            .map(ToString::to_string)
-                    });
-                    let swm = self.parse_session_with_messages(
-                        &sup,
-                        &resp,
-                        "session-revert",
-                        "Reverted session",
-                    )?;
-                    (swm, prompt, target_entry_id, Some(target_idx))
                 }
                 Err(_) if target_idx == 0 => {
-                    let swm = fallback_new_session(&sup)?;
                     let prompt = target_preview.or_else(|| {
                         prompt_text
                             .as_deref()
                             .filter(|s| !s.trim().is_empty())
                             .map(ToString::to_string)
                     });
-                    (swm, prompt, target_entry_id, Some(0))
+                    fallback_new_session(&sup).map(|swm| (swm, prompt, false))
                 }
-                Err(err) => return Err(err.to_string()),
+                Err(err) => Err(err.to_string()),
+            },
+            RevertTargetPlan::FallbackNewSession => {
+                let prompt = prompt_text
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(ToString::to_string);
+                fallback_new_session(&sup).map(|swm| (swm, prompt, false))
             }
-        } else if fork_candidates.is_empty() && user_turn_index.unwrap_or(0) == 0 {
-            let swm = fallback_new_session(&sup)?;
-            let prompt = prompt_text
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(ToString::to_string);
-            (swm, prompt, entry_id.clone(), Some(0))
-        } else {
-            return Err(format!(
-                "Unable to resolve entry ID '{}' to a valid user turn for forking.",
-                entry_id
-            ));
         };
+
+        let (SessionWithMessages { session, messages }, restored_prompt, forked_from_parent) =
+            match chat_result {
+                Ok(ok) => ok,
+                Err(err) => {
+                    if let Some(outcome) = pending_code_outcome {
+                        let _ = redo_targeted_revert_checked(
+                            &project_dir,
+                            &outcome.redo_tree_oid,
+                            &outcome.reverted_files,
+                            Some(&outcome.target_tree_oid),
+                        );
+                    }
+                    return Err(err);
+                }
+            };
+
+        if forked_from_parent {
+            if let Some(parent_id) = session
+                .parent_session_id
+                .as_deref()
+                .or(session_id.as_deref())
+            {
+                self.record_session_parent(&session.id, parent_id);
+            }
+        }
 
         *self
             .inner
@@ -2273,36 +2442,19 @@ impl PiAppState {
             .lock()
             .expect("active_session_id lock poisoned") = Some(session.id.clone());
 
-        let store = load_checkpoint_store(&project_dir);
         let (code_reverted, reverted_files, can_redo, code_revert_note) = if revert_code {
-            if let Some(cp) = find_checkpoint(
-                &store,
-                session_id.as_deref(),
-                &resolved_entry_id,
-                resolved_turn_index,
-                restored_prompt.as_deref(),
-            ) {
-                match revert_to_snapshot(&project_dir, &cp.tree_oid) {
-                    Ok(outcome) => {
-                        let save_result = save_last_redo(
-                            &project_dir,
-                            outcome.redo_tree_oid,
-                            outcome.reverted_files.clone(),
-                            outcome.target_tree_oid,
-                            &session.id,
-                        );
-                        let note = save_result.err().map(|err| {
-                            format!("Reverted chat and code. The redo checkpoint could not be saved. {err}")
-                        });
-                        (true, outcome.reverted_files, note.is_none(), note)
-                    }
-                    Err(err) => (
-                        false,
-                        Vec::new(),
-                        false,
-                        Some(format!("Chat was reverted. Code restore failed. {err}")),
-                    ),
-                }
+            if let Some(outcome) = pending_code_outcome {
+                let save_result = save_last_redo(
+                    &project_dir,
+                    outcome.redo_tree_oid,
+                    outcome.reverted_files.clone(),
+                    outcome.target_tree_oid,
+                    &session.id,
+                );
+                let note = save_result.err().map(|err| {
+                    format!("Reverted chat and code. The redo checkpoint could not be saved. {err}")
+                });
+                (true, outcome.reverted_files, note.is_none(), note)
             } else {
                 (
                     false,
@@ -5192,6 +5344,204 @@ done
         );
 
         state.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chained_revert_uses_parent_lineage_blocks_foreign_leaks_and_keeps_chat_in_sync_on_preflight_error(
+    ) {
+        let _env_lock = crate::snapshots::tests::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = unique_temp_dir("chained-revert-lineage");
+        let home = dir.join("verity-home");
+        let project_dir = dir.join("repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        let prev_vh = env::var("VERITY_HOME").ok();
+        env::set_var("VERITY_HOME", &home);
+
+        // Initialize git so .gitignore rules apply cleanly.
+        assert!(Command::new("git")
+            .args(["init", project_dir.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+
+        let code_file = project_dir.join("app.rs");
+        fs::write(&code_file, "v0\n").unwrap();
+        let secret_file = project_dir.join("secret.env");
+        fs::write(&secret_file, "initial-secret\n").unwrap();
+
+        let store_path = dir.join("providers.json");
+        let script = r#"
+CUR_ID="sess-root"
+FORK_SEQ=0
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  typ=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  case "$typ" in
+    get_state)
+      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"id":"%s","name":"Live"}}\n' "$id" "$CUR_ID"
+      ;;
+    get_messages)
+      printf '{"type":"response","id":"%s","command":"get_messages","success":true,"data":{"messages":[]}}\n' "$id"
+      ;;
+    get_available_models)
+      printf '{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{"models":[]}}\n' "$id"
+      ;;
+    get_available_thinking_levels)
+      printf '{"type":"response","id":"%s","command":"get_available_thinking_levels","success":true,"data":{"levels":["medium"]}}\n' "$id"
+      ;;
+    get_commands)
+      printf '{"type":"response","id":"%s","command":"get_commands","success":true,"data":{"commands":[]}}\n' "$id"
+      ;;
+    prompt)
+      if printf '%s' "$line" | grep -q 'FAIL_THIS_PROMPT'; then
+        printf '{"type":"response","id":"%s","command":"prompt","success":false,"error":"prompt rejected"}\n' "$id"
+      else
+        printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+        printf '{"type":"agent_end","summary":"done"}\n'
+      fi
+      ;;
+    get_fork_messages)
+      printf '{"type":"response","id":"%s","command":"get_fork_messages","success":true,"data":{"messages":[{"entryId":"u-1","role":"user","preview":"Turn one","timestamp":"t1"},{"entryId":"u-2","role":"user","preview":"Turn two","timestamp":"t2"}]}}\n' "$id"
+      ;;
+    fork)
+      eid=$(printf '%s\n' "$line" | sed -n 's/.*"entryId":"\([^"]*\)".*/\1/p')
+      FORK_SEQ=$((FORK_SEQ + 1))
+      CUR_ID="sess-fork-$FORK_SEQ"
+      if [ "$eid" = "u-2" ]; then
+        printf '{"type":"response","id":"%s","command":"fork","success":true,"data":{"text":"Turn two","cancelled":false}}\n' "$id"
+      else
+        printf '{"type":"response","id":"%s","command":"fork","success":true,"data":{"text":"Turn one","cancelled":false}}\n' "$id"
+      fi
+      ;;
+    *)
+      printf '{"type":"response","id":"%s","command":"%s","success":true}\n' "$id" "$typ"
+      ;;
+  esac
+done
+"#;
+
+        let state = PiAppState::with_config(
+            project_dir.clone(),
+            store_path,
+            mock_sh_config(project_dir.clone(), script),
+        );
+        let (settled_tx, settled_rx) = mpsc::channel();
+        let sink: EventSink = Arc::new(move |ev| {
+            if matches!(ev, PiUiEvent::AgentSettled { .. }) {
+                let _ = settled_tx.send(());
+            }
+        });
+
+        let boot = state.bootstrap_with_sink(Arc::clone(&sink));
+        assert_eq!(boot.active_session_id, "sess-root");
+
+        // Record foreign + default-session checkpoints; list_checkpoints must never leak them.
+        crate::snapshots::record_turn_checkpoint(
+            &project_dir,
+            "sess-foreign".into(),
+            "turn-foreign".into(),
+            Some(0),
+            "Foreign secret".into(),
+            "1111111111111111111111111111111111111111".into(),
+        )
+        .unwrap();
+        crate::snapshots::record_turn_checkpoint(
+            &project_dir,
+            "default-session".into(),
+            "turn-default".into(),
+            Some(0),
+            "Default leak".into(),
+            "2222222222222222222222222222222222222222".into(),
+        )
+        .unwrap();
+        assert!(state.list_checkpoints().unwrap().is_empty());
+
+        // Failed prompt must NOT persist an orphan checkpoint.
+        assert!(state
+            .prompt_with_sink(
+                Arc::clone(&sink),
+                "FAIL_THIS_PROMPT".to_string(),
+                vec![],
+                boot.active_project_id.clone(),
+                "sess-root".to_string(),
+            )
+            .is_err());
+        assert!(state.list_checkpoints().unwrap().is_empty());
+
+        // Turn 1 (captures v0 synchronously before prompt returns).
+        state
+            .prompt_with_sink(
+                Arc::clone(&sink),
+                "Turn one".to_string(),
+                vec![],
+                boot.active_project_id.clone(),
+                "sess-root".to_string(),
+            )
+            .unwrap();
+        settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Immediately visible without any polling sleep!
+        assert_eq!(state.list_checkpoints().unwrap().len(), 1);
+
+        // Turn 2 (captures v1 synchronously).
+        fs::write(&code_file, "v1\n").unwrap();
+        state
+            .prompt_with_sink(
+                Arc::clone(&sink),
+                "Turn two".to_string(),
+                vec![],
+                boot.active_project_id.clone(),
+                "sess-root".to_string(),
+            )
+            .unwrap();
+        settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(state.list_checkpoints().unwrap().len(), 2);
+
+        // Edit to v2, then revert to Turn two -> forks into sess-fork-1 and restores v1.
+        fs::write(&code_file, "v2\n").unwrap();
+        let rev_t2 = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-2".to_string(), true, None, None)
+            .unwrap();
+        assert!(rev_t2.code_reverted);
+        assert_eq!(rev_t2.session.id, "sess-fork-1");
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "v1\n");
+
+        // list_checkpoints on sess-fork-1 sees parent lineage checkpoints (2) and still excludes foreign/default.
+        assert_eq!(state.list_checkpoints().unwrap().len(), 2);
+
+        // Add secret.env to .gitignore and edit it -> preflight collision must fail BEFORE forking Pi!
+        fs::write(project_dir.join(".gitignore"), "secret.env\n").unwrap();
+        fs::write(&secret_file, "edited-secret\n").unwrap();
+        let err = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true, None, None)
+            .unwrap_err();
+        assert!(err.contains("preflight collision"), "unexpected err: {err}");
+        // Chat session MUST NOT have forked to sess-fork-2, and secret.env must be untouched.
+        assert_eq!(
+            state.inner.active_session_id.lock().unwrap().as_deref(),
+            Some("sess-fork-1")
+        );
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), "edited-secret\n");
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "v1\n");
+
+        // Remove .gitignore collision -> chained revert from sess-fork-1 to Turn one finds
+        // sess-root's Turn one checkpoint via parent lineage and restores v0!
+        fs::remove_file(project_dir.join(".gitignore")).unwrap();
+        let rev_t1 = state
+            .revert_turn_with_sink(Arc::clone(&sink), "u-1".to_string(), true, None, None)
+            .unwrap();
+        assert!(rev_t1.code_reverted);
+        assert_eq!(rev_t1.session.id, "sess-fork-2");
+        assert_eq!(fs::read_to_string(&code_file).unwrap(), "v0\n");
+
+        state.shutdown();
+        match prev_vh {
+            Some(v) => env::set_var("VERITY_HOME", v),
+            None => env::remove_var("VERITY_HOME"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

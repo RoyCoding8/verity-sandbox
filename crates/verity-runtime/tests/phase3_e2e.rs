@@ -354,7 +354,7 @@ fn approval_rejects_changed_candidate_and_advances_clean_checkout_once() {
     fs::write(&handoff_path, handoff_to_json(&verified)).unwrap();
     assert!(matches!(
         approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex),
-        Err(OrchestratorError::GateFailed(GateError::VerdictNotPass(_)))
+        Err(OrchestratorError::CorruptHandoff(ref msg)) if msg.contains("spec_digest integrity check failed")
     ));
     assert_eq!(
         read_ref(&repo, "refs/heads/main").unwrap().as_ref(),
@@ -563,28 +563,6 @@ fn verify_safe_add() {
     assert!(safe_add(a, b) >= a);
     kani::cover!(a > 0 && b > 0, "both_positive");
 }
-
-#[cfg(not(target_os = "linux"))]
-#[test]
-fn write_task_requires_a_supported_worker_sandbox() {
-    let repo = temp_dir("unsupported_worker_sandbox");
-    init_git_repo(&repo);
-    let task_id = TaskId::parse("sandbox-required").unwrap();
-    let result = spawn_write_task(WriteTaskRequest {
-        repo_dir: repo.clone(),
-        task_id: task_id.clone(),
-        base_ref: "HEAD".to_string(),
-        write_scope: vec![RelPath::parse("src").unwrap()],
-        forbidden: vec![],
-        verifier: VerifierKind::RustKani,
-        goal: "inspect src".to_string(),
-        pi_config: Some(mock_pi_config("exit 1")),
-    });
-    assert!(matches!(result, Err(OrchestratorError::PiRpc(PiRpcError::Sandbox(_)))));
-    assert!(!worktree_path_for(&repo, &task_id).exists());
-    assert!(!handoff_path_for(&repo, &task_id).exists());
-    let _ = fs::remove_dir_all(&repo);
-}
 EOF
 printf '{"type":"agent_settled"}\n'"#;
     let live_handoff = spawn_write_task_with_options(
@@ -699,6 +677,134 @@ printf '{"type":"agent_settled"}\n'"#;
         ),
         Err(OrchestratorError::GateFailed(GateError::VerdictNotPass(_)))
     ));
+
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn write_task_requires_a_supported_worker_sandbox() {
+    let repo = temp_dir("unsupported_worker_sandbox");
+    init_git_repo(&repo);
+    let task_id = TaskId::parse("sandbox-required").unwrap();
+    let result = spawn_write_task(WriteTaskRequest {
+        repo_dir: repo.clone(),
+        task_id: task_id.clone(),
+        base_ref: "HEAD".to_string(),
+        write_scope: vec![RelPath::parse("src").unwrap()],
+        forbidden: vec![],
+        verifier: VerifierKind::RustKani,
+        goal: "inspect src".to_string(),
+        pi_config: Some(mock_pi_config("exit 1")),
+    });
+    assert!(matches!(
+        result,
+        Err(OrchestratorError::PiRpc(PiRpcError::Sandbox(_)))
+    ));
+    assert!(!worktree_path_for(&repo, &task_id).exists());
+    assert!(!handoff_path_for(&repo, &task_id).exists());
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn approve_and_merge_rejects_tampered_verdict_and_hygiene_on_disk() {
+    let repo = temp_dir("tamper_handoff");
+    init_git_repo(&repo);
+    let base_oid = read_ref(&repo, "refs/heads/main").unwrap().unwrap();
+
+    // 1. Write a handoff with VerdictStatus::Counterexample, tamper on disk to flip status -> "pass".
+    let task_id = TaskId::parse("tampered-verdict").unwrap();
+    let worktree = worktree_path_for(&repo, &task_id);
+    create_worktree(&repo, &worktree, &task_id, &base_oid).unwrap();
+    let source = "pub fn safe_add(a: u32, b: u32) -> u32 { a.saturating_add(b) }\n";
+    fs::write(worktree.join("src/math.rs"), source).unwrap();
+    let candidate = commit_worktree_changes(&worktree, "candidate with counterexample").unwrap();
+    remove_worktree(&repo, &worktree).unwrap();
+
+    let handoff = build_spec_handoff(
+        candidate.clone(),
+        &[(RelPath::parse("src/math.rs").unwrap(), source.to_string())],
+        VerifierKind::RustKani,
+        CheckerVerdict {
+            status: VerdictStatus::Counterexample,
+            reason: "assertion failed".to_string(),
+            checks_passed: 0,
+            probes_satisfied: 0,
+        },
+        None,
+    );
+    let digest_hex = handoff.spec_digest.to_hex();
+    let persisted = PersistedHandoff {
+        task_id: task_id.clone(),
+        base_commit: base_oid.clone(),
+        verifier: VerifierKind::RustKani,
+        handoff,
+    };
+    let handoff_path = handoff_path_for(&repo, &task_id);
+    fs::create_dir_all(handoff_path.parent().unwrap()).unwrap();
+    let raw_json = handoff_to_json(&persisted);
+    let tampered_json = raw_json.replacen(r#""status":"counterexample""#, r#""status":"pass""#, 1);
+    assert_ne!(raw_json, tampered_json);
+    fs::write(&handoff_path, tampered_json).unwrap();
+
+    let err = approve_and_merge(&repo, &task_id, "refs/heads/main", &digest_hex).unwrap_err();
+    assert!(
+        matches!(err, OrchestratorError::CorruptHandoff(ref msg) if msg.contains("spec_digest integrity check failed")),
+        "expected CorruptHandoff integrity error, got: {err:?}"
+    );
+    assert_eq!(
+        read_ref(&repo, "refs/heads/main").unwrap().as_ref(),
+        Some(&base_oid)
+    );
+
+    // 2. Write a handoff with a hygiene violation, tamper on disk to clear violations & set clean=true.
+    let hygiene_task = TaskId::parse("tampered-hygiene").unwrap();
+    let dirty_source = "pub fn cheat(x: u32) -> u32 { kani::assume(false); x }\n";
+    let dirty_handoff = build_spec_handoff(
+        candidate,
+        &[(
+            RelPath::parse("src/cheat.rs").unwrap(),
+            dirty_source.to_string(),
+        )],
+        VerifierKind::RustKani,
+        CheckerVerdict {
+            status: VerdictStatus::Pass,
+            reason: "passed".to_string(),
+            checks_passed: 1,
+            probes_satisfied: 0,
+        },
+        None,
+    );
+    assert!(!dirty_handoff.hygiene.is_clean());
+    let dirty_digest = dirty_handoff.spec_digest.to_hex();
+    let dirty_persisted = PersistedHandoff {
+        task_id: hygiene_task.clone(),
+        base_commit: base_oid.clone(),
+        verifier: VerifierKind::RustKani,
+        handoff: dirty_handoff,
+    };
+    let dirty_path = handoff_path_for(&repo, &hygiene_task);
+    let dirty_json = handoff_to_json(&dirty_persisted);
+    let start = dirty_json.find(r#""hygiene":{"clean":false,"#).unwrap();
+    let end = dirty_json[start..].find(r#","verdict":"#).unwrap() + start;
+    let tampered_hygiene = format!(
+        "{}{}{}",
+        &dirty_json[..start],
+        r#""hygiene":{"clean":true,"violations":[]}"#,
+        &dirty_json[end..]
+    );
+    fs::write(&dirty_path, tampered_hygiene).unwrap();
+
+    let err =
+        approve_and_merge(&repo, &hygiene_task, "refs/heads/main", &dirty_digest).unwrap_err();
+    assert!(
+        matches!(err, OrchestratorError::CorruptHandoff(ref msg) if msg.contains("spec_digest integrity check failed")),
+        "expected CorruptHandoff integrity error, got: {err:?}"
+    );
+    assert_eq!(
+        read_ref(&repo, "refs/heads/main").unwrap().as_ref(),
+        Some(&base_oid)
+    );
 
     let _ = fs::remove_dir_all(&repo);
 }

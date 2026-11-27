@@ -356,11 +356,19 @@ pub fn parse_handoff_json(raw: &str) -> Result<PersistedHandoff, OrchestratorErr
             detail: require_str(v, "detail")?.to_string(),
         });
     }
+    let hygiene = HygieneReport { violations };
+    if let Some(clean_val) = hygiene_obj.get("clean").and_then(JsonValue::as_bool) {
+        if clean_val != hygiene.is_clean() {
+            return Err(OrchestratorError::CorruptHandoff(
+                "handoff hygiene.clean disagrees with hygiene.violations".into(),
+            ));
+        }
+    }
 
     let verdict_obj = root
         .get("verdict")
         .ok_or_else(|| OrchestratorError::CorruptHandoff("missing verdict object".into()))?;
-    let mut verdict = CheckerVerdict {
+    let verdict = CheckerVerdict {
         status: parse_verdict_status(require_str(verdict_obj, "status")?)?,
         reason: require_str(verdict_obj, "reason")?.to_string(),
         checks_passed: require_usize(verdict_obj, "checks_passed")?,
@@ -370,8 +378,17 @@ pub fn parse_handoff_json(raw: &str) -> Result<PersistedHandoff, OrchestratorErr
     let spec_digest = parse_spec_digest_hex(require_str(&root, "spec_digest")?)
         .map_err(|e| OrchestratorError::CorruptHandoff(e.to_string()))?;
 
-    if candidate_spec_digest(&candidate_commit, &extracted_spec) != spec_digest {
-        verdict = inconclusive("handoff is missing a current candidate-bound approval digest");
+    if candidate_spec_digest(
+        &candidate_commit,
+        verifier,
+        &verdict,
+        &hygiene,
+        &extracted_spec,
+    ) != spec_digest
+    {
+        return Err(OrchestratorError::CorruptHandoff(
+            "handoff spec_digest integrity check failed".into(),
+        ));
     }
 
     Ok(PersistedHandoff {
@@ -383,7 +400,7 @@ pub fn parse_handoff_json(raw: &str) -> Result<PersistedHandoff, OrchestratorErr
             changed_paths,
             extracted_spec,
             back_translation,
-            hygiene: HygieneReport { violations },
+            hygiene,
             verdict,
             spec_digest,
         },

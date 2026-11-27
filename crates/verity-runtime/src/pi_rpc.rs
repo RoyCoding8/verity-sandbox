@@ -1,4 +1,6 @@
-use crate::sandbox::{pi_sandboxed_command, SandboxConfig, SandboxError};
+use crate::sandbox::{
+    default_offline_config, pi_sandbox_available, pi_sandboxed_command, SandboxConfig, SandboxError,
+};
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -69,6 +71,7 @@ impl PiRpcConfig {
         ];
         if read_only {
             args.push("--no-extensions".to_string());
+            args.push("--no-prompt-templates".to_string());
             args.push("--tools".to_string());
             args.push("read,grep,find,ls".to_string());
         }
@@ -168,6 +171,18 @@ pub fn run_pi_prompt(
 /// and explicit environment. The host must support the required namespaces.
 /// A Pi executable on the sandbox's PATH can use the system runtime paths.
 /// Supply additional trusted installation paths through the sandbox config.
+fn is_pi_cli_program(program: &str) -> bool {
+    let base = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .or_else(|| program.rsplit(['/', '\\']).next())
+        .and_then(|name| name.rsplit('\\').next())
+        .unwrap_or("");
+    base.eq_ignore_ascii_case("pi")
+        || base.eq_ignore_ascii_case("pi.cmd")
+        || base.eq_ignore_ascii_case("pi.exe")
+}
+
 pub fn run_sandboxed_pi_prompt(
     cfg: &PiRpcConfig,
     sandbox: &SandboxConfig,
@@ -175,17 +190,69 @@ pub fn run_sandboxed_pi_prompt(
     prompt_text: &str,
 ) -> Result<PiPromptResult, PiRpcError> {
     let mut args: Vec<_> = cfg.args.iter().map(String::as_str).collect();
-    if std::path::Path::new(&cfg.program)
-        .file_name()
-        .is_some_and(|name| name == "pi")
-    {
+    if is_pi_cli_program(&cfg.program) {
         if !args.contains(&"--no-extensions") {
             args.push("--no-extensions");
         }
-        args.push("--no-prompt-templates");
+        if !args.contains(&"--no-prompt-templates") {
+            args.push("--no-prompt-templates");
+        }
     }
     let cmd = pi_sandboxed_command(sandbox, &cfg.program, &args).map_err(PiRpcError::Sandbox)?;
     run_turn(cmd, cfg, prompt_id, prompt_text, true)
+}
+
+/// Runs a read-only Pi subagent against `cfg.cwd`.
+/// On Linux when bubblewrap is available, mounts `cfg.cwd` read-only (`--ro-bind`)
+/// with a writable tmpfs `HOME=/tmp` so even a prompt-injected worker cannot modify
+/// repository files. On non-Linux (or when bubblewrap is unavailable), enforces
+/// Pi's `--no-extensions --no-prompt-templates --tools read,grep,find,ls` flags.
+pub fn run_readonly_pi_prompt(
+    cfg: &PiRpcConfig,
+    prompt_id: &str,
+    prompt_text: &str,
+) -> Result<PiPromptResult, PiRpcError> {
+    let mut args: Vec<&str> = cfg.args.iter().map(String::as_str).collect();
+    if is_pi_cli_program(&cfg.program) {
+        if !args.contains(&"--no-extensions") {
+            args.push("--no-extensions");
+        }
+        if !args.contains(&"--no-prompt-templates") {
+            args.push("--no-prompt-templates");
+        }
+        if !args.contains(&"--tools") {
+            args.push("--tools");
+            args.push("read,grep,find,ls");
+        }
+    }
+
+    if cfg!(target_os = "linux") && pi_sandbox_available() {
+        let git_dir = crate::git::git_common_dir(&cfg.cwd).ok();
+        let mut sandbox = default_offline_config(&cfg.cwd, git_dir);
+        sandbox.readonly_worktree = true;
+        sandbox.allow_network = true;
+        sandbox.env_passthrough = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_string(), value))
+        })
+        .collect();
+        let cmd =
+            pi_sandboxed_command(&sandbox, &cfg.program, &args).map_err(PiRpcError::Sandbox)?;
+        return run_turn(cmd, cfg, prompt_id, prompt_text, true);
+    }
+
+    let mut cmd = Command::new(resolve_pi_program(&cfg.program));
+    cmd.args(&args).current_dir(&cfg.cwd);
+    run_turn(cmd, cfg, prompt_id, prompt_text, false)
 }
 
 fn run_turn(
@@ -785,5 +852,80 @@ printf '%s\n' '{"type":"agent_settled","summary":"done"}'"#,
             parse_json(r#"{"type":"message_update","delta":"bad","assistantMessageEvent":{}}"#)
                 .unwrap();
         assert_eq!(extract_text_delta(&malformed), None);
+    }
+
+    #[test]
+    fn detects_pi_cli_program_across_platforms_and_casing() {
+        assert!(is_pi_cli_program("pi"));
+        assert!(is_pi_cli_program("/usr/local/bin/pi"));
+        assert!(is_pi_cli_program("pi.cmd"));
+        assert!(is_pi_cli_program("PI.CMD"));
+        assert!(is_pi_cli_program(
+            r"C:\Users\verity\AppData\Roaming\npm\pi.cmd"
+        ));
+        assert!(is_pi_cli_program("pi.exe"));
+        assert!(is_pi_cli_program(r"C:\Tools\PI.EXE"));
+        assert!(!is_pi_cli_program("/bin/sh"));
+        assert!(!is_pi_cli_program("pilot"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readonly_worker_cannot_modify_repo_under_bwrap() {
+        if !crate::sandbox::pi_sandbox_available() {
+            eprintln!("skipping readonly bwrap test because bubblewrap is unavailable");
+            return;
+        }
+        let repo = PathBuf::from("/var/tmp").join(format!(
+            "verity-pi-readonly-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("keep.txt"),
+            "untouched
+",
+        )
+        .unwrap();
+
+        let pi = shell_config(
+            repo.clone(),
+            r#"read -r prompt
+[ "$HOME" = "/tmp" ] || exit 1
+printf 'tmp-ok' > "$HOME/scratch.txt" || exit 1
+err=$(touch pwned.txt 2>&1)
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    printf '{"type":"error","error":"touch unexpectedly succeeded"}
+'
+    exit 0
+fi
+printf '{"type":"message_update","delta":"blocked:%s"}
+' "$err"
+printf '{"type":"agent_settled"}
+'"#,
+        );
+
+        let res = run_readonly_pi_prompt(&pi, "ro-test", "try to touch pwned.txt").unwrap();
+        let pwned_exists = repo.join("pwned.txt").exists();
+        let kept = std::fs::read_to_string(repo.join("keep.txt")).unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
+
+        assert!(res.settled);
+        assert!(
+            res.final_text.to_ascii_lowercase().contains("read-only"),
+            "expected read-only filesystem error, got: {}",
+            res.final_text
+        );
+        assert!(!pwned_exists, "pwned.txt must not be created");
+        assert_eq!(
+            kept,
+            "untouched
+"
+        );
     }
 }

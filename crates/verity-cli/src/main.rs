@@ -10,7 +10,7 @@ use verity_runtime::orchestrator::{
     approve_and_merge, handoff_to_json, load_handoff, parse_verifier_kind, spawn_write_task,
     MergeResult, WriteTaskRequest,
 };
-use verity_runtime::pi_rpc::{run_pi_prompt, PiRpcConfig};
+use verity_runtime::pi_rpc::{run_readonly_pi_prompt, PiRpcConfig};
 
 fn usage() {
     eprintln!(
@@ -65,7 +65,7 @@ fn main() {
             if let Some(bin) = args.get(3) {
                 cfg.program = bin.clone();
             }
-            match run_pi_prompt(&cfg, "readonly-1", goal) {
+            match run_readonly_pi_prompt(&cfg, "readonly-1", goal) {
                 Ok(res) => {
                     if let Ok(log) = RunLog::open(&repo) {
                         let _ =

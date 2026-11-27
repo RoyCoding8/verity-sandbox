@@ -7,7 +7,7 @@ use verity_runtime::orchestrator::{
     approve_and_merge, handoff_to_json, parse_verifier_kind, spawn_write_task, MergeResult,
     WriteTaskRequest,
 };
-use verity_runtime::pi_rpc::{run_pi_prompt, PiRpcConfig};
+use verity_runtime::pi_rpc::{run_readonly_pi_prompt, PiRpcConfig};
 
 fn jsonrpc_result(id_str: &str, result_json: &str) -> String {
     format!(
@@ -88,7 +88,7 @@ fn exec_run_readonly(args: &JsonValue) -> Result<String, String> {
     let repo = PathBuf::from(arg_str(args, "repo")?);
     let goal = arg_str(args, "goal")?;
     let cfg = PiRpcConfig::default_pi(repo.clone(), true);
-    let res = run_pi_prompt(&cfg, "readonly-mcp", goal).map_err(|e| e.to_string())?;
+    let res = run_readonly_pi_prompt(&cfg, "readonly-mcp", goal).map_err(|e| e.to_string())?;
     if let Ok(log) = RunLog::open(&repo) {
         let _ = log.append_event("readonly-mcp", "completed_readonly", &res.final_text);
     }

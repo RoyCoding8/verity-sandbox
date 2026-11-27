@@ -320,6 +320,23 @@ pub fn discover_kani_targets(files: &[(RelPath, String)]) -> (Option<String>, Ve
     )
 }
 
+fn is_kani_proof_attr(compact: &str) -> bool {
+    if compact == "kani::proof" {
+        return true;
+    }
+    if let Some(inner) = compact
+        .strip_prefix("cfg_attr(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        if let Some((pred, attrs)) = inner.split_once(',') {
+            if pred == "kani" {
+                return attrs.split(',').any(|attr| attr == "kani::proof");
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn discover_kani_proofs(files: &[(RelPath, String)]) -> Vec<KaniTarget> {
     let mut targets: Vec<KaniTarget> = Vec::new();
 
@@ -380,7 +397,7 @@ pub(crate) fn discover_kani_proofs(files: &[(RelPath, String)]) -> Vec<KaniTarge
                     .chars()
                     .filter(|c| !c.is_whitespace())
                     .collect();
-                if compact == "kani::proof" && active_proof.is_none() {
+                if is_kani_proof_attr(&compact) && active_proof.is_none() {
                     pending_proof = true;
                 }
                 i = j;
@@ -698,10 +715,100 @@ fn collapse_spaces(line: &str) -> String {
 /// disabled unwinding assertions, and unannotated `kani::assume` calls using a
 /// comment- and string-aware scanner so comments never trigger false positives
 /// and block comments cannot smuggle banned constructs.
+fn normalize_rust_path_spaces(line: &str) -> String {
+    collapse_spaces(line)
+        .replace(" :: ", "::")
+        .replace(" ::", "::")
+        .replace(":: ", "::")
+}
+
+fn contains_call(code: &str, target: &str, allow_path_prefix: bool) -> bool {
+    let bytes = code.as_bytes();
+    let target_bytes = target.as_bytes();
+    if target_bytes.is_empty() || bytes.len() < target_bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + target_bytes.len() <= bytes.len() {
+        if &bytes[i..i + target_bytes.len()] == target_bytes {
+            let prev_ok = i == 0
+                || (!is_ident_byte(bytes[i - 1])
+                    && (allow_path_prefix || (bytes[i - 1] != b':' && bytes[i - 1] != b'.')));
+            if prev_ok {
+                let after = skip_ws(bytes, i + target_bytes.len());
+                if bytes.get(after) == Some(&b'(') {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn imports_kani_assume(scanned_lines: &[ScannedLine]) -> bool {
+    let mut joined = String::new();
+    for line in scanned_lines {
+        joined.push_str(&line.code);
+        joined.push(' ');
+    }
+    let normalized = normalize_rust_path_spaces(&joined);
+    let bytes = normalized.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if starts_with_ident(bytes, i, b"use") {
+            let start = i + 3;
+            let end = normalized[start..]
+                .find(';')
+                .map(|off| start + off)
+                .unwrap_or(bytes.len());
+            let stmt = &normalized[start..end];
+            let stmt_bytes = stmt.as_bytes();
+            for pos in 0..stmt_bytes.len() {
+                if stmt[pos..].starts_with("kani::assume")
+                    && (pos == 0 || !is_ident_byte(stmt_bytes[pos - 1]))
+                    && stmt_bytes
+                        .get(pos + "kani::assume".len())
+                        .is_none_or(|&b| !is_ident_byte(b))
+                {
+                    return true;
+                }
+                if stmt[pos..].starts_with("kani::*")
+                    && (pos == 0 || !is_ident_byte(stmt_bytes[pos - 1]))
+                {
+                    return true;
+                }
+                if stmt[pos..].starts_with("kani::{")
+                    && (pos == 0 || !is_ident_byte(stmt_bytes[pos - 1]))
+                {
+                    let rest = &stmt[pos + "kani::{".len()..];
+                    if let Some(close) = rest.find('}') {
+                        let items = &rest[..close];
+                        if items.split(',').any(|item| {
+                            let item = item.trim();
+                            item == "assume"
+                                || item == "*"
+                                || item.starts_with("assume ")
+                                || item == "self::assume"
+                        }) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            i = end;
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn hygiene_lint_rust(rel_path: &str, source: &str) -> HygieneReport {
     let mut violations = Vec::new();
-    for (idx, scanned) in scan_rust_lines(source).into_iter().enumerate() {
-        let code = collapse_spaces(&scanned.code);
+    let scanned_lines = scan_rust_lines(source);
+    let has_kani_assume_import = imports_kani_assume(&scanned_lines);
+    for (idx, scanned) in scanned_lines.into_iter().enumerate() {
+        let code = normalize_rust_path_spaces(&scanned.code);
         let line_no = idx + 1;
         if code.contains("kani::stub") {
             violations.push(HygieneViolation {
@@ -727,7 +834,9 @@ pub fn hygiene_lint_rust(rel_path: &str, source: &str) -> HygieneReport {
                 detail: "disabling unwinding assertions allows vacuous loop bounds".to_string(),
             });
         }
-        if code.contains("kani::assume(") && !scanned.comments.contains("verity:trusted-assume") {
+        let has_assume_call = contains_call(&code, "kani::assume", true)
+            || (has_kani_assume_import && contains_call(&code, "assume", false));
+        if has_assume_call && !scanned.comments.contains("verity:trusted-assume") {
             violations.push(HygieneViolation {
                 rule: "unreviewed-kani-assume".to_string(),
                 path: rel_path.to_string(),
@@ -998,17 +1107,28 @@ fn no_checker_evidence(status: VerdictStatus, reason: impl Into<String>) -> Chec
     }
 }
 
+#[cfg(test)]
 fn classify_kani_export(
     raw: &str,
     exit_code: Option<i32>,
     worktree_dir: &Path,
     target: &KaniTarget,
 ) -> CheckerVerdict {
+    classify_kani_export_with_crate(raw, exit_code, worktree_dir, target, Some(KANI_CRATE))
+}
+
+fn classify_kani_export_with_crate(
+    raw: &str,
+    exit_code: Option<i32>,
+    worktree_dir: &Path,
+    target: &KaniTarget,
+    expected_crate: Option<&str>,
+) -> CheckerVerdict {
     let export = match parse_kani_export(raw) {
         Ok(export) => export,
         Err(reason) => return no_checker_evidence(VerdictStatus::InvalidReport, reason),
     };
-    if export.crate_name != KANI_CRATE
+    if expected_crate.is_some_and(|expected| export.crate_name != expected)
         || export.report.harness_name.rsplit("::").next() != Some(target.name.as_str())
         || worktree_dir.join(&export.source) != worktree_dir.join(target.source.as_str())
         || !(export.start_line..=export.end_line).contains(&target.line)
@@ -1060,6 +1180,101 @@ pub(crate) fn run_kani_proof_sandboxed(
     verdict
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KaniMode {
+    Standalone,
+    Cargo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KaniInvocation {
+    mode: KaniMode,
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+fn binary_name_matches(path: &Path, name: &str) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|base| {
+            base.eq_ignore_ascii_case(name) || base.eq_ignore_ascii_case(&format!("{name}.exe"))
+        })
+}
+
+fn build_kani_invocation(
+    worktree_dir: &Path,
+    source_path: &Path,
+    run_dir: &Path,
+    report_path: &Path,
+    target: &KaniTarget,
+    kani_program: &Path,
+    cargo_kani_env: Option<&str>,
+) -> Result<KaniInvocation, SandboxError> {
+    let manifest_path = worktree_dir.join("Cargo.toml");
+    let has_cargo_manifest = manifest_path.is_file();
+    let in_src = target.source.as_str().starts_with("src/");
+    let is_cargo_kani_bin = binary_name_matches(kani_program, "cargo-kani");
+    let cargo_env_enabled = cargo_kani_env
+        .is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
+
+    if has_cargo_manifest && in_src && (cargo_env_enabled || is_cargo_kani_bin) {
+        let program = if let Some(raw_path) = cargo_kani_env.filter(|v| Path::new(v).is_absolute())
+        {
+            independent_checker_file(Path::new(raw_path), worktree_dir, "VERITY_CARGO_KANI")?
+        } else if is_cargo_kani_bin || binary_name_matches(kani_program, "cargo") {
+            kani_program.to_path_buf()
+        } else if let Some(sibling) = kani_program
+            .parent()
+            .map(|dir| dir.join("cargo-kani"))
+            .filter(|p| p.is_file())
+        {
+            sibling
+        } else {
+            PathBuf::from("cargo")
+        };
+
+        let mut args = Vec::new();
+        if binary_name_matches(&program, "cargo") {
+            args.push("kani".to_string());
+        }
+        args.extend([
+            "--manifest-path".to_string(),
+            path_arg(&manifest_path)?.to_string(),
+            "-Z".to_string(),
+            "unstable-options".to_string(),
+            "--harness".to_string(),
+            target.name.clone(),
+            "--target-dir".to_string(),
+            path_arg(run_dir)?.to_string(),
+            "--export-json".to_string(),
+            path_arg(report_path)?.to_string(),
+        ]);
+        return Ok(KaniInvocation {
+            mode: KaniMode::Cargo,
+            program,
+            args,
+        });
+    }
+
+    Ok(KaniInvocation {
+        mode: KaniMode::Standalone,
+        program: kani_program.to_path_buf(),
+        args: vec![
+            "-Z".to_string(),
+            "unstable-options".to_string(),
+            "--harness".to_string(),
+            target.name.clone(),
+            "--crate-name".to_string(),
+            KANI_CRATE.to_string(),
+            "--target-dir".to_string(),
+            path_arg(run_dir)?.to_string(),
+            "--export-json".to_string(),
+            path_arg(report_path)?.to_string(),
+            path_arg(source_path)?.to_string(),
+        ],
+    })
+}
+
 fn capture_kani_verdict(
     program: &Path,
     worktree_dir: &Path,
@@ -1067,35 +1282,38 @@ fn capture_kani_verdict(
     run_dir: &Path,
     target: &KaniTarget,
 ) -> Result<CheckerVerdict, SandboxError> {
-    let cfg = checker_sandbox(worktree_dir, program)?;
     let report_path = run_dir.join("report.json");
-    // Standalone Kani invokes its compiler directly without Cargo configuration,
-    // build scripts, dependency search paths, or a candidate-selected linker.
-    let out = run_sandboxed(
-        &cfg,
-        path_arg(program)?,
-        &[
-            "-Z",
-            "unstable-options",
-            "--harness",
-            &target.name,
-            "--crate-name",
-            KANI_CRATE,
-            "--target-dir",
-            path_arg(run_dir)?,
-            "--export-json",
-            path_arg(&report_path)?,
-            path_arg(source_path)?,
-        ],
+    let cargo_kani_env = env::var("VERITY_CARGO_KANI").ok();
+    let invocation = build_kani_invocation(
+        worktree_dir,
+        source_path,
+        run_dir,
+        &report_path,
+        target,
+        program,
+        cargo_kani_env.as_deref(),
     )?;
+    let tool_anchor = if invocation.program.is_absolute() {
+        invocation.program.as_path()
+    } else {
+        program
+    };
+    let cfg = checker_sandbox(worktree_dir, tool_anchor)?;
+    let arg_refs: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+    let out = run_sandboxed(&cfg, path_arg(&invocation.program)?, &arg_refs)?;
+    let expected_crate = match invocation.mode {
+        KaniMode::Standalone => Some(KANI_CRATE),
+        KaniMode::Cargo => None,
+    };
     match fs::symlink_metadata(&report_path) {
         Ok(metadata) if metadata.is_file() => {
             let raw = fs::read_to_string(&report_path).map_err(sandbox_io)?;
-            Ok(classify_kani_export(
+            Ok(classify_kani_export_with_crate(
                 &raw,
                 out.status.code(),
                 worktree_dir,
                 target,
+                expected_crate,
             ))
         }
         Ok(_) => Ok(no_checker_evidence(
@@ -1469,5 +1687,166 @@ pub fn add(a: u32, b: u32) -> u32 { a.saturating_add(b) }
         let (harness, probes) = discover_kani_targets(&files);
         assert_eq!(harness, None);
         assert!(probes.is_empty());
+    }
+
+    #[test]
+    fn discover_kani_proofs_recognizes_cfg_attr_kani_proof() {
+        let src = r#"
+#[cfg_attr(kani, kani::proof)]
+fn verify_cfg_attr_harness() {
+    kani::cover!(true, "cfg_probe");
+}
+"#;
+        let files = vec![(RelPath::parse("src/cfg.rs").unwrap(), src.to_string())];
+        let targets = discover_kani_proofs(&files);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "verify_cfg_attr_harness");
+        assert_eq!(targets[0].probes, ["cfg_probe"]);
+    }
+
+    #[test]
+    fn hygiene_lint_rust_catches_whitespace_split_and_imported_assume() {
+        let split_src = "fn harness() {
+    kani :: assume(false);
+}
+";
+        let split_report = hygiene_lint_rust("src/split.rs", split_src);
+        assert_eq!(split_report.violations.len(), 1);
+        assert_eq!(split_report.violations[0].rule, "unreviewed-kani-assume");
+        assert_eq!(split_report.violations[0].line, 2);
+
+        let imported_src = "use kani::assume;
+fn harness() {
+    assume(false);
+}
+";
+        let imported_report = hygiene_lint_rust("src/imported.rs", imported_src);
+        assert_eq!(imported_report.violations.len(), 1);
+        assert_eq!(imported_report.violations[0].rule, "unreviewed-kani-assume");
+        assert_eq!(imported_report.violations[0].line, 3);
+
+        let grouped_import_src = "use kani::{any, assume};
+fn harness() {
+    let _x: u8 = any();
+    assume(false);
+}
+";
+        let grouped_report = hygiene_lint_rust("src/grouped.rs", grouped_import_src);
+        assert_eq!(grouped_report.violations.len(), 1);
+        assert_eq!(grouped_report.violations[0].rule, "unreviewed-kani-assume");
+        assert_eq!(grouped_report.violations[0].line, 4);
+    }
+
+    #[test]
+    fn kani_invocation_selects_cargo_or_standalone_mode() {
+        let base = env::temp_dir().join(format!("verity-kani-inv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(wt.join("src")).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        let src_file = wt.join("src/lib.rs");
+        fs::write(&src_file, "#[kani::proof] fn verify_ok() {}\n").unwrap();
+        let root_file = wt.join("proof.rs");
+        fs::write(&root_file, "#[kani::proof] fn verify_ok() {}\n").unwrap();
+        let fake_cargo = bin_dir.join("cargo");
+        fs::write(&fake_cargo, "#!/bin/sh\n").unwrap();
+
+        let run_dir = wt.join(".verity-kani-0");
+        let report_path = run_dir.join("report.json");
+        let src_target = KaniTarget {
+            name: "verify_ok".to_string(),
+            source: RelPath::parse("src/lib.rs").unwrap(),
+            line: 1,
+            probes: Vec::new(),
+        };
+        let root_target = KaniTarget {
+            name: "verify_ok".to_string(),
+            source: RelPath::parse("proof.rs").unwrap(),
+            line: 1,
+            probes: Vec::new(),
+        };
+
+        // 1. Standalone kani without VERITY_CARGO_KANI uses standalone mode.
+        let standalone = build_kani_invocation(
+            &wt,
+            &src_file,
+            &run_dir,
+            &report_path,
+            &src_target,
+            Path::new("/usr/local/bin/kani"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(standalone.mode, KaniMode::Standalone);
+        assert!(standalone.args.contains(&"--crate-name".to_string()));
+        assert!(standalone
+            .args
+            .contains(&src_file.to_string_lossy().into_owned()));
+
+        // 2. cargo-kani binary with Cargo.toml and src/ proof selects Cargo mode.
+        let cargo_bin = build_kani_invocation(
+            &wt,
+            &src_file,
+            &run_dir,
+            &report_path,
+            &src_target,
+            Path::new("/usr/local/bin/cargo-kani"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cargo_bin.mode, KaniMode::Cargo);
+        assert_eq!(
+            cargo_bin.program,
+            PathBuf::from("/usr/local/bin/cargo-kani")
+        );
+        assert!(cargo_bin.args.contains(&"--manifest-path".to_string()));
+        assert!(!cargo_bin.args.contains(&"--crate-name".to_string()));
+        assert!(!cargo_bin.args.contains(&"kani".to_string()));
+
+        // 3. VERITY_CARGO_KANI pointing at cargo prepends `kani` subcommand.
+        let cargo_env = build_kani_invocation(
+            &wt,
+            &src_file,
+            &run_dir,
+            &report_path,
+            &src_target,
+            Path::new("/usr/local/bin/kani"),
+            Some(fake_cargo.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(cargo_env.mode, KaniMode::Cargo);
+        assert_eq!(cargo_env.args.first().map(String::as_str), Some("kani"));
+        assert!(cargo_env.args.contains(&"--manifest-path".to_string()));
+
+        // 4. Proof outside src/ stays in standalone mode even with cargo-kani.
+        let outside_src = build_kani_invocation(
+            &wt,
+            &root_file,
+            &run_dir,
+            &report_path,
+            &root_target,
+            Path::new("/usr/local/bin/cargo-kani"),
+            Some("1"),
+        )
+        .unwrap();
+        assert_eq!(outside_src.mode, KaniMode::Standalone);
+
+        // 5. Repo without Cargo.toml stays in standalone mode.
+        fs::remove_file(wt.join("Cargo.toml")).unwrap();
+        let no_manifest = build_kani_invocation(
+            &wt,
+            &src_file,
+            &run_dir,
+            &report_path,
+            &src_target,
+            Path::new("/usr/local/bin/cargo-kani"),
+            Some("1"),
+        )
+        .unwrap();
+        assert_eq!(no_manifest.mode, KaniMode::Standalone);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

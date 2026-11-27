@@ -1,15 +1,22 @@
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     pub worktree_dir: PathBuf,
     pub git_common_dir: Option<PathBuf>,
     pub allow_network: bool,
+    /// When true, mounts `worktree_dir` read-only (`--ro-bind`) and sets `HOME=/tmp`.
+    pub readonly_worktree: bool,
     /// Additional trusted installation files visible to a Pi worker.
     pub read_only_paths: Vec<PathBuf>,
     pub env_passthrough: Vec<(String, String)>,
+    /// Optional wall-clock timeout in seconds for `run_sandboxed`.
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,15 +81,85 @@ pub fn run_sandboxed(
         .map(canonical_dir)
         .transpose()?;
     let mut cmd = if cfg!(target_os = "linux") {
-        linux_command(cfg.allow_network, &worktree, git_dir.as_deref())?
+        linux_command(
+            cfg.allow_network,
+            cfg.readonly_worktree,
+            &worktree,
+            git_dir.as_deref(),
+        )?
     } else {
-        macos_command(cfg.allow_network, &worktree, git_dir.as_deref())?
+        macos_command(
+            cfg.allow_network,
+            cfg.readonly_worktree,
+            &worktree,
+            git_dir.as_deref(),
+        )?
     };
     configure_environment(&mut cmd, cfg, &worktree);
-    cmd.arg(program)
-        .args(args)
-        .output()
-        .map_err(|e| SandboxError::Io(e.to_string()))
+    cmd.arg(program).args(args);
+    run_command_with_timeout(cmd, cfg.timeout_secs.map(Duration::from_secs))
+}
+
+fn run_command_with_timeout(
+    mut cmd: Command,
+    timeout: Option<Duration>,
+) -> Result<Output, SandboxError> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| SandboxError::Io(e.to_string()))?;
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| SandboxError::Io("missing sandboxed child stdout".to_string()))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| SandboxError::Io("missing sandboxed child stderr".to_string()))?;
+
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let status = match timeout {
+        None => child.wait().map_err(|e| SandboxError::Io(e.to_string()))?,
+        Some(limit) => {
+            let deadline = Instant::now() + limit;
+            loop {
+                match child
+                    .try_wait()
+                    .map_err(|e| SandboxError::Io(e.to_string()))?
+                {
+                    Some(status) => break status,
+                    None => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(SandboxError::Io(
+                                "sandboxed command timed out".to_string(),
+                            ));
+                        }
+                        let remaining = deadline.saturating_duration_since(now);
+                        thread::sleep(remaining.min(Duration::from_millis(25)));
+                    }
+                }
+            }
+        }
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 pub(crate) fn pi_sandboxed_command(
@@ -100,7 +177,11 @@ pub(crate) fn pi_sandboxed_command(
     if worktree == Path::new("/") {
         return Err(SandboxError::Io("invalid Pi worktree root".into()));
     }
-    cmd.arg("--bind").arg(&worktree).arg(&worktree);
+    if cfg.readonly_worktree {
+        cmd.arg("--ro-bind").arg(&worktree).arg(&worktree);
+    } else {
+        cmd.arg("--bind").arg(&worktree).arg(&worktree);
+    }
     for path in &cfg.read_only_paths {
         bind_read_only(&mut cmd, &pi_installation_path(path, &worktree)?);
     }
@@ -123,16 +204,18 @@ pub(crate) fn pi_sandboxed_command(
     if let Some(git_dir) = &cfg.git_common_dir {
         bind_read_only(&mut cmd, &canonical_dir(git_dir)?);
     }
-    let git_marker = worktree.join(".git");
-    match git_marker.symlink_metadata() {
-        Ok(meta) if meta.is_file() || meta.is_dir() => bind_read_only(&mut cmd, &git_marker),
-        Ok(_) => {
-            return Err(SandboxError::Io(
-                "unexpected Pi worktree .git file type".into(),
-            ))
+    if !cfg.readonly_worktree {
+        let git_marker = worktree.join(".git");
+        match git_marker.symlink_metadata() {
+            Ok(meta) if meta.is_file() || meta.is_dir() => bind_read_only(&mut cmd, &git_marker),
+            Ok(_) => {
+                return Err(SandboxError::Io(
+                    "unexpected Pi worktree .git file type".into(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(SandboxError::Io(error.to_string())),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(SandboxError::Io(error.to_string())),
     }
     cmd.args(["--remount-ro", "/", "--chdir"])
         .arg(&worktree)
@@ -151,6 +234,11 @@ pub(crate) fn pi_sandboxed_command(
 }
 
 fn configure_environment(cmd: &mut Command, cfg: &SandboxConfig, worktree: &Path) {
+    let home = if cfg.readonly_worktree {
+        Path::new("/tmp")
+    } else {
+        worktree
+    };
     cmd.current_dir(worktree)
         .envs(
             cfg.env_passthrough
@@ -158,7 +246,7 @@ fn configure_environment(cmd: &mut Command, cfg: &SandboxConfig, worktree: &Path
                 .filter(|(key, _)| !key.starts_with("LD_") && !key.starts_with("DYLD_"))
                 .map(|(key, value)| (key, value)),
         )
-        .env("HOME", worktree)
+        .env("HOME", home)
         .env("TMPDIR", "/tmp");
 }
 
@@ -256,6 +344,7 @@ fn launcher(paths: &[&str]) -> Result<Command, SandboxError> {
 
 fn linux_command(
     allow_network: bool,
+    readonly_worktree: bool,
     worktree: &Path,
     git_dir: Option<&Path>,
 ) -> Result<Command, SandboxError> {
@@ -264,7 +353,11 @@ fn linux_command(
         .args(["--dev", "/dev"])
         .args(["--proc", "/proc"])
         .args(["--tmpfs", "/tmp"])
-        .arg("--bind")
+        .arg(if readonly_worktree {
+            "--ro-bind"
+        } else {
+            "--bind"
+        })
         .arg(worktree)
         .arg(worktree)
         .arg("--chdir")
@@ -282,14 +375,19 @@ fn linux_command(
 
 fn macos_command(
     allow_network: bool,
+    readonly_worktree: bool,
     worktree: &Path,
     git_dir: Option<&Path>,
 ) -> Result<Command, SandboxError> {
     let mut cmd = launcher(&["/usr/bin/sandbox-exec"])?;
-    let mut profile = format!(
-        "(version 1)\n(deny default)\n(allow process*)\n(allow file-read*)\n(allow file-write* (subpath {}) (subpath \"/private/tmp\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
-        seatbelt_path(worktree)?,
-    );
+    let mut profile = if readonly_worktree {
+        "(version 1)\n(deny default)\n(allow process*)\n(allow file-read*)\n(allow file-write* (subpath \"/private/tmp\"))\n(allow file-write-data (literal \"/dev/null\"))\n".to_string()
+    } else {
+        format!(
+            "(version 1)\n(deny default)\n(allow process*)\n(allow file-read*)\n(allow file-write* (subpath {}) (subpath \"/private/tmp\"))\n(allow file-write-data (literal \"/dev/null\"))\n",
+            seatbelt_path(worktree)?,
+        )
+    };
     if let Some(git_dir) = git_dir {
         profile.push_str(&format!(
             "(deny file-write* (subpath {}))\n",
@@ -326,7 +424,42 @@ pub fn default_offline_config(
         worktree_dir: worktree_dir.to_path_buf(),
         git_common_dir,
         allow_network: false,
+        readonly_worktree: false,
         read_only_paths: Vec::new(),
         env_passthrough: Vec::new(),
+        timeout_secs: Some(300),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_sandboxed_terminates_hanging_command_at_timeout() {
+        if !bwrap_available() {
+            eprintln!("skipping sandbox timeout test because bubblewrap is unavailable");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("verity-sandbox-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg = default_offline_config(&dir, None);
+        cfg.timeout_secs = Some(1);
+        let started = Instant::now();
+        let err = run_sandboxed(&cfg, "sleep", &["10"]).unwrap_err();
+        let elapsed = started.elapsed();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(err, SandboxError::Io(ref msg) if msg.contains("timed out")),
+            "expected timeout error, got: {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timed out command took too long: {elapsed:?}"
+        );
     }
 }
