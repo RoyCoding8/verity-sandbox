@@ -29,7 +29,9 @@ npm run tauri:dev
 
 Run `npm run tauri:build` to build a release bundle, or `npm run dev` to preview only the React UI in a browser without Tauri.
 
-Configure model providers from **Provider settings** in the desktop sidebar, or set provider API keys in your shell environment. To enable subagent tools inside desktop Pi chat sessions, build `verity` and place it on your `PATH` or beside the desktop executable, or set `VERITY_MCP_BIN` to its absolute path.
+The desktop dev and release builds automatically build and bundle the Verity CLI, which enables delegation tools in Pi chat sessions. Configure model providers from **Provider settings** in the desktop sidebar, or set provider API keys in your shell environment. To use a different CLI, set `VERITY_MCP_BIN` to its absolute path. Pi reports a startup warning and persistent status when the CLI is missing or cannot run. Set `VERITY_DISABLE_SUBAGENT_TOOLS=1` to intentionally disable these tools.
+
+Before running desktop Cargo commands directly, run `npm run sidecar:prepare` from the repository root. Use `-- --release` for a release CLI or `-- --target <triple>` for a cross build. The helper also honors Tauri's target and debug settings and Cargo's `CARGO_BUILD_TARGET` and `CARGO_TARGET_DIR` environment variables.
 
 ## Limitations
 

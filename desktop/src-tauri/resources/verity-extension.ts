@@ -282,6 +282,28 @@ function registerVeritySubagentTools(pi: ExtensionAPI): void {
   }
 
   const verityBin = process.env.VERITY_MCP_BIN?.trim();
+  pi.on("session_start", async (_event, ctx) => {
+    let problem: string | undefined;
+    if (!verityBin) {
+      problem = "Verity CLI was not found. Rebuild the desktop app or set VERITY_MCP_BIN to the CLI's absolute path.";
+    } else {
+      try {
+        const result = await pi.exec(verityBin, [], { timeout: 5_000 });
+        const output = `${result.stdout}\n${result.stderr}`;
+        if (result.code !== 2 || !output.includes("Verity v") || !output.includes("run-readonly") || !output.includes("spawn")) {
+          problem = `Verity CLI at ${verityBin} failed its startup check (exit ${result.code}). Rebuild the desktop app or check VERITY_MCP_BIN.`;
+        }
+      } catch (error) {
+        problem = `Verity CLI at ${verityBin} could not start: ${String(error)}`;
+      }
+    }
+    if (problem) {
+      ctx.ui.setStatus("verity-delegation", "Verity delegation unavailable");
+      ctx.ui.notify(problem, "warning");
+    } else {
+      ctx.ui.setStatus("verity-delegation", undefined);
+    }
+  });
   if (!verityBin || typeof pi.registerTool !== "function") {
     return;
   }
