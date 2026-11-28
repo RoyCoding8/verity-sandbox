@@ -56,6 +56,9 @@ jobs:
       - name: Run tests (Tauri Rust shell)
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
 
+      - name: Build desktop executable with its CLI sidecar
+        run: cargo build --locked --manifest-path desktop/src-tauri/Cargo.toml
+
       - name: Verify Pi delegation tools with the CLI beside the desktop
         env:
           VERITY_TEST_CLI: ${{ github.workspace }}/desktop/src-tauri/target/debug/verity${{ matrix.os == 'windows-latest' && '.exe' || '' }}
