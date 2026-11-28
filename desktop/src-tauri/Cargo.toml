@@ -9,6 +9,7 @@ description = "Thin Tauri v2 native desktop shell for Verity"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+embed-resource = "3"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
