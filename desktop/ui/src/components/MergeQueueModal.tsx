@@ -199,7 +199,7 @@ export function MergeQueueModal({
                           className="vo-merge-meta-value"
                           title={entry.targetRef}
                         >
-                          {entry.targetRef}
+                          {entry.targetRef === "HEAD" ? "Current checked-out branch (HEAD)" : entry.targetRef}
                         </span>
                       </div>
                       <div className="vo-merge-meta-item">

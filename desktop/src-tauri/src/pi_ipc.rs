@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -304,18 +305,94 @@ pub fn validate_external_open_url(raw: &str) -> Result<String, String> {
     {
         return Err("external URL must not contain whitespace or control characters".to_string());
     }
-    let rest = if let Some(r) = trimmed.strip_prefix("https://") {
-        r
-    } else if let Some(r) = trimmed.strip_prefix("http://") {
-        r
-    } else {
+    let parsed = tauri::Url::parse(trimmed).map_err(|e| format!("invalid external URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err("external URL must use http:// or https://".to_string());
-    };
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if host.is_empty() {
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
         return Err("external URL must include a non-empty host".to_string());
     }
-    Ok(trimmed.to_string())
+    Ok(parsed.to_string())
+}
+
+#[cfg(windows)]
+mod windows_browser {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            window: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+
+    pub(super) fn open(url: &str) -> Result<(), String> {
+        open_with(url, |operation, file| unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                operation,
+                file,
+                ptr::null(),
+                ptr::null(),
+                1,
+            )
+        })
+    }
+
+    fn open_with(
+        url: &str,
+        execute: impl FnOnce(*const u16, *const u16) -> isize,
+    ) -> Result<(), String> {
+        let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        let result = execute(operation.as_ptr(), file.as_ptr());
+        if result <= 32 {
+            return Err(format!(
+                "failed to launch browser: ShellExecuteW returned {result}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_open_receives_entire_url_as_one_utf16_file_argument() {
+            let url = "https://example.test/auth?a=1&echo(VERITY_SHELL_MARKER&b=%22ok%22#雪";
+            open_with(url, |operation, file| {
+                let expected_operation: Vec<u16> = "open\0".encode_utf16().collect();
+                let expected_file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+                unsafe {
+                    assert_eq!(
+                        std::slice::from_raw_parts(operation, expected_operation.len()),
+                        expected_operation
+                    );
+                    assert_eq!(
+                        std::slice::from_raw_parts(file, expected_file.len()),
+                        expected_file
+                    );
+                }
+                33
+            })
+            .unwrap();
+        }
+
+        #[test]
+        fn native_open_reports_os_errors() {
+            for code in [0, 2, 5, 31, 32] {
+                let error = open_with("https://example.test/", |_, _| code).unwrap_err();
+                assert!(error.contains(&code.to_string()));
+            }
+        }
+    }
 }
 
 fn launch_os_browser(url: &str) -> Result<(), String> {
@@ -337,14 +414,7 @@ fn launch_os_browser(url: &str) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("failed to launch browser: {}", e))?;
-        Ok(())
+        windows_browser::open(url)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -4104,6 +4174,23 @@ lines.on("line", (line) => {
         assert!(validate_external_open_url("javascript:alert(1)").is_err());
         assert!(validate_external_open_url("https://").is_err());
         assert!(validate_external_open_url("https://example.com/a b").is_err());
+        for malformed in [
+            "https://:443/path",
+            "https://[broken]/",
+            "https://example.com:bad/",
+            "https://a%00b/",
+        ] {
+            assert!(
+                validate_external_open_url(malformed).is_err(),
+                "{malformed}"
+            );
+        }
+        let query = "https://example.test/auth?a=1&echo(VERITY_SHELL_MARKER&b=%22ok%22#done";
+        assert_eq!(validate_external_open_url(query).unwrap(), query);
+        assert_eq!(
+            validate_external_open_url("https://[::1]:3000/path?x=1&y=2").unwrap(),
+            "https://[::1]:3000/path?x=1&y=2"
+        );
     }
 
     #[test]

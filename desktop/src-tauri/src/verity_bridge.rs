@@ -189,7 +189,26 @@ pub fn approve_and_merge_view(
     approved_digest: &str,
 ) -> Result<MergeResponse, String> {
     let parsed_id = TaskId::parse(task_id).map_err(|e| e.to_string())?;
-    match approve_and_merge(repo_dir, &parsed_id, target_ref, approved_digest)
+    let target_ref = if target_ref == "HEAD" {
+        let output = verity_runtime::git::run_git(repo_dir, &["symbolic-ref", "--quiet", "HEAD"])
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(
+                "merge target requires a checked-out local branch; HEAD is detached or unavailable"
+                    .into(),
+            );
+        }
+        let branch = String::from_utf8(output.stdout)
+            .map_err(|_| "merge target branch is not UTF-8".to_string())?;
+        let branch = branch.trim_end_matches(['\r', '\n']);
+        if !branch.starts_with("refs/heads/") {
+            return Err("merge target must be a checked-out local branch".into());
+        }
+        branch.to_string()
+    } else {
+        target_ref.to_string()
+    };
+    match approve_and_merge(repo_dir, &parsed_id, &target_ref, approved_digest)
         .map_err(|e| e.to_string())?
     {
         MergeResult::Merged {
@@ -296,6 +315,158 @@ mod tests {
     use verity_core::{CheckerVerdict, CommitOid, VerifierKind};
     use verity_runtime::handoff::build_spec_handoff;
     use verity_runtime::orchestrator::{handoff_path_for, handoff_to_json};
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = verity_runtime::git::run_git(repo, args).unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn merge_fixture(scenario: &str) -> (PathBuf, String, String) {
+        let repo = unique_temp_repo("merge-head");
+        git(&repo, &["init", "-b", "develop"]);
+        git(&repo, &["config", "user.email", "fixture@example.test"]);
+        git(&repo, &["config", "user.name", "Fixture"]);
+        fs::write(repo.join(".gitignore"), ".verity/\nignored.txt\n").unwrap();
+        fs::write(repo.join("unchanged.txt"), "preserve tracked content\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["branch", "main"]);
+        git(&repo, &["checkout", "-b", "candidate"]);
+        let code = if scenario == "hygiene" {
+            "pub fn value() -> u32 { 2 }\nkani::assume(false);\nassert!(true);\n"
+        } else {
+            "pub fn value() -> u32 { 2 }\nassert!(true);\n"
+        };
+        fs::write(repo.join("candidate.rs"), code).unwrap();
+        git(&repo, &["add", "candidate.rs"]);
+        git(&repo, &["commit", "-m", "candidate"]);
+        let candidate = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "develop"]);
+        fs::write(repo.join("notes.txt"), "preserve untracked content\n").unwrap();
+        fs::write(repo.join("ignored.txt"), "preserve ignored content\n").unwrap();
+        let id = TaskId::parse("merge-head").unwrap();
+        let handoff = build_spec_handoff(
+            CommitOid::parse(&candidate).unwrap(),
+            &[(RelPath::parse("candidate.rs").unwrap(), code.to_string())],
+            VerifierKind::RustKani,
+            CheckerVerdict {
+                status: if scenario == "verdict" {
+                    VerdictStatus::Inconclusive
+                } else {
+                    VerdictStatus::Pass
+                },
+                reason: "fixture".into(),
+                checks_passed: 1,
+                probes_satisfied: 1,
+            },
+            None,
+        );
+        let digest = handoff.spec_digest.to_hex();
+        let record = PersistedHandoff {
+            task_id: id.clone(),
+            base_commit: CommitOid::parse(&base).unwrap(),
+            verifier: VerifierKind::RustKani,
+            handoff,
+        };
+        let path = handoff_path_for(&repo, &id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, handoff_to_json(&record)).unwrap();
+        (repo, base, digest)
+    }
+
+    #[test]
+    fn head_target_merges_checked_out_non_main_branch_and_preserves_other_state() {
+        let (repo, base, digest) = merge_fixture("pass");
+        let result = approve_and_merge_view(&repo, "merge-head", "HEAD", &digest).unwrap();
+        assert_eq!(result.status, "merged");
+        assert!(!result.already_merged);
+        let merged = result.commit.unwrap();
+        assert_ne!(merged, base);
+        assert_eq!(git(&repo, &["rev-parse", "refs/heads/develop"]), merged);
+        assert_eq!(git(&repo, &["symbolic-ref", "HEAD"]), "refs/heads/develop");
+        assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), base);
+        git(
+            &repo,
+            &["merge-base", "--is-ancestor", "candidate", "develop"],
+        );
+        assert!(repo.join("candidate.rs").exists());
+        for (path, expected) in [
+            ("unchanged.txt", "preserve tracked content\n"),
+            ("notes.txt", "preserve untracked content\n"),
+            ("ignored.txt", "preserve ignored content\n"),
+        ] {
+            assert_eq!(fs::read_to_string(repo.join(path)).unwrap(), expected);
+        }
+        assert_eq!(
+            git(&repo, &["status", "--porcelain", "--untracked-files=no"]),
+            ""
+        );
+        assert!(
+            approve_and_merge_view(&repo, "merge-head", "HEAD", &digest)
+                .unwrap()
+                .already_merged
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn head_target_refuses_detached_moved_dirty_and_unapproved_targets() {
+        for scenario in ["detached", "moved", "dirty", "digest", "verdict", "hygiene"] {
+            let (repo, base, digest) = merge_fixture(scenario);
+            let mut approved = digest;
+            match scenario {
+                "detached" => {
+                    git(&repo, &["checkout", "--detach"]);
+                }
+                "moved" => {
+                    git(&repo, &["commit", "--allow-empty", "-m", "moved"]);
+                }
+                "dirty" => {
+                    fs::write(repo.join("unchanged.txt"), "user edit\n").unwrap();
+                }
+                "digest" => {
+                    approved = "f".repeat(64);
+                }
+                "verdict" | "hygiene" => {}
+                _ => unreachable!(),
+            }
+            let before = git(&repo, &["rev-parse", "refs/heads/develop"]);
+            let error = approve_and_merge_view(&repo, "merge-head", "HEAD", &approved).unwrap_err();
+            let expected = match scenario {
+                "detached" => "checked-out local branch",
+                "moved" => "differs from the verified base",
+                "dirty" => "contains tracked changes",
+                "digest" => "approved digest mismatch",
+                "verdict" => "machine checker verdict",
+                "hygiene" => "spec hygiene check failed",
+                _ => unreachable!(),
+            };
+            assert!(error.contains(expected), "{scenario}: {error}");
+            assert_eq!(
+                git(&repo, &["rev-parse", "refs/heads/develop"]),
+                before,
+                "{scenario}"
+            );
+            assert_eq!(
+                git(&repo, &["rev-parse", "refs/heads/main"]),
+                base,
+                "{scenario}"
+            );
+            if scenario == "dirty" {
+                assert_eq!(
+                    fs::read_to_string(repo.join("unchanged.txt")).unwrap(),
+                    "user edit\n"
+                );
+            }
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
 
     fn unique_temp_repo(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
