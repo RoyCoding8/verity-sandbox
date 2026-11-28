@@ -12,6 +12,7 @@ fn main() {
         .manage(PiAppState::new_default())
         .invoke_handler(tauri::generate_handler![
             providers::list_providers,
+            providers::scan_provider_models,
             providers::upsert_provider,
             providers::delete_provider,
             providers::validate_provider_sign_in_url,

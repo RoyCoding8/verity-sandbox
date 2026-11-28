@@ -46,12 +46,59 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
 
+      - name: Build and stage the Verity CLI sidecar
+        run: npm run sidecar:prepare
+
       - name: Run Clippy (Tauri Rust shell)
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run tests (Tauri Rust shell)
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+
+      - name: Build desktop executable with its CLI sidecar
+        run: cargo build --locked --manifest-path desktop/src-tauri/Cargo.toml
+
+      - name: Verify Pi delegation tools with the CLI beside the desktop
+        env:
+          VERITY_TEST_CLI: ${{ github.workspace }}/desktop/src-tauri/target/debug/verity${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+        run: npm exec --yes --package=@earendil-works/pi-coding-agent@1.5.2 -- node --test desktop/ui/src/verify/piExtension.test.mjs
+
+      - name: Install desktop bundler
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build native release bundle through Tauri
+        shell: bash
+        env:
+          NATIVE_BUNDLE: ${{ matrix.os == 'ubuntu-latest' && 'deb' || matrix.os == 'macos-latest' && 'app' || 'nsis' }}
+        run: |
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          echo "RELEASE_TARGET=$target" >> "$GITHUB_ENV"
+          npm --prefix desktop run tauri:build -- --ci --no-sign --target "$target" --bundles "$NATIVE_BUNDLE"
+
+      - name: Verify Linux release package payload
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          dpkg-deb -x desktop/src-tauri/target/"$RELEASE_TARGET"/release/bundle/deb/*.deb "$RUNNER_TEMP/verity-bundle"
+          node desktop/scripts/verify-bundle.mjs "$RUNNER_TEMP/verity-bundle" "$RELEASE_TARGET"
+
+      - name: Verify macOS release app payload
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: node desktop/scripts/verify-bundle.mjs "desktop/src-tauri/target/$RELEASE_TARGET/release/bundle/macos/Verity.app" "$RELEASE_TARGET"
+
+      - name: Verify Windows release installer payload
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $installer = @(Get-ChildItem -LiteralPath "desktop/src-tauri/target/$env:RELEASE_TARGET/release/bundle/nsis" -Filter *.exe)
+          if ($installer.Count -ne 1) { throw "Expected exactly one NSIS installer" }
+          $payload = Join-Path $env:RUNNER_TEMP 'verity-bundle'
+          & 7z x $installer[0].FullName "-o$payload" -y
+          if ($LASTEXITCODE -ne 0) { throw "Could not extract the NSIS installer" }
+          node desktop/scripts/verify-bundle.mjs $payload $env:RELEASE_TARGET
 
       - name: Install pinned TLC
         if: matrix.os == 'ubuntu-latest'

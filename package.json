@@ -10,7 +10,8 @@
     "tauri": "npm --prefix desktop run tauri --",
     "tauri:dev": "npm --prefix desktop run tauri:dev",
     "tauri:build": "npm --prefix desktop run tauri:build",
-    "test": "cargo test --workspace && cargo test --manifest-path desktop/src-tauri/Cargo.toml",
+    "sidecar:prepare": "node desktop/scripts/prepare-sidecar.mjs",
+    "test": "cargo test --workspace && npm run sidecar:prepare && cargo test --manifest-path desktop/src-tauri/Cargo.toml",
     "formal": "cargo kani -p verity-formal"
   }
 }

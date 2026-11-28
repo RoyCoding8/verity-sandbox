@@ -334,7 +334,7 @@ export function App() {
       return [
         {
           taskId: handoff.task_id,
-          targetRef: "refs/heads/main",
+          targetRef: "HEAD",
           worktreePath: `.verity/worktrees/${handoff.task_id}`,
           handoff,
           approvedDigest: handoff.spec_digest,

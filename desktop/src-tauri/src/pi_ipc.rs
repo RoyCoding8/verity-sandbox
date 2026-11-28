@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -225,40 +226,81 @@ pub struct PiBootstrapData {
 // Launch Env & MCP Binary Resolution (Pure Boundary Helpers)
 // ============================================================
 
-/// Resolves the local `verity` CLI binary for `verity mcp` launch wiring.
-pub fn resolve_verity_mcp_bin() -> Option<PathBuf> {
-    if let Ok(explicit) = env::var("VERITY_MCP_BIN") {
-        let path = PathBuf::from(explicit.trim());
-        if path.is_absolute() && path.is_file() {
-            return Some(path);
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerityBinError {
+    RelativeOverride(PathBuf),
+    MissingOverride(PathBuf),
+}
+
+impl std::fmt::Display for VerityBinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RelativeOverride(path) => write!(
+                f,
+                "VERITY_MCP_BIN must be an absolute path: {}",
+                path.display()
+            ),
+            Self::MissingOverride(path) => write!(
+                f,
+                "VERITY_MCP_BIN does not name a CLI file: {}",
+                path.display()
+            ),
         }
     }
+}
 
+pub fn resolve_verity_mcp_bin() -> Result<Option<PathBuf>, VerityBinError> {
+    let explicit = env::var_os("VERITY_MCP_BIN");
+    let exe = env::current_exe().ok();
+    let paths = env::var_os("PATH").unwrap_or_default();
+    resolve_verity_mcp_bin_from(
+        explicit.as_deref(),
+        exe.as_deref(),
+        env::split_paths(&paths),
+        Path::is_file,
+    )
+}
+
+fn resolve_verity_mcp_bin_from(
+    explicit: Option<&std::ffi::OsStr>,
+    current_exe: Option<&Path>,
+    paths: impl IntoIterator<Item = PathBuf>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<Option<PathBuf>, VerityBinError> {
+    if let Some(explicit) = explicit.filter(|value| !value.to_string_lossy().trim().is_empty()) {
+        let path = PathBuf::from(explicit.to_string_lossy().trim());
+        if !path.is_absolute() {
+            return Err(VerityBinError::RelativeOverride(path));
+        }
+        return if is_file(&path) {
+            Ok(Some(path))
+        } else {
+            Err(VerityBinError::MissingOverride(path))
+        };
+    }
     let bin_name = if cfg!(windows) {
         "verity.exe"
     } else {
         "verity"
     };
 
-    if let Ok(exe) = env::current_exe() {
+    if let Some(exe) = current_exe.filter(|exe| exe.is_absolute()) {
         if let Some(dir) = exe.parent() {
             let sibling = dir.join(bin_name);
-            if sibling.is_file() {
-                return Some(sibling);
+            if is_file(&sibling) {
+                return Ok(Some(sibling));
             }
         }
     }
 
-    if let Some(paths) = env::var_os("PATH") {
-        for dir in env::split_paths(&paths).filter(|dir| dir.is_absolute()) {
-            let candidate = dir.join(bin_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    for dir in paths.into_iter().filter(|dir| dir.is_absolute()) {
+        let candidate = dir.join(bin_name);
+        if is_file(&candidate) {
+            return Ok(Some(candidate));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Builds the full child-process environment for Pi:
@@ -304,18 +346,94 @@ pub fn validate_external_open_url(raw: &str) -> Result<String, String> {
     {
         return Err("external URL must not contain whitespace or control characters".to_string());
     }
-    let rest = if let Some(r) = trimmed.strip_prefix("https://") {
-        r
-    } else if let Some(r) = trimmed.strip_prefix("http://") {
-        r
-    } else {
+    let parsed = tauri::Url::parse(trimmed).map_err(|e| format!("invalid external URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err("external URL must use http:// or https://".to_string());
-    };
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if host.is_empty() {
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
         return Err("external URL must include a non-empty host".to_string());
     }
-    Ok(trimmed.to_string())
+    Ok(parsed.to_string())
+}
+
+#[cfg(windows)]
+mod windows_browser {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            window: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+
+    pub(super) fn open(url: &str) -> Result<(), String> {
+        open_with(url, |operation, file| unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                operation,
+                file,
+                ptr::null(),
+                ptr::null(),
+                1,
+            )
+        })
+    }
+
+    fn open_with(
+        url: &str,
+        execute: impl FnOnce(*const u16, *const u16) -> isize,
+    ) -> Result<(), String> {
+        let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        let result = execute(operation.as_ptr(), file.as_ptr());
+        if result <= 32 {
+            return Err(format!(
+                "failed to launch browser: ShellExecuteW returned {result}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_open_receives_entire_url_as_one_utf16_file_argument() {
+            let url = "https://example.test/auth?a=1&echo(VERITY_SHELL_MARKER&b=%22ok%22#雪";
+            open_with(url, |operation, file| {
+                let expected_operation: Vec<u16> = "open\0".encode_utf16().collect();
+                let expected_file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+                unsafe {
+                    assert_eq!(
+                        std::slice::from_raw_parts(operation, expected_operation.len()),
+                        expected_operation
+                    );
+                    assert_eq!(
+                        std::slice::from_raw_parts(file, expected_file.len()),
+                        expected_file
+                    );
+                }
+                33
+            })
+            .unwrap();
+        }
+
+        #[test]
+        fn native_open_reports_os_errors() {
+            for code in [0, 2, 5, 31, 32] {
+                let error = open_with("https://example.test/", |_, _| code).unwrap_err();
+                assert!(error.contains(&code.to_string()));
+            }
+        }
+    }
 }
 
 fn launch_os_browser(url: &str) -> Result<(), String> {
@@ -337,14 +455,7 @@ fn launch_os_browser(url: &str) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("failed to launch browser: {}", e))?;
-        Ok(())
+        windows_browser::open(url)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -1247,7 +1358,17 @@ impl PiAppState {
     ) -> Result<Arc<PiSessionSupervisor>, String> {
         let store = ProviderStore::load(&self.inner.provider_store_path).unwrap_or_default();
         let verity_bin = resolve_verity_mcp_bin();
-        let launch_env = build_pi_launch_env(&store, verity_bin.as_deref());
+        let mut launch_env = build_pi_launch_env(
+            &store,
+            verity_bin.as_ref().ok().and_then(|bin| bin.as_deref()),
+        );
+        launch_env.push((
+            "VERITY_MCP_ERROR".to_string(),
+            verity_bin
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default(),
+        ));
 
         let mut config = match &self.inner.base_config {
             Some(cfg) => {
@@ -1256,8 +1377,9 @@ impl PiAppState {
                 cloned
             }
             None => {
-                let ext_path = ensure_verity_pi_extension_path().ok();
-                build_default_pi_config(project_path, ext_path.as_deref())
+                let ext_path = ensure_verity_pi_extension_path()
+                    .map_err(|err| format!("Failed to prepare Verity Pi extension: {err}"))?;
+                build_default_pi_config(project_path, Some(&ext_path))
             }
         };
         config.env.extend(launch_env);
@@ -4017,6 +4139,93 @@ lines.on("line", (line) => {
     }
 
     #[test]
+    fn cli_resolver_honors_explicit_overrides_without_fallback() {
+        let root = env::temp_dir();
+        let explicit = root.join("custom-verity");
+        let missing = root.join("missing-verity");
+        let desktop = root.join("verity-desktop");
+        let relative = Path::new("repo/verity");
+        for (input, expected) in [
+            (explicit.as_path(), Ok(Some(explicit.clone()))),
+            (
+                missing.as_path(),
+                Err(VerityBinError::MissingOverride(missing.clone())),
+            ),
+            (
+                relative,
+                Err(VerityBinError::RelativeOverride(relative.to_path_buf())),
+            ),
+        ] {
+            let result = resolve_verity_mcp_bin_from(
+                Some(input.as_os_str()),
+                Some(&desktop),
+                [root.clone()],
+                |path| path != missing,
+            );
+            assert_eq!(result, expected);
+            if let Err(error) = result {
+                assert!(error.to_string().contains(&input.display().to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn cli_resolver_uses_absolute_sibling_then_absolute_path_entries() {
+        let root = env::temp_dir();
+        let desktop = root.join("app").join("verity-desktop");
+        let name = if cfg!(windows) {
+            "verity.exe"
+        } else {
+            "verity"
+        };
+        let sibling = desktop.parent().unwrap().join(name);
+        let path_bin = root.join("bin").join(name);
+        let paths = [
+            PathBuf::new(),
+            PathBuf::from("opened-repo"),
+            root.join("bin"),
+        ];
+        for explicit in [None, Some(std::ffi::OsStr::new("  "))] {
+            assert_eq!(
+                resolve_verity_mcp_bin_from(explicit, Some(&desktop), paths.clone(), |_| true),
+                Ok(Some(sibling.clone()))
+            );
+            assert_eq!(
+                resolve_verity_mcp_bin_from(explicit, Some(&desktop), paths.clone(), |path| path
+                    == path_bin),
+                Ok(Some(path_bin.clone()))
+            );
+            assert_eq!(
+                resolve_verity_mcp_bin_from(explicit, None, paths.clone(), |path| !path
+                    .is_absolute()),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn cli_resolver_discovers_a_real_sibling_file() {
+        let root = unique_temp_dir("cli-sibling");
+        let name = if cfg!(windows) {
+            "verity.exe"
+        } else {
+            "verity"
+        };
+        let sibling = root.join(name);
+        fs::write(&sibling, b"sidecar fixture").unwrap();
+        assert_eq!(
+            resolve_verity_mcp_bin_from(
+                None,
+                Some(&root.join("verity-desktop")),
+                [],
+                Path::is_file
+            ),
+            Ok(Some(sibling))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn parses_all_ipc_response_payloads_to_frontend_shapes() {
         let msgs_val = parse_json(
             r#"{"messages":[{"id":"m1","role":"user","content":"hello","timestamp":"10:00"},{"id":"m2","role":"assistant","content":[{"text":"world"}],"timestamp":1700000000000,"toolCalls":[{"id":"tc1","name":"read","status":"done"}]}]}"#,
@@ -4104,6 +4313,23 @@ lines.on("line", (line) => {
         assert!(validate_external_open_url("javascript:alert(1)").is_err());
         assert!(validate_external_open_url("https://").is_err());
         assert!(validate_external_open_url("https://example.com/a b").is_err());
+        for malformed in [
+            "https://:443/path",
+            "https://[broken]/",
+            "https://example.com:bad/",
+            "https://a%00b/",
+        ] {
+            assert!(
+                validate_external_open_url(malformed).is_err(),
+                "{malformed}"
+            );
+        }
+        let query = "https://example.test/auth?a=1&echo(VERITY_SHELL_MARKER&b=%22ok%22#done";
+        assert_eq!(validate_external_open_url(query).unwrap(), query);
+        assert_eq!(
+            validate_external_open_url("https://[::1]:3000/path?x=1&y=2").unwrap(),
+            "https://[::1]:3000/path?x=1&y=2"
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ const DEFAULT_COST = Object.freeze({
 });
 const KEYLESS_FALLBACK_API_KEY = "verity-no-key";
 const SUBAGENT_EXEC_TIMEOUT_MS = 310_000;
+const VERITY_TOOLS = new Set(["verity_run_readonly", "verity_spawn_write", "verity_list_handoffs"]);
 
 const API_MAP: Readonly<Record<string, string>> = Object.freeze({
   "openai-completions": "openai-completions",
@@ -40,11 +41,61 @@ interface RawProviderEntry {
 
 interface HandoffSummary {
   task_id: string;
-  verifier: string | null;
-  verdict: string | null;
-  hygiene_violations: unknown[];
+  verifier: "kani" | "lean";
+  verdict: "pass" | "counterexample" | "inconclusive" | "invalid_report";
+  hygiene_clean: boolean;
+  hygiene_violations: HygieneViolation[];
   changed_paths: string[];
-  spec_digest: string | null;
+  spec_digest: string;
+}
+
+interface HygieneViolation {
+  rule: string;
+  path: string;
+  line: number;
+  detail: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isHygieneViolation(value: unknown): value is HygieneViolation {
+  return isRecord(value) && typeof value.rule === "string" &&
+    typeof value.path === "string" && typeof value.detail === "string" &&
+    typeof value.line === "number" && Number.isSafeInteger(value.line) && value.line >= 0;
+}
+
+function parseHandoffSummary(value: unknown, file: string): HandoffSummary {
+  if (!isRecord(value) || typeof value.task_id !== "string" || value.task_id !== file.slice(0, -5) ||
+    (value.verifier !== "kani" && value.verifier !== "lean") ||
+    !isRecord(value.verdict) || !isRecord(value.hygiene)) {
+    throw new Error("invalid handoff identity, verifier, verdict, or hygiene");
+  }
+  const status = value.verdict.status;
+  if (status !== "pass" && status !== "counterexample" &&
+    status !== "inconclusive" && status !== "invalid_report") {
+    throw new Error("invalid verdict status");
+  }
+  const { clean, violations } = value.hygiene;
+  if (typeof clean !== "boolean" || !Array.isArray(violations) ||
+    !violations.every(isHygieneViolation) || clean !== (violations.length === 0)) {
+    throw new Error("invalid hygiene report");
+  }
+  if (!Array.isArray(value.changed_paths) ||
+    !value.changed_paths.every((p): p is string => typeof p === "string") ||
+    typeof value.spec_digest !== "string" || !/^[0-9a-f]{64}$/.test(value.spec_digest)) {
+    throw new Error("invalid changed paths or spec digest");
+  }
+  return {
+    task_id: value.task_id,
+    verifier: value.verifier,
+    verdict: status,
+    hygiene_clean: clean,
+    hygiene_violations: violations,
+    changed_paths: value.changed_paths,
+    spec_digest: value.spec_digest,
+  };
 }
 
 function resolvePiApi(rawApi: unknown): string {
@@ -232,6 +283,36 @@ function registerVeritySubagentTools(pi: ExtensionAPI): void {
   }
 
   const verityBin = process.env.VERITY_MCP_BIN?.trim();
+  let suspendedTools: string[] = [];
+  pi.on("session_start", async (_event, ctx) => {
+    const activeTools = pi.getActiveTools();
+    suspendedTools = [...new Set([...suspendedTools, ...activeTools.filter((name) => VERITY_TOOLS.has(name))])];
+    pi.setActiveTools(activeTools.filter((name) => !VERITY_TOOLS.has(name)));
+    let problem = process.env.VERITY_MCP_ERROR?.trim();
+    if (!problem && !verityBin) {
+      problem = "Verity CLI was not found. Rebuild the desktop app or set VERITY_MCP_BIN to the CLI's absolute path.";
+    } else if (!problem && verityBin && !path.isAbsolute(verityBin)) {
+      problem = `VERITY_MCP_BIN must be an absolute path: ${verityBin}`;
+    } else if (!problem && verityBin) {
+      try {
+        const result = await pi.exec(verityBin, [], { timeout: 5_000 });
+        const output = `${result.stdout}\n${result.stderr}`;
+        if (result.code !== 2 || !output.includes("Verity v") || !output.includes("run-readonly") || !output.includes("spawn")) {
+          problem = `Verity CLI at ${verityBin} failed its startup check (exit ${result.code}). Rebuild the desktop app or check VERITY_MCP_BIN.`;
+        }
+      } catch (error) {
+        problem = `Verity CLI at ${verityBin} could not start: ${String(error)}`;
+      }
+    }
+    if (problem) {
+      ctx.ui.setStatus("verity-delegation", "Verity delegation unavailable");
+      ctx.ui.notify(problem, "warning");
+    } else {
+      pi.setActiveTools([...new Set([...pi.getActiveTools(), ...suspendedTools])]);
+      suspendedTools = [];
+      ctx.ui.setStatus("verity-delegation", undefined);
+    }
+  });
   if (!verityBin || typeof pi.registerTool !== "function") {
     return;
   }
@@ -452,39 +533,9 @@ function registerVeritySubagentTools(pi: ExtensionAPI): void {
         const fullPath = path.join(handoffsDir, file);
         try {
           const raw = await fs.readFile(fullPath, "utf8");
-          const parsed = JSON.parse(raw) as Record<string, unknown>;
-          const taskId =
-            typeof parsed.task_id === "string"
-              ? parsed.task_id
-              : file.replace(/\.json$/, "");
-          const verifier =
-            typeof parsed.verifier === "string" ? parsed.verifier : null;
-          const verdict =
-            typeof parsed.verdict === "string" ? parsed.verdict : null;
-          const hygieneViolations = Array.isArray(parsed.hygiene_violations)
-            ? parsed.hygiene_violations
-            : [];
-          const changedPaths = Array.isArray(parsed.changed_paths)
-            ? parsed.changed_paths.filter(
-                (p): p is string => typeof p === "string",
-              )
-            : [];
-          const specDigest =
-            typeof parsed.spec_digest === "string" ? parsed.spec_digest : null;
-
-          handoffs.push({
-            task_id: taskId,
-            verifier,
-            verdict,
-            hygiene_violations: hygieneViolations,
-            changed_paths: changedPaths,
-            spec_digest: specDigest,
-          });
+          handoffs.push(parseHandoffSummary(JSON.parse(raw), file));
         } catch (err) {
-          console.error(
-            `[verity-handoffs] failed to parse handoff "${file}":`,
-            err,
-          );
+          throw new Error(`Invalid Verity handoff "${file}": ${String(err)}`);
         }
       }
 

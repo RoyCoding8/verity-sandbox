@@ -2867,6 +2867,7 @@ export function usePiWorkspace() {
         if (reqId === providerRequestIdRef.current) {
           notify(`Failed to save provider: ${formatErrorMessage(err)}`, "error");
         }
+        throw err;
       }
     },
     [notify]
@@ -2903,6 +2904,7 @@ export function usePiWorkspace() {
         if (reqId === providerRequestIdRef.current) {
           notify(`Failed to delete provider: ${formatErrorMessage(err)}`, "error");
         }
+        throw err;
       }
     },
     [notify]

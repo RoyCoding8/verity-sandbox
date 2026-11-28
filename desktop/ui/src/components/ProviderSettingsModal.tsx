@@ -7,6 +7,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import {
+  tauriApi,
   validateExternalSignInUrl,
   validateProviderBaseUrl,
   type ProviderApiKind,
@@ -59,6 +60,12 @@ const EMPTY_FORM: ProviderFormState = {
 
 const FORM_ID = "provider-settings-form";
 
+type ModelScanState =
+  | { readonly kind: "idle" }
+  | { readonly kind: "loading" }
+  | { readonly kind: "ready"; readonly models: readonly string[]; readonly selected: string }
+  | { readonly kind: "error"; readonly message: string };
+
 const API_PROTOCOL_OPTIONS: readonly Md3SelectOption[] = [
   {
     value: "openai-completions",
@@ -75,13 +82,19 @@ const API_PROTOCOL_OPTIONS: readonly Md3SelectOption[] = [
     label: "anthropic-messages",
     description: "Anthropic Messages API",
   },
+  {
+    value: "google-generative-ai",
+    label: "google-generative-ai",
+    description: "Google Generative AI (manual model IDs)",
+  },
 ];
 
 function isProviderApiKind(value: string): value is ProviderApiKind {
   return (
     value === "openai-completions" ||
     value === "openai-responses" ||
-    value === "anthropic-messages"
+    value === "anthropic-messages" ||
+    value === "google-generative-ai"
   );
 }
 
@@ -113,6 +126,8 @@ export function ProviderSettingsModal({
   const [submitting, setSubmitting] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [scan, setScan] = useState<ModelScanState>({ kind: "idle" });
+  const scanGeneration = useRef(0);
 
   const draftModelInputRef = useRef<HTMLInputElement>(null);
 
@@ -137,6 +152,7 @@ export function ProviderSettingsModal({
   );
 
   function resetFormState() {
+    invalidateScan();
     setForm(EMPTY_FORM);
     setAddingModel(false);
     setDraftModelId("");
@@ -144,9 +160,50 @@ export function ProviderSettingsModal({
     setError(null);
   }
 
+  function invalidateScan() {
+    scanGeneration.current += 1;
+    setScan({ kind: "idle" });
+  }
+
+  function updateForm(next: ProviderFormState) {
+    invalidateScan();
+    setForm(next);
+  }
+
+  function closeModal() {
+    invalidateScan();
+    onClose();
+  }
+
+  async function scanModels() {
+    const generation = ++scanGeneration.current;
+    const baseError = validateProviderBaseUrl(form.baseUrl);
+    if (baseError) {
+      setScan({ kind: "error", message: baseError });
+      return;
+    }
+    setScan({ kind: "loading" });
+    try {
+      const models = deduplicateModels(await tauriApi.scanProviderModels({
+        provider_id: form.isEditing ? form.id : undefined,
+        api: form.api,
+        base_url: form.baseUrl.trim(),
+        api_key: form.clearApiKey ? "" : form.apiKey.trim() || undefined,
+      }));
+      if (generation === scanGeneration.current) {
+        setScan({ kind: "ready", models, selected: models[0] ?? "" });
+      }
+    } catch (error: unknown) {
+      if (generation === scanGeneration.current) {
+        setScan({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+
   // Reset form edits, error banner, and pending delete confirmation on close/reopen
   useEffect(() => {
     if (!open) {
+      invalidateScan();
       setForm(EMPTY_FORM);
       setAddingModel(false);
       setDraftModelId("");
@@ -159,11 +216,13 @@ export function ProviderSettingsModal({
     }
     function onKeyDown(e: KeyboardEvent) {
       if (e.defaultPrevented) return;
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") closeModal();
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [open, onClose]);
+
+  useEffect(() => () => { scanGeneration.current += 1; }, [open]);
 
   useEffect(() => {
     if (addingModel) {
@@ -174,6 +233,7 @@ export function ProviderSettingsModal({
   if (!open) return null;
 
   function loadForEdit(profile: PublicProviderProfile) {
+    invalidateScan();
     const uniqueModels = deduplicateModels(profile.models);
     setError(null);
     setPendingDeleteId(null);
@@ -308,7 +368,7 @@ export function ProviderSettingsModal({
   }
 
   return (
-    <div className="md3-scrim" onClick={onClose}>
+    <div className="md3-scrim" onClick={closeModal}>
       <div
         className="md3-dialog md3-dialog-wide"
         role="dialog"
@@ -326,8 +386,8 @@ export function ProviderSettingsModal({
                 Model Providers
               </h2>
               <p className="md3-dialog-subtitle">
-                API keys are stored atomically with 0600 permissions and never
-                echoed back to the UI.
+                API keys are stored locally and never echoed back to the UI.
+                File permissions are restricted to the owner on Unix; Windows uses inherited permissions.
               </p>
             </div>
           </div>
@@ -335,7 +395,7 @@ export function ProviderSettingsModal({
             type="button"
             className="md3-icon-btn"
             aria-label="Close provider settings"
-            onClick={onClose}
+            onClick={closeModal}
           >
             <CloseIcon size={16} />
           </button>
@@ -511,7 +571,7 @@ export function ProviderSettingsModal({
                   placeholder="e.g. openrouter"
                   value={form.id}
                   disabled={form.isEditing || isBusy}
-                  onChange={(e) => setForm({ ...form, id: e.target.value })}
+                  onChange={(e) => updateForm({ ...form, id: e.target.value })}
                 />
               </label>
 
@@ -522,7 +582,7 @@ export function ProviderSettingsModal({
                   placeholder="e.g. OpenRouter"
                   value={form.name}
                   disabled={isBusy}
-                  onChange={(e) => setForm({ ...form, name: e.target.value })}
+                  onChange={(e) => updateForm({ ...form, name: e.target.value })}
                 />
               </label>
 
@@ -538,7 +598,7 @@ export function ProviderSettingsModal({
                   options={API_PROTOCOL_OPTIONS}
                   onChange={(nextValue) => {
                     if (isProviderApiKind(nextValue)) {
-                      setForm({ ...form, api: nextValue });
+                      updateForm({ ...form, api: nextValue });
                     }
                   }}
                 />
@@ -552,7 +612,7 @@ export function ProviderSettingsModal({
                   value={form.baseUrl}
                   disabled={isBusy}
                   onChange={(e) =>
-                    setForm({ ...form, baseUrl: e.target.value })
+                    updateForm({ ...form, baseUrl: e.target.value })
                   }
                 />
               </label>
@@ -611,6 +671,51 @@ export function ProviderSettingsModal({
                   </div>
                 )}
 
+                <div className="vo-model-scan">
+                  <button
+                    type="button"
+                    className="md3-btn-tonal"
+                    disabled={isBusy || scan.kind === "loading" || form.api === "google-generative-ai"}
+                    onClick={() => void scanModels()}
+                  >
+                    {scan.kind === "loading" ? "Scanning..." : "Scan for models"}
+                  </button>
+                  <div role="status" aria-live="polite">
+                    {form.api === "google-generative-ai"
+                      ? "Scanning is unavailable for Google Generative AI. Add model IDs manually."
+                      : scan.kind === "loading" ? "Requesting model catalog..."
+                      : scan.kind === "error" ? scan.message
+                      : scan.kind === "ready" ? (scan.models.length === 0 ? "No models found. You can add an ID manually." : `Found ${scan.models.length} models. Select one to add.`)
+                      : "Scan the endpoint without saving this provider."}
+                  </div>
+                  {scan.kind === "ready" && scan.models.length > 0 && (
+                    <div className="vo-model-select-row">
+                      <div className="vo-model-select-wrap">
+                        <Md3Select
+                          variant="field"
+                          ariaLabel="Discovered models"
+                          value={scan.selected}
+                          options={scan.models.map((id) => ({ value: id, label: id }))}
+                          disabled={isBusy}
+                          onChange={(selected) => setScan({ ...scan, selected })}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="md3-btn-tonal"
+                        disabled={isBusy || !scan.selected || form.models.includes(scan.selected)}
+                        onClick={() => {
+                          const selected = scan.selected;
+                          setForm((prev) => ({ ...prev, models: deduplicateModels([...prev.models, selected]) }));
+                          setSelectedModelId(selected);
+                        }}
+                      >
+                        Add selected model
+                      </button>
+                    </div>
+                  )}
+                </div>
+
                 <div className="vo-model-select-row">
                   <div className="vo-model-select-wrap">
                     <Md3Select
@@ -647,7 +752,7 @@ export function ProviderSettingsModal({
                   value={form.signInUrl}
                   disabled={isBusy}
                   onChange={(e) =>
-                    setForm({ ...form, signInUrl: e.target.value })
+                    updateForm({ ...form, signInUrl: e.target.value })
                   }
                 />
               </label>
@@ -667,7 +772,7 @@ export function ProviderSettingsModal({
                 placeholder="sk-..."
                 value={form.apiKey}
                 disabled={form.clearApiKey || isBusy}
-                onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
+                onChange={(e) => updateForm({ ...form, apiKey: e.target.value })}
               />
             </label>
 
@@ -678,7 +783,7 @@ export function ProviderSettingsModal({
                   checked={form.clearApiKey}
                   disabled={isBusy}
                   onChange={(e) =>
-                    setForm({
+                    updateForm({
                       ...form,
                       clearApiKey: e.target.checked,
                       apiKey: "",
@@ -692,7 +797,7 @@ export function ProviderSettingsModal({
         </div>
 
         <footer className="md3-dialog-footer">
-          <button type="button" className="md3-btn-text" onClick={onClose}>
+          <button type="button" className="md3-btn-text" onClick={closeModal}>
             Close
           </button>
           <button

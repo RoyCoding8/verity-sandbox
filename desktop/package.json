@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "npm --prefix ui run dev",
     "build": "npm --prefix ui run build",
+    "sidecar:prepare": "node scripts/prepare-sidecar.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

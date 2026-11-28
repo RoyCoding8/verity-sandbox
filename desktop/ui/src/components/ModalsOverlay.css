@@ -914,3 +914,10 @@
     grid-template-columns: 1fr;
   }
 }
+.vo-model-scan {
+  display: grid;
+  gap: 10px;
+  margin-block: 12px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}

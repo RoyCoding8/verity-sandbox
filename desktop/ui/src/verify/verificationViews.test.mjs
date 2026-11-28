@@ -78,6 +78,7 @@ test("verification views display decisions made from persisted handoff and merge
   };
   const mergeCases = [
     { label: "ready", expected: true },
+    { label: "current branch", entry: { targetRef: "HEAD" }, expected: true },
     { label: "normalized digest", entry: { approvedDigest: ` ${digest.toUpperCase()} ` }, expected: true },
     { label: "digest mismatch", entry: { approvedDigest: "f".repeat(64) } },
     { label: "missing digest", entry: { approvedDigest: "" } },
@@ -94,6 +95,7 @@ test("verification views display decisions made from persisted handoff and merge
       onClose: noop,
     }));
     assert.equal(enabledButton(html, button), expected, label);
+    if (entry?.targetRef === "HEAD") assert.match(html, /Current checked-out branch \(HEAD\)/);
   }
 
   const log = renderToStaticMarkup(createElement(RunLogDrawer, {
