@@ -17,6 +17,7 @@ const DEFAULT_COST = Object.freeze({
 });
 const KEYLESS_FALLBACK_API_KEY = "verity-no-key";
 const SUBAGENT_EXEC_TIMEOUT_MS = 310_000;
+const VERITY_TOOLS = new Set(["verity_run_readonly", "verity_spawn_write", "verity_list_handoffs"]);
 
 const API_MAP: Readonly<Record<string, string>> = Object.freeze({
   "openai-completions": "openai-completions",
@@ -282,11 +283,17 @@ function registerVeritySubagentTools(pi: ExtensionAPI): void {
   }
 
   const verityBin = process.env.VERITY_MCP_BIN?.trim();
+  let suspendedTools: string[] = [];
   pi.on("session_start", async (_event, ctx) => {
-    let problem: string | undefined;
-    if (!verityBin) {
+    const activeTools = pi.getActiveTools();
+    suspendedTools = [...new Set([...suspendedTools, ...activeTools.filter((name) => VERITY_TOOLS.has(name))])];
+    pi.setActiveTools(activeTools.filter((name) => !VERITY_TOOLS.has(name)));
+    let problem = process.env.VERITY_MCP_ERROR?.trim();
+    if (!problem && !verityBin) {
       problem = "Verity CLI was not found. Rebuild the desktop app or set VERITY_MCP_BIN to the CLI's absolute path.";
-    } else {
+    } else if (!problem && verityBin && !path.isAbsolute(verityBin)) {
+      problem = `VERITY_MCP_BIN must be an absolute path: ${verityBin}`;
+    } else if (!problem && verityBin) {
       try {
         const result = await pi.exec(verityBin, [], { timeout: 5_000 });
         const output = `${result.stdout}\n${result.stderr}`;
@@ -301,6 +308,8 @@ function registerVeritySubagentTools(pi: ExtensionAPI): void {
       ctx.ui.setStatus("verity-delegation", "Verity delegation unavailable");
       ctx.ui.notify(problem, "warning");
     } else {
+      pi.setActiveTools([...new Set([...pi.getActiveTools(), ...suspendedTools])]);
+      suspendedTools = [];
       ctx.ui.setStatus("verity-delegation", undefined);
     }
   });
