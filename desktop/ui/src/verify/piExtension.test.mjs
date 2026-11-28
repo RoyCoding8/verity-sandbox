@@ -29,7 +29,7 @@ import { writeFileSync } from "node:fs";
 import verityExtension from ${JSON.stringify(extension.replaceAll("\\", "/"))};
 export default function probe(pi) {
   pi.on("session_start", async (_, ctx) => {
-    const result = { tools: pi.getAllTools().map(tool => tool.name) };
+    const result = { tools: pi.getAllTools().map(tool => tool.name), activeTools: pi.getActiveTools() };
     if (${Boolean(handoffs)}) {
       const tools = new Map();
       verityExtension({ registerProvider() {}, registerTool(tool) { tools.set(tool.name, tool); } });
@@ -75,12 +75,14 @@ export default function probe(pi) {
     child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
     const closed = new Promise((resolve) => child.once("close", resolve));
     const lines = createInterface({ input: child.stdout });
+    const diagnostics = [];
     let timeout;
     try {
       const response = new Promise((resolve, reject) => {
         lines.on("line", (line) => {
           try {
             const response = JSON.parse(line);
+            if (response.type === "extension_ui_request") diagnostics.push(response);
             if (response.id === "models") resolve(response);
           } catch (error) {
             reject(error);
@@ -99,6 +101,8 @@ export default function probe(pi) {
       assert.ok(model, `Pi did not register the configured model. ${stderr}`);
       const result = JSON.parse(await readFile(resultPath, "utf8"));
       result.tools = result.tools.filter((name) => name.startsWith("verity_")).sort();
+      result.activeTools = result.activeTools.filter((name) => name.startsWith("verity_")).sort();
+      result.diagnostics = diagnostics;
       return result;
     } finally {
       clearTimeout(timeout);
@@ -115,6 +119,15 @@ test("offline Pi loads the embedded extension, custom model, and configured tool
   assert.deepEqual((await readPiRegistration({ enabled: true, cliConfigured: true })).tools, verityTools);
   assert.deepEqual((await readPiRegistration({ enabled: false, cliConfigured: true })).tools, []);
   assert.deepEqual((await readPiRegistration({ enabled: true, cliConfigured: false })).tools, []);
+});
+
+test("missing CLI produces a persistent startup status and warning; intentional disable stays silent", async () => {
+  const missing = await readPiRegistration({ enabled: true, cliConfigured: false });
+  assert.deepEqual(missing.activeTools, []);
+  assert.ok(missing.diagnostics.some((event) => event.method === "setStatus" && /unavailable/i.test(event.statusText)));
+  assert.ok(missing.diagnostics.some((event) => event.method === "notify" && event.notifyType === "warning" && /CLI/i.test(event.message)));
+  const disabled = await readPiRegistration({ enabled: false, cliConfigured: false });
+  assert.deepEqual(disabled.diagnostics, []);
 });
 
 const violation = { rule: "no-unsafe", path: "src/lib.rs", line: 2, detail: "unsafe block" };
