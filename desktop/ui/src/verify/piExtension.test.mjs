@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -24,11 +24,13 @@ const piCli = process.env.VERITY_PI_CLI || (process.env.PATH || "").split(delimi
 ]).find(existsSync);
 assert.ok(piCli, "Install Pi or set VERITY_PI_CLI to its dist/cli.js");
 
-async function readPiRegistration({ enabled, cliConfigured, cliPath = stagedCli, handoffs, executeCliTool = false }) {
+async function readPiRegistration({ enabled, cliConfigured, cliPath = stagedCli, resolutionError = "", handoffs, executeCliTool = false, recovery = false }) {
   const dir = await mkdtemp(join(tmpdir(), "verity-pi-test-"));
   const probe = join(dir, "probe.ts");
   const resultPath = join(dir, "tools.json");
+  const selectedCli = recovery ? join(dir, `verity${process.platform === "win32" ? ".exe" : ""}`) : cliPath;
   try {
+    if (cliPath.startsWith("./")) await copyFile(stagedCli, join(dir, cliPath));
     if (handoffs) {
       const handoffsDir = join(dir, ".verity", "handoffs");
       await mkdir(handoffsDir, { recursive: true });
@@ -74,7 +76,8 @@ export default function probe(pi) {
         PI_CODING_AGENT_DIR: join(dir, "agent"),
         PI_OFFLINE: "1",
         VERITY_TEST_TOOL_RESULT: resultPath,
-        VERITY_MCP_BIN: cliConfigured ? cliPath : "",
+        VERITY_MCP_BIN: cliConfigured ? selectedCli : "",
+        VERITY_MCP_ERROR: resolutionError,
         VERITY_DISABLE_SUBAGENT_TOOLS: enabled ? "0" : "1",
         VERITY_DESKTOP_PROVIDERS: JSON.stringify([{
           id: "verity-fixture",
@@ -92,29 +95,55 @@ export default function probe(pi) {
     const diagnostics = [];
     let timeout;
     try {
-      const response = new Promise((resolve, reject) => {
-        lines.on("line", (line) => {
+      lines.on("line", (line) => {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "extension_ui_request") diagnostics.push(event);
+        } catch {}
+      });
+      const request = (type, id) => new Promise((resolve, reject) => {
+        const onLine = (line) => {
           try {
             const response = JSON.parse(line);
-            if (response.type === "extension_ui_request") diagnostics.push(response);
-            if (response.id === "models") resolve(response);
+            if (response.id === id) {
+              clearTimeout(timeout);
+              lines.off("line", onLine);
+              resolve(response);
+            }
           } catch (error) {
             reject(error);
           }
-        });
+        };
+        lines.on("line", onLine);
         child.once("error", reject);
         child.once("close", (code) => reject(new Error(`Pi exited with ${code}. ${stderr}`)));
-        timeout = setTimeout(() => reject(new Error(`Pi did not return its models. ${stderr}`)), 15_000);
+        timeout = setTimeout(() => reject(new Error(`Pi did not return ${id}. ${stderr}`)), 15_000);
+        child.stdin.write(JSON.stringify({ type, id }) + "\n");
       });
       child.stdin.on("error", () => {});
-      child.stdin.write('{"type":"get_available_models","id":"models"}\n');
-      const reply = await response;
+      const reply = await request("get_available_models", "models");
       assert.equal(reply.success, true, stderr);
       const model = reply.data.models.find((item) =>
         item.provider === "verity-fixture" && item.id === "fixture-model");
       assert.ok(model, `Pi did not register the configured model. ${stderr}`);
+      if (recovery) {
+        const snapshot = async () => ({
+          ...JSON.parse(await readFile(resultPath, "utf8")),
+          status: diagnostics.filter((event) => event.method === "setStatus").at(-1),
+        });
+        const snapshots = [await snapshot()];
+        for (const ready of [true, false, true]) {
+          if (ready) await copyFile(stagedCli, selectedCli);
+          else await unlink(selectedCli);
+          const reply = await request("new_session", `session-${snapshots.length}`);
+          assert.equal(reply.success, true, JSON.stringify(reply));
+          snapshots.push(await snapshot());
+        }
+        return { snapshots, diagnostics };
+      }
       const result = JSON.parse(await readFile(resultPath, "utf8"));
       result.tools = result.tools.filter((name) => name.startsWith("verity_")).sort();
+      result.builtinTools = result.activeTools.filter((name) => !name.startsWith("verity_")).sort();
       result.activeTools = result.activeTools.filter((name) => name.startsWith("verity_")).sort();
       result.diagnostics = diagnostics;
       return result;
@@ -138,12 +167,49 @@ test("offline Pi loads the embedded extension, custom model, and configured tool
   assert.deepEqual((await readPiRegistration({ enabled: true, cliConfigured: false })).tools, []);
 });
 
-test("an invalid CLI produces a persistent startup status and warning", async () => {
-  for (const cliPath of [join(tmpdir(), "verity-does-not-exist"), process.execPath]) {
+test("an invalid CLI is inactive and produces a persistent startup status and warning", async () => {
+  for (const cliPath of [join(tmpdir(), "verity-does-not-exist"), process.execPath, `./verity${process.platform === "win32" ? ".exe" : ""}`]) {
     const result = await readPiRegistration({ enabled: true, cliConfigured: true, cliPath });
+    assert.deepEqual(result.activeTools, []);
+    assert.deepEqual(result.builtinTools, ["bash", "edit", "read", "write"]);
     assert.ok(result.diagnostics.some((event) => event.method === "setStatus" && /unavailable/i.test(event.statusText)));
     assert.ok(result.diagnostics.some((event) => event.method === "notify" && event.notifyType === "warning" && event.message.includes(cliPath)));
+    if (cliPath.startsWith("./")) assert.ok(result.diagnostics.some((event) => /must be an absolute path/.test(event.message)));
   }
+});
+
+test("a nonexecutable CLI is inactive without disabling Pi built-ins", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "verity-nonexecutable-"));
+  try {
+    const cliPath = join(dir, "verity.txt");
+    await writeFile(cliPath, "not an executable");
+    await chmod(cliPath, 0o644);
+    const result = await readPiRegistration({ enabled: true, cliConfigured: true, cliPath });
+    assert.deepEqual(result.activeTools, []);
+    assert.deepEqual(result.builtinTools, ["bash", "edit", "read", "write"]);
+    assert.ok(result.diagnostics.some((event) => event.method === "notify" && event.message.includes(cliPath)));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("repeated Pi sessions suspend and recover tools as the CLI disappears and returns", async () => {
+  const { snapshots } = await readPiRegistration({ enabled: true, cliConfigured: true, recovery: true });
+  for (const [index, snapshot] of snapshots.entries()) {
+    assert.deepEqual(snapshot.activeTools.filter((name) => name.startsWith("verity_")).sort(), index % 2 ? verityTools : []);
+    assert.deepEqual(snapshot.activeTools.filter((name) => !name.startsWith("verity_")).sort(), ["bash", "edit", "read", "write"]);
+    if (index % 2) assert.equal(snapshot.status.statusText, undefined);
+    else assert.match(snapshot.status.statusText, /unavailable/i);
+  }
+});
+
+test("desktop resolution errors show the rejected path and intentional disable remains quiet", async () => {
+  const resolutionError = "VERITY_MCP_BIN does not name a CLI file: /missing/explicit/verity";
+  const rejected = await readPiRegistration({ enabled: true, cliConfigured: false, resolutionError });
+  assert.deepEqual(rejected.activeTools, []);
+  assert.deepEqual(rejected.builtinTools, ["bash", "edit", "read", "write"]);
+  assert.ok(rejected.diagnostics.some((event) => event.method === "notify" && event.message === resolutionError));
+  assert.deepEqual((await readPiRegistration({ enabled: false, cliConfigured: false, resolutionError })).diagnostics, []);
 });
 
 test("an active delegation tool executes the staged CLI and reports its argument rejection", async () => {

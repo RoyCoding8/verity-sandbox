@@ -226,40 +226,81 @@ pub struct PiBootstrapData {
 // Launch Env & MCP Binary Resolution (Pure Boundary Helpers)
 // ============================================================
 
-/// Resolves the local `verity` CLI binary for `verity mcp` launch wiring.
-pub fn resolve_verity_mcp_bin() -> Option<PathBuf> {
-    if let Ok(explicit) = env::var("VERITY_MCP_BIN") {
-        let path = PathBuf::from(explicit.trim());
-        if path.is_absolute() && path.is_file() {
-            return Some(path);
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerityBinError {
+    RelativeOverride(PathBuf),
+    MissingOverride(PathBuf),
+}
+
+impl std::fmt::Display for VerityBinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RelativeOverride(path) => write!(
+                f,
+                "VERITY_MCP_BIN must be an absolute path: {}",
+                path.display()
+            ),
+            Self::MissingOverride(path) => write!(
+                f,
+                "VERITY_MCP_BIN does not name a CLI file: {}",
+                path.display()
+            ),
         }
     }
+}
 
+pub fn resolve_verity_mcp_bin() -> Result<Option<PathBuf>, VerityBinError> {
+    let explicit = env::var_os("VERITY_MCP_BIN");
+    let exe = env::current_exe().ok();
+    let paths = env::var_os("PATH").unwrap_or_default();
+    resolve_verity_mcp_bin_from(
+        explicit.as_deref(),
+        exe.as_deref(),
+        env::split_paths(&paths),
+        Path::is_file,
+    )
+}
+
+fn resolve_verity_mcp_bin_from(
+    explicit: Option<&std::ffi::OsStr>,
+    current_exe: Option<&Path>,
+    paths: impl IntoIterator<Item = PathBuf>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<Option<PathBuf>, VerityBinError> {
+    if let Some(explicit) = explicit.filter(|value| !value.to_string_lossy().trim().is_empty()) {
+        let path = PathBuf::from(explicit.to_string_lossy().trim());
+        if !path.is_absolute() {
+            return Err(VerityBinError::RelativeOverride(path));
+        }
+        return if is_file(&path) {
+            Ok(Some(path))
+        } else {
+            Err(VerityBinError::MissingOverride(path))
+        };
+    }
     let bin_name = if cfg!(windows) {
         "verity.exe"
     } else {
         "verity"
     };
 
-    if let Ok(exe) = env::current_exe() {
+    if let Some(exe) = current_exe.filter(|exe| exe.is_absolute()) {
         if let Some(dir) = exe.parent() {
             let sibling = dir.join(bin_name);
-            if sibling.is_file() {
-                return Some(sibling);
+            if is_file(&sibling) {
+                return Ok(Some(sibling));
             }
         }
     }
 
-    if let Some(paths) = env::var_os("PATH") {
-        for dir in env::split_paths(&paths).filter(|dir| dir.is_absolute()) {
-            let candidate = dir.join(bin_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    for dir in paths.into_iter().filter(|dir| dir.is_absolute()) {
+        let candidate = dir.join(bin_name);
+        if is_file(&candidate) {
+            return Ok(Some(candidate));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Builds the full child-process environment for Pi:
@@ -1317,7 +1358,17 @@ impl PiAppState {
     ) -> Result<Arc<PiSessionSupervisor>, String> {
         let store = ProviderStore::load(&self.inner.provider_store_path).unwrap_or_default();
         let verity_bin = resolve_verity_mcp_bin();
-        let launch_env = build_pi_launch_env(&store, verity_bin.as_deref());
+        let mut launch_env = build_pi_launch_env(
+            &store,
+            verity_bin.as_ref().ok().and_then(|bin| bin.as_deref()),
+        );
+        launch_env.push((
+            "VERITY_MCP_ERROR".to_string(),
+            verity_bin
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default(),
+        ));
 
         let mut config = match &self.inner.base_config {
             Some(cfg) => {
@@ -4085,6 +4136,93 @@ lines.on("line", (line) => {
             "/usr/local/bin/verity".to_string()
         )));
         assert!(env_pairs.contains(&("VERITY_MCP_ARGS".to_string(), "mcp".to_string())));
+    }
+
+    #[test]
+    fn cli_resolver_honors_explicit_overrides_without_fallback() {
+        let root = env::temp_dir();
+        let explicit = root.join("custom-verity");
+        let missing = root.join("missing-verity");
+        let desktop = root.join("verity-desktop");
+        let relative = Path::new("repo/verity");
+        for (input, expected) in [
+            (explicit.as_path(), Ok(Some(explicit.clone()))),
+            (
+                missing.as_path(),
+                Err(VerityBinError::MissingOverride(missing.clone())),
+            ),
+            (
+                relative,
+                Err(VerityBinError::RelativeOverride(relative.to_path_buf())),
+            ),
+        ] {
+            let result = resolve_verity_mcp_bin_from(
+                Some(input.as_os_str()),
+                Some(&desktop),
+                [root.clone()],
+                |path| path != missing,
+            );
+            assert_eq!(result, expected);
+            if let Err(error) = result {
+                assert!(error.to_string().contains(&input.display().to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn cli_resolver_uses_absolute_sibling_then_absolute_path_entries() {
+        let root = env::temp_dir();
+        let desktop = root.join("app").join("verity-desktop");
+        let name = if cfg!(windows) {
+            "verity.exe"
+        } else {
+            "verity"
+        };
+        let sibling = desktop.parent().unwrap().join(name);
+        let path_bin = root.join("bin").join(name);
+        let paths = [
+            PathBuf::new(),
+            PathBuf::from("opened-repo"),
+            root.join("bin"),
+        ];
+        for explicit in [None, Some(std::ffi::OsStr::new("  "))] {
+            assert_eq!(
+                resolve_verity_mcp_bin_from(explicit, Some(&desktop), paths.clone(), |_| true),
+                Ok(Some(sibling.clone()))
+            );
+            assert_eq!(
+                resolve_verity_mcp_bin_from(explicit, Some(&desktop), paths.clone(), |path| path
+                    == path_bin),
+                Ok(Some(path_bin.clone()))
+            );
+            assert_eq!(
+                resolve_verity_mcp_bin_from(explicit, None, paths.clone(), |path| !path
+                    .is_absolute()),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn cli_resolver_discovers_a_real_sibling_file() {
+        let root = unique_temp_dir("cli-sibling");
+        let name = if cfg!(windows) {
+            "verity.exe"
+        } else {
+            "verity"
+        };
+        let sibling = root.join(name);
+        fs::write(&sibling, b"sidecar fixture").unwrap();
+        assert_eq!(
+            resolve_verity_mcp_bin_from(
+                None,
+                Some(&root.join("verity-desktop")),
+                [],
+                Path::is_file
+            ),
+            Ok(Some(sibling))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

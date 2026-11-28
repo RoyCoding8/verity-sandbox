@@ -1,0 +1,35 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { access, readFile, readdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const [bundleDir, target] = process.argv.slice(2);
+assert.ok(bundleDir && target, "Usage: node verify-bundle.mjs <unpacked-bundle> <target-triple>");
+const windows = target.includes("windows");
+const cliName = windows ? "verity.exe" : "verity";
+const mainName = windows ? "verity-desktop.exe" : "verity-desktop";
+const entries = await readdir(resolve(bundleDir), { recursive: true, withFileTypes: true });
+const find = (name) => entries.filter((entry) => entry.isFile() && entry.name === name)
+  .map((entry) => join(entry.parentPath, entry.name));
+const cli = find(cliName);
+const main = find(mainName);
+assert.equal(cli.length, 1, `Expected one bundled ${cliName}, found ${JSON.stringify(cli)}`);
+assert.equal(main.length, 1, `Expected one bundled ${mainName}, found ${JSON.stringify(main)}`);
+assert.equal(dirname(cli[0]), dirname(main[0]), "CLI must be a sibling of the desktop executable");
+const staged = fileURLToPath(new URL(`../src-tauri/binaries/verity-${target}${windows ? ".exe" : ""}`, import.meta.url));
+const root = fileURLToPath(new URL("../../", import.meta.url));
+const releaseCli = join(process.env.CARGO_TARGET_DIR || join(root, "target"), target, "release", cliName);
+const digest = async (file) => createHash("sha256").update(await readFile(file)).digest("hex");
+assert.equal(await digest(staged), await digest(releaseCli), "Staged CLI must come from the requested target's release build");
+assert.equal(await digest(cli[0]), await digest(staged), "Bundle must contain the staged release CLI");
+assert.notEqual(await digest(cli[0]), await digest(main[0]), "Desktop and CLI must be distinct executables");
+await access(cli[0], constants.X_OK);
+const probe = spawnSync(cli[0], [], { encoding: "utf8", timeout: 10_000 });
+assert.ifError(probe.error);
+assert.equal(probe.status, 2, `Bundled CLI did not report usage: ${probe.stderr}`);
+const output = `${probe.stdout}\n${probe.stderr}`;
+for (const token of ["Verity v", "run-readonly", "spawn"]) assert.ok(output.includes(token), output);
+console.log(`Verified native release bundle CLI and desktop siblings at ${dirname(cli[0])}`);
