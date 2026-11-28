@@ -10,7 +10,8 @@ fn main() {
     if windows {
         println!("cargo:rerun-if-changed=windows.manifest");
         let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-        let manifest = std::fs::canonicalize("windows.manifest").unwrap();
+        let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
+            .join("windows.manifest");
         let resource = out.join("common-controls.rc");
         std::fs::write(
             &resource,
