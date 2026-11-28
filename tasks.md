@@ -13,6 +13,8 @@
 - [x] Repair confirmed handoff schema, Windows URL opening, and non-main merge-target defects in an isolated worktree.
 - [x] Run local workspace, desktop, frontend, Verus, TLC and production trace checks; record their scope and gaps.
 - [x] Embed the Common Controls v6 manifest in Windows test binaries and rerun native tests.
-- [ ] Run the existing Linux, Windows and macOS CI jobs on a disposable verification branch, including the unfinished Kani proofs.
+- [x] Run the existing Linux, Windows and macOS CI jobs on a disposable verification branch, including all nine Kani proofs and live verifier integration.
 - [x] Review and integrate verified work, then clean up the finished worktrees.
+- [ ] Make the desktop main session reliably locate its Verity CLI and expose missing setup instead of silently omitting delegation tools.
+- [ ] Verify the main agent's registered tool catalog and a real read-only delegation from the desktop session.
 - [ ] Right now the agents cannot run subagents, we need to plan that properly. Research and plan
