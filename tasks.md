@@ -18,6 +18,18 @@ Model routing follows the user instruction. Use `codex` with GPT 6.1 Sol Medium 
 - [ ] Shared mutable state. Parent owns tasks.md and the decision ledger. The implementation owner writes only its worktree.
 - [ ] Smallest safe decomposition. Keep CLI preparation, discovery, extension diagnostics and their coupled regression checks under one owner.
 
+## Delegation follow-up plan
+
+The reported defect concerns the main agent. Nested worker delegation is a separate capability. The current runtime smoke uses real Pi and CLI processes with an isolated fixture model. It does not verify desktop provider propagation or native WebView interaction.
+
+1. Finish the current CLI packaging repair. On Linux, Windows and macOS, verify the staged executable, all three active main-agent tools, visible missing-CLI diagnostics, and a real read-only child result.
+2. Pass an explicit provider and model to each worker. Transfer only its required endpoint and credential through a trusted worker configuration, with no project extension loading or persistent repository secrets. Verify a desktop-configured loopback provider reaches both read-only and write workers without a pre-existing Pi models file. Verify unrelated credentials are absent.
+3. Preserve worker authority. Read-only workers retain read, grep, find and ls. Write workers keep declared scope, isolated Git worktrees and verifier gates. Check actual filesystem effects on each platform and state where enforcement relies on tool restrictions rather than an OS sandbox.
+4. Define task identity and lifecycle before asynchronous delegation. Persist started, running, cancelled, failed and completed states. Check cancellation stops the child process tree, restart does not duplicate work or publish twice, and unmerged work survives recovery.
+5. Keep worker-to-worker delegation disabled until authority is explicit. A child must receive a bounded depth, shared task budget, cancellation ownership and scope no broader than its parent. Verify denied nesting, exhausted budgets and attempts to widen scope before enabling the capability.
+
+Production points to change or retain are `pi_ipc.rs::build_pi_launch_env`, the embedded extension's tool definitions, `PiRpcConfig::default_pi`, `run_sandboxed_pi_prompt` and `sandbox.rs::configure_environment`. The sandbox clears its environment and Pi workers suppress extensions, so main-agent model registration alone does not configure those workers.
+
 ## Existing task history
 
 - [x] Inspect the provider setup flow and the verification-min-cover procedure.
