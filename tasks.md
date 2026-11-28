@@ -14,5 +14,5 @@
 - [x] Run local workspace, desktop, frontend, Verus, TLC and production trace checks; record their scope and gaps.
 - [x] Embed the Common Controls v6 manifest in Windows test binaries and rerun native tests.
 - [ ] Run the existing Linux, Windows and macOS CI jobs on a disposable verification branch, including the unfinished Kani proofs.
-- [ ] Review and integrate verified work, then clean up the finished worktrees.
+- [x] Review and integrate verified work, then clean up the finished worktrees.
 - [ ] Right now the agents cannot run subagents, we need to plan that properly. Research and plan
