@@ -51,6 +51,11 @@ jobs:
         working-directory: desktop/ui
         run: node --test src/verify/piStore.laws.mjs src/verify/verificationViews.test.mjs
 
+      - name: Install Rust for the CLI sidecar
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Verify the installed Pi extension offline
         working-directory: desktop/ui
-        run: npm exec --yes --package=@earendil-works/pi-coding-agent@1.5.2 -- node --test src/verify/piExtension.test.mjs
+        run: |
+          npm --prefix ../.. run sidecar:prepare
+          npm exec --yes --package=@earendil-works/pi-coding-agent@1.5.2 -- node --test src/verify/piExtension.test.mjs

@@ -46,12 +46,20 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
 
+      - name: Build and stage the Verity CLI sidecar
+        run: npm run sidecar:prepare
+
       - name: Run Clippy (Tauri Rust shell)
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run tests (Tauri Rust shell)
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+
+      - name: Verify Pi delegation tools with the CLI beside the desktop
+        env:
+          VERITY_TEST_CLI: ${{ github.workspace }}/desktop/src-tauri/target/debug/verity${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+        run: npm exec --yes --package=@earendil-works/pi-coding-agent@1.5.2 -- node --test desktop/ui/src/verify/piExtension.test.mjs
 
       - name: Install pinned TLC
         if: matrix.os == 'ubuntu-latest'

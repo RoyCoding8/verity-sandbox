@@ -1326,8 +1326,9 @@ impl PiAppState {
                 cloned
             }
             None => {
-                let ext_path = ensure_verity_pi_extension_path().ok();
-                build_default_pi_config(project_path, ext_path.as_deref())
+                let ext_path = ensure_verity_pi_extension_path()
+                    .map_err(|err| format!("Failed to prepare Verity Pi extension: {err}"))?;
+                build_default_pi_config(project_path, Some(&ext_path))
             }
         };
         config.env.extend(launch_env);

@@ -1,5 +1,6 @@
 /target/
 /desktop/src-tauri/target/
+/desktop/src-tauri/binaries/
 /desktop/ui/node_modules/
 /desktop/ui/dist/
 /desktop/src-tauri/gen/schemas/
