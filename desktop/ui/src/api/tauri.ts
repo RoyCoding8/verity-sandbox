@@ -8,7 +8,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export type ProviderApiKind =
   | "openai-completions"
   | "openai-responses"
-  | "anthropic-messages";
+  | "anthropic-messages"
+  | "google-generative-ai";
 
 export interface PublicProviderProfile {
   readonly id: string;
@@ -30,6 +31,10 @@ export interface ProviderProfileInput {
   /** `undefined` preserves existing key, `""` clears it, non-empty replaces it. */
   readonly api_key?: string;
 }
+
+export type ProviderModelScanInput = Pick<ProviderProfileInput, "api" | "base_url" | "api_key"> & {
+  readonly provider_id?: string;
+};
 
 export interface PendingAttachment {
   readonly filename: string;
@@ -2579,6 +2584,13 @@ export const tauriApi = {
   },
 
   // --- Provider CRUD (exact Rust commands in desktop/src-tauri/src/providers.rs) ---
+  async scanProviderModels(input: ProviderModelScanInput): Promise<readonly string[]> {
+    if (!isTauriRuntime()) {
+      throw new Error("Model scanning requires the desktop app. Add model IDs manually in browser preview.");
+    }
+    return invoke<string[]>("scan_provider_models", { input });
+  },
+
   async listProviders(): Promise<readonly PublicProviderProfile[]> {
     if (!isTauriRuntime()) {
       return previewRuntime.listProviders();

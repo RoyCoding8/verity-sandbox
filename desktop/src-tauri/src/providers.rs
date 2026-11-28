@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 use verity_core::json::{parse_json, to_json_string, JsonValue};
 use verity_core::provider::{validate_external_sign_in_url, validate_provider_url};
 
@@ -77,6 +78,129 @@ pub struct ProviderProfileInput {
     /// `Some(non_empty)` sets/replaces the key; `Some("")` clears it; `None` preserves existing key.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ProviderModelScanInput {
+    pub provider_id: Option<String>,
+    pub api: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
+}
+
+const MODEL_SCAN_BODY_LIMIT: u64 = 1024 * 1024;
+
+fn models_url(base_url: &str) -> Result<reqwest::Url, String> {
+    validate_provider_url(base_url).map_err(|_| "Invalid provider base URL".to_string())?;
+    let mut url =
+        reqwest::Url::parse(base_url).map_err(|_| "Invalid provider base URL".to_string())?;
+    let path = url.path().trim_end_matches('/');
+    let path = if path.is_empty() {
+        "/v1/models".to_string()
+    } else {
+        format!("{path}/models")
+    };
+    url.set_path(&path);
+    Ok(url)
+}
+
+fn scan_models_at(
+    store_path: &Path,
+    input: ProviderModelScanInput,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    let api = parse_provider_api(&input.api).map_err(|_| "Unsupported provider API".to_string())?;
+    if api == ProviderApi::GoogleGenerativeAi {
+        return Err(
+            "Model scanning is not supported for Google Generative AI; add model IDs manually"
+                .to_string(),
+        );
+    }
+    let url = models_url(&input.base_url)?;
+    let key = match input.api_key {
+        Some(key) => Some(key),
+        None if input.provider_id.is_none() => None,
+        None => {
+            let _guard = STORE_WRITE_LOCK
+                .lock()
+                .map_err(|_| "Provider store unavailable")?;
+            let store = ProviderStore::load(store_path)
+                .map_err(|_| "Could not read saved provider credentials")?;
+            store
+                .profiles
+                .iter()
+                .find(|profile| {
+                    Some(&profile.id) == input.provider_id.as_ref()
+                        && profile.api == api
+                        && models_url(&profile.base_url).ok().as_ref() == Some(&url)
+                })
+                .and_then(|profile| profile.api_key.clone())
+        }
+    };
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|_| "Could not initialize model scan")?;
+    let mut request = client.get(url);
+    if api == ProviderApi::AnthropicMessages {
+        request = request.header("anthropic-version", "2023-06-01");
+        if let Some(key) = key.filter(|key| !key.is_empty()) {
+            request = request.header("x-api-key", key);
+        }
+    } else if let Some(key) = key.filter(|key| !key.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().map_err(|error| {
+        if error.is_timeout() {
+            "Model scan timed out; try again"
+        } else {
+            "Could not connect to model catalog; check the endpoint and credentials"
+        }
+        .to_string()
+    })?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Model catalog returned HTTP {}; check the endpoint and credentials",
+            response.status().as_u16()
+        ));
+    }
+    let mut body = Vec::new();
+    response
+        .take(MODEL_SCAN_BODY_LIMIT + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| "Could not read model catalog; try again")?;
+    if body.len() as u64 > MODEL_SCAN_BODY_LIMIT {
+        return Err("Model catalog exceeded the 1 MiB limit".to_string());
+    }
+    #[derive(Deserialize)]
+    struct Catalog {
+        data: Vec<Model>,
+    }
+    #[derive(Deserialize)]
+    struct Model {
+        id: String,
+    }
+    let catalog: Catalog = serde_json::from_slice(&body)
+        .map_err(|_| "Invalid model catalog: expected data containing model IDs")?;
+    let mut models: Vec<String> = catalog
+        .data
+        .into_iter()
+        .map(|model| model.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+#[tauri::command]
+pub async fn scan_provider_models(input: ProviderModelScanInput) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_models_at(&default_store_path(), input, Duration::from_secs(10))
+    })
+    .await
+    .map_err(|_| "Model scan task failed".to_string())?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -687,6 +811,8 @@ pub async fn validate_provider_sign_in_url(url: String) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -702,6 +828,276 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn catalog_server(
+        body: String,
+        status: &str,
+        delay: Duration,
+    ) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let status = status.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            thread::sleep(delay);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            String::from_utf8(request).unwrap().to_lowercase()
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn model_scan_http_paths_credentials_and_storage_are_independent() {
+        let dir = unique_temp_dir("scan");
+        let path = dir.join("providers.json");
+        for (suffix, expected_path, api, supplied, matched, expected_key) in [
+            (
+                "",
+                "/v1/models",
+                "openai-completions",
+                None,
+                true,
+                Some("saved-secret"),
+            ),
+            (
+                "/v1/",
+                "/v1/models",
+                "openai-responses",
+                Some("override-secret"),
+                true,
+                Some("override-secret"),
+            ),
+            (
+                "/deployment/api/v1",
+                "/deployment/api/v1/models",
+                "openai-completions",
+                Some(""),
+                true,
+                None,
+            ),
+            (
+                "/proxy",
+                "/proxy/models",
+                "openai-completions",
+                None,
+                false,
+                None,
+            ),
+            (
+                "/v1",
+                "/v1/models",
+                "anthropic-messages",
+                Some("anthropic-secret"),
+                true,
+                Some("anthropic-secret"),
+            ),
+        ] {
+            let (base, server) = catalog_server(
+                r#"{"data":[{"id":" z "},{"id":"a"},{"id":"z"},{"id":" "}]}"#.to_string(),
+                "200 OK",
+                Duration::ZERO,
+            );
+            let base_url = format!("{base}{suffix}");
+            let mut store = ProviderStore::default();
+            store
+                .upsert(ProviderProfileInput {
+                    id: "scan".into(),
+                    name: "Scan".into(),
+                    api: api.into(),
+                    base_url: if matched {
+                        base_url.clone()
+                    } else {
+                        format!("{base}/other")
+                    },
+                    sign_in_url: None,
+                    models: vec!["manual".into()],
+                    api_key: Some("saved-secret".into()),
+                })
+                .unwrap();
+            store.save_atomic(&path).unwrap();
+            let before = fs::read(&path).unwrap();
+            let models = scan_models_at(
+                &path,
+                ProviderModelScanInput {
+                    provider_id: Some("scan".into()),
+                    api: api.into(),
+                    base_url,
+                    api_key: supplied.map(str::to_string),
+                },
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(models, ["a", "z"]);
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let request = server.join().unwrap();
+            assert!(
+                request.starts_with(&format!("get {expected_path} http/1.1\r\n")),
+                "{request}"
+            );
+            if api == "anthropic-messages" {
+                assert!(request.contains("anthropic-version: 2023-06-01\r\n"));
+                assert!(request.contains("x-api-key: anthropic-secret\r\n"));
+                assert!(!request.contains("authorization:"));
+            } else if let Some(key) = expected_key {
+                assert!(request.contains(&format!("authorization: bearer {key}\r\n")));
+            } else {
+                assert!(!request.contains("authorization:"));
+                assert!(!request.contains("saved-secret"));
+            }
+        }
+        for (id, api) in [
+            (None, "openai-completions"),
+            (Some("different"), "openai-completions"),
+            (Some("scan"), "openai-responses"),
+        ] {
+            let (base, server) = catalog_server("{\"data\":[]}".into(), "200 OK", Duration::ZERO);
+            let mut store = ProviderStore::default();
+            store
+                .upsert(ProviderProfileInput {
+                    id: "scan".into(),
+                    name: "Scan".into(),
+                    api: "openai-completions".into(),
+                    base_url: base.clone(),
+                    sign_in_url: None,
+                    models: vec![],
+                    api_key: Some("saved-secret".into()),
+                })
+                .unwrap();
+            store.save_atomic(&path).unwrap();
+            assert!(scan_models_at(
+                &path,
+                ProviderModelScanInput {
+                    provider_id: id.map(str::to_string),
+                    api: api.into(),
+                    base_url: base,
+                    api_key: None
+                },
+                Duration::from_secs(2)
+            )
+            .unwrap()
+            .is_empty());
+            assert!(!server.join().unwrap().contains("saved-secret"));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn model_scan_rejects_bad_catalogs_redirects_and_excessive_responses() {
+        let dir = unique_temp_dir("scan-errors");
+        let path = dir.join("absent.json");
+        for (body, status, delay, expected) in [
+            (
+                "not-json".into(),
+                "200 OK",
+                Duration::ZERO,
+                "Invalid model catalog",
+            ),
+            (
+                "{}".into(),
+                "200 OK",
+                Duration::ZERO,
+                "Invalid model catalog",
+            ),
+            (
+                "{\"data\":[{\"id\":3}]}".into(),
+                "200 OK",
+                Duration::ZERO,
+                "Invalid model catalog",
+            ),
+            (
+                "{\"data\":null}".into(),
+                "200 OK",
+                Duration::ZERO,
+                "Invalid model catalog",
+            ),
+            (
+                "secret-body".into(),
+                "401 Unauthorized",
+                Duration::ZERO,
+                "HTTP 401",
+            ),
+            (
+                "secret-body".into(),
+                "302 Found\r\nLocation: http://127.0.0.1:1/secret-destination",
+                Duration::ZERO,
+                "HTTP 302",
+            ),
+            (
+                "x".repeat(MODEL_SCAN_BODY_LIMIT as usize + 1),
+                "200 OK",
+                Duration::ZERO,
+                "1 MiB",
+            ),
+            (
+                "{\"data\":[]}".into(),
+                "200 OK",
+                Duration::from_millis(150),
+                "timed out",
+            ),
+        ] {
+            let (base, server) = catalog_server(body, status, delay);
+            let error = scan_models_at(
+                &path,
+                ProviderModelScanInput {
+                    provider_id: None,
+                    api: "openai-completions".into(),
+                    base_url: base.clone(),
+                    api_key: Some("request-secret".into()),
+                },
+                if delay.is_zero() {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(75)
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            for forbidden in [
+                "secret-body",
+                "request-secret",
+                base.as_str(),
+                "secret-destination",
+            ] {
+                assert!(!error.contains(forbidden));
+            }
+            server.join().unwrap();
+        }
+        for base in [
+            "https://example.com/v1?q=secret",
+            "https://example.com/v1#secret",
+            "https://user:secret@example.com/v1",
+            "ftp://example.com/v1",
+        ] {
+            assert!(models_url(base).is_err());
+        }
+        let error = scan_models_at(
+            &path,
+            ProviderModelScanInput {
+                provider_id: None,
+                api: "google-generative-ai".into(),
+                base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+                api_key: None,
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.contains("not supported"));
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
